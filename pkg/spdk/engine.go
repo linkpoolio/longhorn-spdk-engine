@@ -177,7 +177,7 @@ type EngineReplicaStatus struct {
 	Mode     types.Mode
 }
 
-func NewEngine(engineName, volumeName, frontend string, specSize uint64, engineUpdateCh chan interface{}) *Engine {
+func NewEngine(engineName, volumeName, frontend string, specSize uint64, replicaTransport NvmfTransportType, engineUpdateCh chan interface{}) *Engine {
 	log := logrus.StandardLogger().WithFields(logrus.Fields{
 		"engineName": engineName,
 		"volumeName": volumeName,
@@ -198,6 +198,8 @@ func NewEngine(engineName, volumeName, frontend string, specSize uint64, engineU
 		// TODO: support user-defined values
 		ctrlrLossTimeout:     replicaCtrlrLossTimeoutSec,
 		fastIOFailTimeoutSec: replicaFastIOFailTimeoutSec,
+
+		ReplicaTransport: replicaTransport,
 
 		ReplicaStatusMap: map[string]*EngineReplicaStatus{},
 

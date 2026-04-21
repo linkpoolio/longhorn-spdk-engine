@@ -167,7 +167,7 @@ func getUblkNumberOfQueue(ublkNumberOfQueue int32) int32 {
 	return ublkNumberOfQueue
 }
 
-func NewEngineFrontend(engineFrontendName, engineName, volumeName, frontend string, specSize uint64, ublkQueueDepth, ublkNumberOfQueue int32,
+func NewEngineFrontend(engineFrontendName, engineName, volumeName, frontend string, specSize uint64, ublkQueueDepth, ublkNumberOfQueue int32, transport NvmfTransportType,
 	engineFrontendUpdateCh chan interface{}) *EngineFrontend {
 	log := logrus.StandardLogger().WithFields(logrus.Fields{
 		"engineFrontendName": engineFrontendName,
@@ -190,7 +190,7 @@ func NewEngineFrontend(engineFrontendName, engineName, volumeName, frontend stri
 		log = log.WithField("roundedSpecSize", roundedSpecSize)
 	}
 
-	nvmeTcpFrontend := &NvmeTcpFrontend{}
+	nvmeTcpFrontend := &NvmeTcpFrontend{Transport: transport}
 	ublkFrontend := &UblkFrontend{
 		UblkQueueDepth:    getUblkQueueDepth(ublkQueueDepth),
 		UblkNumberOfQueue: getUblkNumberOfQueue(ublkNumberOfQueue),
