@@ -346,7 +346,7 @@ func (s *TestSuite) TestEngineFrontendSwitchOverTargetUsesPathMetadataForRemoteA
 	ef.NvmeTcpFrontend.Nqn = getStableVolumeNQN("vol-a")
 	ef.NvmeTcpFrontend.Nguid = getStableVolumeNGUID("vol-a")
 	ef.Endpoint = GetNvmfEndpoint(ef.NvmeTcpFrontend.Nqn, ef.NvmeTcpFrontend.TargetIP, ef.NvmeTcpFrontend.TargetPort)
-	ef.upsertNVMeTCPPathLocked("10.0.0.1", 2000, "engine-a", ef.NvmeTcpFrontend.Nqn, ef.NvmeTcpFrontend.Nguid, NvmeTCPANAStateOptimized)
+	ef.upsertNVMeTCPPathLocked("10.0.0.1", 2000, "engine-a", ef.NvmeTcpFrontend.Nqn, ef.NvmeTcpFrontend.Nguid, NvmeTCPANAStateOptimized, NvmfTransportTCP)
 	ef.ActivePath = "10.0.0.1:2000"
 	ef.PreferredPath = "10.0.0.1:2000"
 
@@ -902,8 +902,8 @@ func (s *TestSuite) TestCreateUblkFrontendNilReturnsCorrectErrorField(c *C) {
 func (s *TestSuite) TestPromoteNVMeTCPPathLockedDemotesOldActivePath(c *C) {
 	ef := NewEngineFrontend("ef-a", "engine-a", "vol-a", lhtypes.FrontendSPDKTCPNvmf, 1024, 0, 0, make(chan interface{}, 1))
 
-	oldAddress := ef.upsertNVMeTCPPathLocked("10.0.0.1", 2000, "engine-a", getStableVolumeNQN("vol-a"), getStableVolumeNGUID("vol-a"), NvmeTCPANAStateOptimized)
-	newAddress := ef.upsertNVMeTCPPathLocked("10.0.0.2", 3000, "engine-b", getStableVolumeNQN("vol-a"), getStableVolumeNGUID("vol-a"), NvmeTCPANAStateNonOptimized)
+	oldAddress := ef.upsertNVMeTCPPathLocked("10.0.0.1", 2000, "engine-a", getStableVolumeNQN("vol-a"), getStableVolumeNGUID("vol-a"), NvmeTCPANAStateOptimized, NvmfTransportTCP)
+	newAddress := ef.upsertNVMeTCPPathLocked("10.0.0.2", 3000, "engine-b", getStableVolumeNQN("vol-a"), getStableVolumeNGUID("vol-a"), NvmeTCPANAStateNonOptimized, NvmfTransportTCP)
 	ef.ActivePath = oldAddress
 	ef.PreferredPath = oldAddress
 
@@ -918,8 +918,8 @@ func (s *TestSuite) TestPromoteNVMeTCPPathLockedDemotesOldActivePath(c *C) {
 func (s *TestSuite) TestRemoveNVMeTCPPathLockedUpdatesSelectors(c *C) {
 	ef := NewEngineFrontend("ef-a", "engine-a", "vol-a", lhtypes.FrontendSPDKTCPNvmf, 1024, 0, 0, make(chan interface{}, 1))
 
-	firstAddress := ef.upsertNVMeTCPPathLocked("10.0.0.1", 2000, "engine-a", getStableVolumeNQN("vol-a"), getStableVolumeNGUID("vol-a"), NvmeTCPANAStateNonOptimized)
-	secondAddress := ef.upsertNVMeTCPPathLocked("10.0.0.2", 3000, "engine-b", getStableVolumeNQN("vol-a"), getStableVolumeNGUID("vol-a"), NvmeTCPANAStateOptimized)
+	firstAddress := ef.upsertNVMeTCPPathLocked("10.0.0.1", 2000, "engine-a", getStableVolumeNQN("vol-a"), getStableVolumeNGUID("vol-a"), NvmeTCPANAStateNonOptimized, NvmfTransportTCP)
+	secondAddress := ef.upsertNVMeTCPPathLocked("10.0.0.2", 3000, "engine-b", getStableVolumeNQN("vol-a"), getStableVolumeNGUID("vol-a"), NvmeTCPANAStateOptimized, NvmfTransportTCP)
 	ef.ActivePath = secondAddress
 	ef.PreferredPath = secondAddress
 

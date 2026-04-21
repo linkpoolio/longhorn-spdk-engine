@@ -965,6 +965,15 @@ func (i *Initiator) GetEndpoint() string {
 	return ""
 }
 
+// GetExecutor exposes the underlying namespace executor so callers that
+// already hold an Initiator can reuse its nsenter setup for nvme-cli
+// operations without constructing a new one. Needed by transport-specific
+// teardown paths (e.g. explicit RDMA controller disconnect during
+// switchover).
+func (i *Initiator) GetExecutor() *commonns.Executor {
+	return i.executor
+}
+
 // WaitForControllerLive waits for the NVMe controller at the given address to
 // reach "live" state. This is needed after nvme connect which returns
 // immediately while the TCP handshake completes asynchronously.
