@@ -96,6 +96,8 @@ type EngineFrontend struct {
 	waitForNvmeTCPControllerLiveFn func(transportAddress string, transportPort int32) error
 	// Test hook for explicit RDMA controller disconnect during switchover.
 	teardownRemoteRDMAPathFn func(nqn, targetIP, targetPort string) error
+	// Test hook for remote SPDK listener removal during switchover.
+	removeRemoteTargetListenerFn func(targetIP, engineName string, transport NvmfTransportType) error
 
 	// metadataDir is the base path for persisting engine frontend records.
 	// If empty, persistence is disabled.
@@ -500,10 +502,11 @@ func (ef *EngineFrontend) syncRemoteEngineTargetANAStates(oldTargetIP, oldEngine
 	}
 
 	// RDMA QPs must be torn down explicitly — a dangling QP in error
-	// state occupies the HCA's QP table until the initiator disconnects.
-	// TCP controllers are left to ctrl-loss-tmo.
+	// state occupies the HCA's QP table until both the initiator
+	// disconnects and the target releases the listener. TCP controllers
+	// are left to ctrl-loss-tmo.
 	if oldEngineName != newEngineName || oldTargetIP != newTargetIP {
-		if err := ef.teardownRemoteRDMAPathIfNeeded(oldTargetIP); err != nil {
+		if err := ef.teardownRemoteRDMAPathIfNeeded(oldTargetIP, oldEngineName); err != nil {
 			ef.log.WithError(err).WithFields(logrus.Fields{
 				"oldEngineName": oldEngineName,
 				"oldTargetIP":   oldTargetIP,
@@ -523,7 +526,7 @@ func (ef *EngineFrontend) syncRemoteEngineTargetANAStates(oldTargetIP, oldEngine
 	return syncErr
 }
 
-func (ef *EngineFrontend) teardownRemoteRDMAPathIfNeeded(oldTargetIP string) error {
+func (ef *EngineFrontend) teardownRemoteRDMAPathIfNeeded(oldTargetIP, oldEngineName string) error {
 	if oldTargetIP == "" {
 		return nil
 	}
@@ -551,6 +554,11 @@ func (ef *EngineFrontend) teardownRemoteRDMAPathIfNeeded(oldTargetIP string) err
 		return nil
 	}
 
+	var combinedErr error
+	if err := ef.removeRemoteTargetListener(oldTargetIP, oldEngineName, NvmfTransportRDMA); err != nil {
+		combinedErr = multierr.Append(combinedErr, errors.Wrap(err, "remove remote target listener"))
+	}
+
 	portStr := strconv.Itoa(int(matchedPort))
 	ef.log.WithFields(logrus.Fields{
 		"oldTargetIP":   oldTargetIP,
@@ -558,13 +566,38 @@ func (ef *EngineFrontend) teardownRemoteRDMAPathIfNeeded(oldTargetIP string) err
 		"nqn":           matchedNQN,
 	}).Info("Explicitly disconnecting old RDMA path to release HCA queue pair")
 
+	var disconnectErr error
 	if ef.teardownRemoteRDMAPathFn != nil {
-		return ef.teardownRemoteRDMAPathFn(matchedNQN, oldTargetIP, portStr)
+		disconnectErr = ef.teardownRemoteRDMAPathFn(matchedNQN, oldTargetIP, portStr)
+	} else if ef.initiator != nil {
+		disconnectErr = initiator.DisconnectController(matchedNQN, oldTargetIP, portStr, ef.initiator.GetExecutor())
 	}
-	if ef.initiator == nil {
+	if disconnectErr != nil {
+		combinedErr = multierr.Append(combinedErr, errors.Wrap(disconnectErr, "initiator disconnect"))
+	}
+
+	return combinedErr
+}
+
+func (ef *EngineFrontend) removeRemoteTargetListener(targetIP, engineName string, transport NvmfTransportType) error {
+	if targetIP == "" || engineName == "" {
 		return nil
 	}
-	return initiator.DisconnectController(matchedNQN, oldTargetIP, portStr, ef.initiator.GetExecutor())
+	if ef.removeRemoteTargetListenerFn != nil {
+		return ef.removeRemoteTargetListenerFn(targetIP, engineName, transport)
+	}
+
+	engineAddress := net.JoinHostPort(targetIP, strconv.Itoa(types.SPDKServicePort))
+	engineClient, err := GetServiceClient(engineAddress)
+	if err != nil {
+		return errors.Wrapf(err, "failed to get SPDK client for engine %s at %s", engineName, engineAddress)
+	}
+	defer func() {
+		if errClose := engineClient.Close(); errClose != nil {
+			ef.log.WithError(errClose).Warnf("Failed to close engine SPDK client for listener removal on engine %s", engineName)
+		}
+	}()
+	return engineClient.EngineRemoveTargetListener(engineName, string(transport))
 }
 
 func isSubsystemNotFoundError(err error) bool {

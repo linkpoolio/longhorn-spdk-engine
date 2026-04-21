@@ -41,9 +41,10 @@ type NvmeTcpTarget struct {
 	IP   string
 	Port int32
 
-	Nqn      string
-	Nguid    string
-	ANAState NvmeTCPANAState
+	Nqn       string
+	Nguid     string
+	ANAState  NvmeTCPANAState
+	Transport NvmfTransportType
 }
 
 func toSPDKListenerANAState(anaState NvmeTCPANAState) (spdktypes.NvmfSubsystemListenerAnaState, error) {
@@ -169,6 +170,13 @@ func (e *Engine) replicaTransport() NvmfTransportType {
 		return DefaultNvmfTransport
 	}
 	return e.ReplicaTransport
+}
+
+func (e *Engine) targetTransport() NvmfTransportType {
+	if e.NvmeTcpTarget == nil || e.NvmeTcpTarget.Transport == "" {
+		return DefaultNvmfTransport
+	}
+	return e.NvmeTcpTarget.Transport
 }
 
 type EngineReplicaStatus struct {
@@ -329,6 +337,7 @@ func (e *Engine) createNVMeTCPTarget(spdkClient *spdkclient.Client, superiorPort
 	e.NvmeTcpTarget.Port = port
 	e.NvmeTcpTarget.Nqn = getStableVolumeNQN(e.VolumeName)
 	e.NvmeTcpTarget.Nguid = getStableVolumeNGUID(e.VolumeName)
+	e.NvmeTcpTarget.Transport = e.replicaTransport()
 
 	spdkANAState, err := toSPDKListenerANAState(initialANAState)
 	if err != nil {
@@ -345,8 +354,8 @@ func (e *Engine) createNVMeTCPTarget(spdkClient *spdkclient.Client, superiorPort
 
 	e.log.Infof("Starting to expose RAID bdev for engine target %v on %v:%v with initial ANA state %v, cntlid %v, nsUUID %v",
 		e.Name, e.NvmeTcpTarget.IP, e.NvmeTcpTarget.Port, initialANAState, cntlid, nsUUID)
-	if err := spdkClient.StartExposeBdevWithANAState(e.NvmeTcpTarget.Nqn, e.Name, e.NvmeTcpTarget.Nguid, nsUUID,
-		e.NvmeTcpTarget.IP, strconv.Itoa(int(e.NvmeTcpTarget.Port)), spdkANAState, cntlid, cntlid); err != nil {
+	if err := spdkClient.StartExposeBdevWithANAStateAndTransport(e.NvmeTcpTarget.Nqn, e.Name, e.NvmeTcpTarget.Nguid, nsUUID,
+		e.NvmeTcpTarget.IP, strconv.Itoa(int(e.NvmeTcpTarget.Port)), e.NvmeTcpTarget.Transport.ToSPDKTransportType(), spdkANAState, cntlid, cntlid); err != nil {
 		// No need to release ports here. The engine will be marked as ERR by
 		// Create's deferred error handler, and Delete will release the ports
 		// when the user cleans up this engine.
@@ -429,7 +438,7 @@ func (e *Engine) SetTargetListenerANAState(spdkClient *spdkclient.Client, anaSta
 		nqn,
 		ip,
 		strconv.Itoa(int(port)),
-		spdktypes.NvmeTransportTypeTCP,
+		e.targetTransport().ToSPDKTransportType(),
 		spdktypes.NvmeAddressFamilyIPv4,
 		spdkANAState,
 		spdktypes.DefaultNvmfANAGroupID,
@@ -453,6 +462,48 @@ func (e *Engine) SetTargetListenerANAState(spdkClient *spdkclient.Client, anaSta
 		"anaState":   anaState,
 	}).Info("Updated engine target listener ANA state")
 
+	return nil
+}
+
+func (e *Engine) RemoveTargetListener(spdkClient *spdkclient.Client, transport NvmfTransportType) error {
+	if e == nil {
+		return fmt.Errorf("engine is nil")
+	}
+	if spdkClient == nil {
+		return fmt.Errorf("SPDK client is nil for engine %s", e.Name)
+	}
+
+	e.Lock()
+	defer e.Unlock()
+
+	if e.NvmeTcpTarget == nil {
+		return nil
+	}
+
+	nqn := e.NvmeTcpTarget.Nqn
+	ip := e.NvmeTcpTarget.IP
+	port := e.NvmeTcpTarget.Port
+	if nqn == "" || ip == "" || port == 0 {
+		return nil
+	}
+
+	if transport == "" {
+		transport = e.targetTransport()
+	}
+
+	_, err := spdkClient.NvmfSubsystemRemoveListener(
+		nqn, ip, strconv.Itoa(int(port)),
+		transport.ToSPDKTransportType(),
+		spdktypes.NvmeAddressFamilyIPv4,
+	)
+	if err != nil {
+		return errors.Wrapf(err, "failed to remove %s target listener for engine %s", transport, e.Name)
+	}
+	e.log.WithFields(logrus.Fields{
+		"targetIP":   ip,
+		"targetPort": port,
+		"transport":  transport,
+	}).Info("Removed engine target listener")
 	return nil
 }
 
