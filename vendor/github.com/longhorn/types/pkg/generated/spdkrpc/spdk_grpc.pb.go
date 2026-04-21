@@ -64,6 +64,7 @@ const (
 	SPDKService_EngineExpandPrecheck_FullMethodName                      = "/spdkrpc.SPDKService/EngineExpandPrecheck"
 	SPDKService_EngineDeleteTarget_FullMethodName                        = "/spdkrpc.SPDKService/EngineDeleteTarget"
 	SPDKService_EngineSetTargetListenerANAState_FullMethodName           = "/spdkrpc.SPDKService/EngineSetTargetListenerANAState"
+	SPDKService_EngineRemoveTargetListener_FullMethodName                = "/spdkrpc.SPDKService/EngineRemoveTargetListener"
 	SPDKService_EngineSnapshotCreate_FullMethodName                      = "/spdkrpc.SPDKService/EngineSnapshotCreate"
 	SPDKService_EngineSnapshotDelete_FullMethodName                      = "/spdkrpc.SPDKService/EngineSnapshotDelete"
 	SPDKService_EngineSnapshotRevert_FullMethodName                      = "/spdkrpc.SPDKService/EngineSnapshotRevert"
@@ -164,6 +165,7 @@ type SPDKServiceClient interface {
 	EngineExpandPrecheck(ctx context.Context, in *EngineExpandPrecheckRequest, opts ...grpc.CallOption) (*EngineExpandPrecheckResponse, error)
 	EngineDeleteTarget(ctx context.Context, in *EngineDeleteTargetRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	EngineSetTargetListenerANAState(ctx context.Context, in *EngineSetTargetListenerANAStateRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	EngineRemoveTargetListener(ctx context.Context, in *EngineRemoveTargetListenerRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	EngineSnapshotCreate(ctx context.Context, in *SnapshotRequest, opts ...grpc.CallOption) (*SnapshotResponse, error)
 	EngineSnapshotDelete(ctx context.Context, in *SnapshotRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	EngineSnapshotRevert(ctx context.Context, in *SnapshotRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
@@ -639,6 +641,15 @@ func (c *sPDKServiceClient) EngineDeleteTarget(ctx context.Context, in *EngineDe
 func (c *sPDKServiceClient) EngineSetTargetListenerANAState(ctx context.Context, in *EngineSetTargetListenerANAStateRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
 	out := new(emptypb.Empty)
 	err := c.cc.Invoke(ctx, SPDKService_EngineSetTargetListenerANAState_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sPDKServiceClient) EngineRemoveTargetListener(ctx context.Context, in *EngineRemoveTargetListenerRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, SPDKService_EngineRemoveTargetListener_FullMethodName, in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1212,6 +1223,7 @@ type SPDKServiceServer interface {
 	EngineExpandPrecheck(context.Context, *EngineExpandPrecheckRequest) (*EngineExpandPrecheckResponse, error)
 	EngineDeleteTarget(context.Context, *EngineDeleteTargetRequest) (*emptypb.Empty, error)
 	EngineSetTargetListenerANAState(context.Context, *EngineSetTargetListenerANAStateRequest) (*emptypb.Empty, error)
+	EngineRemoveTargetListener(context.Context, *EngineRemoveTargetListenerRequest) (*emptypb.Empty, error)
 	EngineSnapshotCreate(context.Context, *SnapshotRequest) (*SnapshotResponse, error)
 	EngineSnapshotDelete(context.Context, *SnapshotRequest) (*emptypb.Empty, error)
 	EngineSnapshotRevert(context.Context, *SnapshotRequest) (*emptypb.Empty, error)
@@ -1402,6 +1414,9 @@ func (UnimplementedSPDKServiceServer) EngineDeleteTarget(context.Context, *Engin
 }
 func (UnimplementedSPDKServiceServer) EngineSetTargetListenerANAState(context.Context, *EngineSetTargetListenerANAStateRequest) (*emptypb.Empty, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method EngineSetTargetListenerANAState not implemented")
+}
+func (UnimplementedSPDKServiceServer) EngineRemoveTargetListener(context.Context, *EngineRemoveTargetListenerRequest) (*emptypb.Empty, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method EngineRemoveTargetListener not implemented")
 }
 func (UnimplementedSPDKServiceServer) EngineSnapshotCreate(context.Context, *SnapshotRequest) (*SnapshotResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method EngineSnapshotCreate not implemented")
@@ -2357,6 +2372,24 @@ func _SPDKService_EngineSetTargetListenerANAState_Handler(srv interface{}, ctx c
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(SPDKServiceServer).EngineSetTargetListenerANAState(ctx, req.(*EngineSetTargetListenerANAStateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SPDKService_EngineRemoveTargetListener_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(EngineRemoveTargetListenerRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SPDKServiceServer).EngineRemoveTargetListener(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SPDKService_EngineRemoveTargetListener_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SPDKServiceServer).EngineRemoveTargetListener(ctx, req.(*EngineRemoveTargetListenerRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -3448,6 +3481,10 @@ var SPDKService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "EngineSetTargetListenerANAState",
 			Handler:    _SPDKService_EngineSetTargetListenerANAState_Handler,
+		},
+		{
+			MethodName: "EngineRemoveTargetListener",
+			Handler:    _SPDKService_EngineRemoveTargetListener_Handler,
 		},
 		{
 			MethodName: "EngineSnapshotCreate",

@@ -80,7 +80,10 @@ require (
 	k8s.io/utils v0.0.0-20251002143259-bc988d571ff4 // indirect
 )
 
-// Points at a sibling checkout of go-spdk-helper until a linkpoolio fork ref
-// is published. Clone github.com/longhorn/go-spdk-helper into ../go-spdk-helper
-// and check out the feat/v2-rdma-transport branch before building.
+// Points at sibling checkouts until linkpoolio fork refs are published.
+// Clone github.com/longhorn/go-spdk-helper into ../go-spdk-helper and
+// github.com/longhorn/types into ../longhorn-types, both on the
+// feat/v2-rdma-transport branch, before building.
 replace github.com/longhorn/go-spdk-helper => ../go-spdk-helper
+
+replace github.com/longhorn/types => ../longhorn-types
