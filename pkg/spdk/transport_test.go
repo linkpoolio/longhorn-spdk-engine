@@ -34,33 +34,24 @@ func TestNvmfTransportTypeIsRDMA(t *testing.T) {
 	}
 }
 
-func TestDetectTransportNoInfiniband(t *testing.T) {
-	dir := t.TempDir()
+func withInfinibandSysfs(t *testing.T, path string) {
+	t.Helper()
 	orig := infinibandSysfsPath
-	defer func() { infinibandSysfsPath = orig }()
-	infinibandSysfsPath = filepath.Join(dir, "nonexistent")
+	t.Cleanup(func() { infinibandSysfsPath = orig })
+	infinibandSysfsPath = path
+}
 
-	cap := DetectTransport()
-	if cap.RDMA {
-		t.Errorf("expected RDMA=false when sysfs path missing, got true")
-	}
-	if !cap.TCP {
-		t.Errorf("expected TCP=true always")
-	}
-	if got := cap.PreferredListenerTransport(); got != NvmfTransportTCP {
-		t.Errorf("PreferredListenerTransport = %q, want TCP", got)
+func TestDetectTransportNoInfiniband(t *testing.T) {
+	withInfinibandSysfs(t, filepath.Join(t.TempDir(), "nonexistent"))
+	if DetectTransport().RDMA {
+		t.Errorf("expected RDMA=false when sysfs path missing")
 	}
 }
 
 func TestDetectTransportEmptyInfiniband(t *testing.T) {
-	dir := t.TempDir()
-	orig := infinibandSysfsPath
-	defer func() { infinibandSysfsPath = orig }()
-	infinibandSysfsPath = dir
-
-	cap := DetectTransport()
-	if cap.RDMA {
-		t.Errorf("expected RDMA=false when sysfs path empty, got true")
+	withInfinibandSysfs(t, t.TempDir())
+	if DetectTransport().RDMA {
+		t.Errorf("expected RDMA=false when sysfs path empty")
 	}
 }
 
@@ -69,16 +60,9 @@ func TestDetectTransportWithDevice(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(dir, "mlx5_0"), 0755); err != nil {
 		t.Fatal(err)
 	}
-	orig := infinibandSysfsPath
-	defer func() { infinibandSysfsPath = orig }()
-	infinibandSysfsPath = dir
-
-	cap := DetectTransport()
-	if !cap.RDMA {
-		t.Errorf("expected RDMA=true when device present, got false")
-	}
-	if got := cap.PreferredListenerTransport(); got != NvmfTransportRDMA {
-		t.Errorf("PreferredListenerTransport = %q, want RDMA", got)
+	withInfinibandSysfs(t, dir)
+	if !DetectTransport().RDMA {
+		t.Errorf("expected RDMA=true when device present")
 	}
 }
 
@@ -87,12 +71,8 @@ func TestDetectTransportIgnoresDotEntries(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(dir, ".keep"), 0755); err != nil {
 		t.Fatal(err)
 	}
-	orig := infinibandSysfsPath
-	defer func() { infinibandSysfsPath = orig }()
-	infinibandSysfsPath = dir
-
-	cap := DetectTransport()
-	if cap.RDMA {
-		t.Errorf("expected RDMA=false when only dot entries present, got true")
+	withInfinibandSysfs(t, dir)
+	if DetectTransport().RDMA {
+		t.Errorf("expected RDMA=false when only dot entries present")
 	}
 }

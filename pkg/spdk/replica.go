@@ -74,10 +74,6 @@ type Replica struct {
 	PortStart int32
 	PortEnd   int32
 
-	// ListenerTransport selects the NVMe-oF transport this replica uses
-	// when exposing its bdevs (normal data path, rebuild source, snapshot
-	// clone) and when attaching remote bdevs (rebuild dst pulling from
-	// src, snapshot clone dst pulling from src). Empty/unset == TCP.
 	ListenerTransport NvmfTransportType
 
 	State    types.InstanceState
@@ -122,8 +118,6 @@ type Replica struct {
 	// TODO: Record error message
 }
 
-// transport returns the effective NVMe-oF transport for this replica,
-// folding the empty zero-value into the default (TCP).
 func (r *Replica) transport() NvmfTransportType {
 	if r.ListenerTransport == "" {
 		return DefaultNvmfTransport

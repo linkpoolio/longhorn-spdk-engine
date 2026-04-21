@@ -120,11 +120,6 @@ type Engine struct {
 	ctrlrLossTimeout     int
 	fastIOFailTimeoutSec int
 
-	// ReplicaTransport selects the NVMe-oF transport used when this engine
-	// attaches replicas (both the normal RAID path and the restore
-	// attach-all path). Empty/unset == TCP. RDMA requires that the local
-	// node has /sys/class/infiniband populated and that the remote replica
-	// is listening on the matching transport.
 	ReplicaTransport NvmfTransportType
 
 	ReplicaStatusMap map[string]*EngineReplicaStatus
@@ -169,9 +164,6 @@ type Engine struct {
 	replicaAddFinishUnlockedHook func()
 }
 
-// replicaTransport returns the effective transport for replica attachments,
-// folding the empty zero-value into the default (TCP) so every call site can
-// stay oblivious to whether the engine was constructed transport-aware.
 func (e *Engine) replicaTransport() NvmfTransportType {
 	if e.ReplicaTransport == "" {
 		return DefaultNvmfTransport

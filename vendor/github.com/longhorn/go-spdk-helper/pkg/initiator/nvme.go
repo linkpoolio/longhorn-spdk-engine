@@ -12,14 +12,10 @@ import (
 	"github.com/longhorn/go-spdk-helper/pkg/types"
 )
 
-// DiscoverTarget discovers a target over TCP. For transport-aware discovery
-// use DiscoverTargetWithTransport.
 func DiscoverTarget(ip, port string, executor *commonns.Executor) (subnqn string, err error) {
 	return DiscoverTargetWithTransport(DefaultTransportType, ip, port, executor)
 }
 
-// DiscoverTargetWithTransport discovers a target over the given transport
-// ("tcp" or "rdma"). An empty transport defaults to TCP for backward compat.
 func DiscoverTargetWithTransport(transport, ip, port string, executor *commonns.Executor) (subnqn string, err error) {
 	hostID, err := getHostID(executor)
 	if err != nil {
@@ -44,14 +40,10 @@ func DiscoverTargetWithTransport(transport, ip, port string, executor *commonns.
 	return "", fmt.Errorf("found empty subnqn after nvme discover for %s:%s", ip, port)
 }
 
-// ConnectTarget connects to a target over TCP. For transport-aware connect
-// use ConnectTargetWithTransport.
 func ConnectTarget(ip, port, nqn string, executor *commonns.Executor) (controllerName string, err error) {
 	return ConnectTargetWithTransport(DefaultTransportType, ip, port, nqn, executor)
 }
 
-// ConnectTargetWithTransport connects to a target over the given transport
-// ("tcp" or "rdma"). An empty transport defaults to TCP for backward compat.
 func ConnectTargetWithTransport(transport, ip, port, nqn string, executor *commonns.Executor) (controllerName string, err error) {
 	if transport == "" {
 		transport = DefaultTransportType
