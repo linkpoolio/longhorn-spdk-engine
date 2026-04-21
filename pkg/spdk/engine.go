@@ -186,6 +186,18 @@ func (e *Engine) targetTransport() NvmfTransportType {
 	return e.NvmeTcpTarget.Transport
 }
 
+// resolveCntlidRange returns the cntlid [min, max] range for this engine's
+// subsystem. Single-listener engines keep the legacy scheme (range size 1);
+// dual-listener RDMA engines draw from a disjoint, offset range so rolling
+// upgrades cannot collide legacy and dual-listener cntlids on the same NQN.
+func (e *Engine) resolveCntlidRange() (uint16, uint16) {
+	if e.targetTransport().IsRDMA() {
+		return getEngineDualCntlidRange(e.Name)
+	}
+	cntlid := getEngineCntlid(e.Name)
+	return cntlid, cntlid
+}
+
 type EngineReplicaStatus struct {
 	Address  string
 	BdevName string
@@ -356,13 +368,13 @@ func (e *Engine) createNVMeTCPTarget(spdkClient *spdkclient.Client, superiorPort
 		return errors.Wrapf(err, "failed to blindly stop exposing RAID bdev for engine target %v", e.Name)
 	}
 
-	cntlid := getEngineCntlid(e.Name)
+	minCntlid, maxCntlid := e.resolveCntlidRange()
 	nsUUID := getStableVolumeNsUUID(e.VolumeName)
 
 	e.log.Infof("Starting to expose RAID bdev for engine target %v on %v:%v with initial ANA state %v, primary transport %v, cntlid [%v,%v], nsUUID %v",
-		e.Name, e.NvmeTcpTarget.IP, e.NvmeTcpTarget.Port, initialANAState, e.NvmeTcpTarget.Transport, cntlid, cntlid+1, nsUUID)
+		e.Name, e.NvmeTcpTarget.IP, e.NvmeTcpTarget.Port, initialANAState, e.NvmeTcpTarget.Transport, minCntlid, maxCntlid, nsUUID)
 	if err := spdkClient.StartExposeBdevWithANAStateAndTransport(e.NvmeTcpTarget.Nqn, e.Name, e.NvmeTcpTarget.Nguid, nsUUID,
-		e.NvmeTcpTarget.IP, strconv.Itoa(int(e.NvmeTcpTarget.Port)), e.NvmeTcpTarget.Transport.ToSPDKTransportType(), spdkANAState, cntlid, cntlid+1); err != nil {
+		e.NvmeTcpTarget.IP, strconv.Itoa(int(e.NvmeTcpTarget.Port)), e.NvmeTcpTarget.Transport.ToSPDKTransportType(), spdkANAState, minCntlid, maxCntlid); err != nil {
 		// No need to release ports here. The engine will be marked as ERR by
 		// Create's deferred error handler, and Delete will release the ports
 		// when the user cleans up this engine.
@@ -2510,7 +2522,7 @@ func (e *Engine) Expand(spdkClient *spdkclient.Client, size uint64) (err error) 
 
 	switch e.Frontend {
 	case types.FrontendSPDKTCPBlockdev, types.FrontendSPDKTCPNvmf:
-		cntlid := getEngineCntlid(e.Name)
+		minCntlid, maxCntlid := e.resolveCntlidRange()
 		nsUUID := getStableVolumeNsUUID(e.VolumeName)
 		// Preserve the current ANA state across the expand. If this engine
 		// was demoted to inaccessible during a switchover, re-exposing with
@@ -2524,10 +2536,10 @@ func (e *Engine) Expand(spdkClient *spdkclient.Client, size uint64) (err error) 
 			return errors.Wrapf(err, "invalid ANA state %q for engine target %v during expand", currentANAState, e.Name)
 		}
 		e.log.Infof("Starting to expose RAID bdev for engine target %v on %v:%v with ANA state %v, cntlid [%v,%v], nsUUID %v",
-			e.Name, e.NvmeTcpTarget.IP, e.NvmeTcpTarget.Port, currentANAState, cntlid, cntlid+1, nsUUID)
+			e.Name, e.NvmeTcpTarget.IP, e.NvmeTcpTarget.Port, currentANAState, minCntlid, maxCntlid, nsUUID)
 		if err := spdkClient.StartExposeBdevWithANAStateAndTransport(e.NvmeTcpTarget.Nqn, e.Name, e.NvmeTcpTarget.Nguid, nsUUID,
 			e.NvmeTcpTarget.IP, strconv.Itoa(int(e.NvmeTcpTarget.Port)),
-			e.targetTransport().ToSPDKTransportType(), spdkANAState, cntlid, cntlid+1); err != nil {
+			e.targetTransport().ToSPDKTransportType(), spdkANAState, minCntlid, maxCntlid); err != nil {
 			return errors.Wrapf(err, "failed to start exposing RAID bdev for engine target %v", e.Name)
 		}
 		if e.targetTransport().IsRDMA() && e.NvmeTcpTarget.TCPFallbackPort != 0 {
