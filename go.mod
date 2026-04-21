@@ -80,4 +80,7 @@ require (
 	k8s.io/utils v0.0.0-20251002143259-bc988d571ff4 // indirect
 )
 
-replace github.com/longhorn/go-spdk-helper => /Users/jonny/dev/misc/go-spdk-helper
+// Points at a sibling checkout of go-spdk-helper until a linkpoolio fork ref
+// is published. Clone github.com/longhorn/go-spdk-helper into ../go-spdk-helper
+// and check out the feat/v2-rdma-transport branch before building.
+replace github.com/longhorn/go-spdk-helper => ../go-spdk-helper

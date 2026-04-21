@@ -84,10 +84,6 @@ type NVMeTCPInfo struct {
 	ControllerName     string
 	NamespaceName      string
 
-	// Transport is the NVMe-oF transport for this initiator connection.
-	// Empty string means TCP (legacy behavior). Set to "rdma" to use
-	// NVMe-oF RDMA. The name NVMeTCPInfo is retained for backward
-	// compatibility with callers that predate RDMA support.
 	Transport string
 }
 
@@ -963,6 +959,10 @@ func (i *Initiator) GetEndpoint() string {
 		return i.Endpoint
 	}
 	return ""
+}
+
+func (i *Initiator) GetExecutor() *commonns.Executor {
+	return i.executor
 }
 
 // WaitForControllerLive waits for the NVMe controller at the given address to

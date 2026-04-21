@@ -94,6 +94,8 @@ type EngineFrontend struct {
 	setRemoteEngineTargetANAStateFn func(targetIP, engineName string, anaState NvmeTCPANAState) error
 	// Test hook for waiting for an NVMe-TCP controller to reach live state.
 	waitForNvmeTCPControllerLiveFn func(transportAddress string, transportPort int32) error
+	// Test hook for explicit RDMA controller disconnect during switchover.
+	teardownRemoteRDMAPathFn func(nqn, targetIP, targetPort string) error
 
 	// metadataDir is the base path for persisting engine frontend records.
 	// If empty, persistence is disabled.
@@ -108,6 +110,8 @@ type NvmeTcpFrontend struct {
 
 	Nqn   string
 	Nguid string
+
+	Transport NvmfTransportType
 }
 
 type NvmeTCPANAState string
@@ -134,6 +138,10 @@ type NvmeTCPPath struct {
 	Nqn        string
 	Nguid      string
 	ANAState   NvmeTCPANAState
+
+	// TCP relies on ctrl-loss-tmo for passive cleanup; RDMA needs an
+	// explicit disconnect or the HCA keeps the QP in error state.
+	Transport NvmfTransportType
 }
 
 type UblkFrontend struct {
@@ -257,12 +265,15 @@ func (ef *EngineFrontend) clearNVMeTCPPathsLocked() {
 	ef.PreferredPath = ""
 }
 
-func (ef *EngineFrontend) upsertNVMeTCPPathLocked(targetIP string, targetPort int32, engineName, nqn, nguid string, anaState NvmeTCPANAState) string {
+func (ef *EngineFrontend) upsertNVMeTCPPathLocked(targetIP string, targetPort int32, engineName, nqn, nguid string, anaState NvmeTCPANAState, transport NvmfTransportType) string {
 	ef.ensureVolumeTargetIdentityLocked()
 
 	address := getNvmeTCPPathAddress(targetIP, targetPort)
 	if address == "" {
 		return ""
+	}
+	if transport == "" {
+		transport = DefaultNvmfTransport
 	}
 
 	path := ef.NvmeTCPPathMap[address]
@@ -276,6 +287,7 @@ func (ef *EngineFrontend) upsertNVMeTCPPathLocked(targetIP string, targetPort in
 	path.Nqn = nqn
 	path.Nguid = nguid
 	path.ANAState = anaState
+	path.Transport = transport
 
 	return address
 }
@@ -355,7 +367,8 @@ func (ef *EngineFrontend) syncCurrentNVMeTCPPathLocked() {
 	}
 
 	ef.upsertNVMeTCPPathLocked(ef.NvmeTcpFrontend.TargetIP, ef.NvmeTcpFrontend.TargetPort,
-		ef.EngineName, ef.NvmeTcpFrontend.Nqn, ef.NvmeTcpFrontend.Nguid, NvmeTCPANAStateOptimized)
+		ef.EngineName, ef.NvmeTcpFrontend.Nqn, ef.NvmeTcpFrontend.Nguid, NvmeTCPANAStateOptimized,
+		ef.NvmeTcpFrontend.Transport)
 	ef.promoteNVMeTCPPathLocked(address)
 }
 
@@ -486,6 +499,18 @@ func (ef *EngineFrontend) syncRemoteEngineTargetANAStates(oldTargetIP, oldEngine
 		}
 	}
 
+	// RDMA QPs must be torn down explicitly — a dangling QP in error
+	// state occupies the HCA's QP table until the initiator disconnects.
+	// TCP controllers are left to ctrl-loss-tmo.
+	if oldEngineName != newEngineName || oldTargetIP != newTargetIP {
+		if err := ef.teardownRemoteRDMAPathIfNeeded(oldTargetIP); err != nil {
+			ef.log.WithError(err).WithFields(logrus.Fields{
+				"oldEngineName": oldEngineName,
+				"oldTargetIP":   oldTargetIP,
+			}).Warn("Best-effort RDMA teardown failed; continuing switchover")
+		}
+	}
+
 	// Phase 3: Promote new path to optimized.
 	if err := ef.setRemoteEngineTargetANAState(newTargetIP, newEngineName, NvmeTCPANAStateOptimized); err != nil {
 		syncErr = multierr.Append(syncErr, err)
@@ -496,6 +521,50 @@ func (ef *EngineFrontend) syncRemoteEngineTargetANAStates(oldTargetIP, oldEngine
 	}
 
 	return syncErr
+}
+
+func (ef *EngineFrontend) teardownRemoteRDMAPathIfNeeded(oldTargetIP string) error {
+	if oldTargetIP == "" {
+		return nil
+	}
+
+	ef.RLock()
+	var (
+		matchedPort int32
+		matchedNQN  string
+		isRDMA      bool
+	)
+	for _, path := range ef.NvmeTCPPathMap {
+		if path == nil {
+			continue
+		}
+		if path.TargetIP == oldTargetIP && path.Transport.IsRDMA() {
+			matchedPort = path.TargetPort
+			matchedNQN = path.Nqn
+			isRDMA = true
+			break
+		}
+	}
+	ef.RUnlock()
+
+	if !isRDMA {
+		return nil
+	}
+
+	portStr := strconv.Itoa(int(matchedPort))
+	ef.log.WithFields(logrus.Fields{
+		"oldTargetIP":   oldTargetIP,
+		"oldTargetPort": matchedPort,
+		"nqn":           matchedNQN,
+	}).Info("Explicitly disconnecting old RDMA path to release HCA queue pair")
+
+	if ef.teardownRemoteRDMAPathFn != nil {
+		return ef.teardownRemoteRDMAPathFn(matchedNQN, oldTargetIP, portStr)
+	}
+	if ef.initiator == nil {
+		return nil
+	}
+	return initiator.DisconnectController(matchedNQN, oldTargetIP, portStr, ef.initiator.GetExecutor())
 }
 
 func isSubsystemNotFoundError(err error) bool {

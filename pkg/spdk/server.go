@@ -935,6 +935,7 @@ func (s *Server) recoverEngineFrontends() {
 					Nqn:        path.Nqn,
 					Nguid:      path.Nguid,
 					ANAState:   path.ANAState,
+					Transport:  path.Transport,
 				}
 			}
 		}

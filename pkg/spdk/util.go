@@ -63,9 +63,6 @@ func discoverAndConnectNVMeTarget(srcIP string, srcPort int32, maxRetries int, r
 	return subsystemNQN, controllerName, nil
 }
 
-// exposeSnapshotLvolBdev exposes a snapshot's lvol as an NVMe-oF target.
-// transport selects the listener transport; an empty value defaults to TCP.
-// The initiator side (discover + connect) uses the same transport.
 func exposeSnapshotLvolBdev(spdkClient *spdkclient.Client, lvsName, lvolName, ip string, port int32, transport NvmfTransportType, executor *commonns.Executor) (subsystemNQN, controllerName string, err error) {
 	if transport == "" {
 		transport = DefaultNvmfTransport
@@ -127,18 +124,10 @@ func splitHostPort(address string) (string, int32, error) {
 	return address, 0, nil
 }
 
-// connectNVMfBdev connects to an NVMe-oF target (TCP by default) exposed by
-// a remote lvol bdev. For RDMA use connectNVMfBdevWithTransport.
-// controllerName is typically the lvol name, and address is the IP:port of
-// the target.
 func connectNVMfBdev(spdkClient *spdkclient.Client, controllerName, address string, ctrlrLossTimeout, fastIOFailTimeoutSec int, maxRetries int, retryInterval time.Duration) (bdevName string, err error) {
 	return connectNVMfBdevWithTransport(spdkClient, controllerName, address, DefaultNvmfTransport, ctrlrLossTimeout, fastIOFailTimeoutSec, maxRetries, retryInterval)
 }
 
-// connectNVMfBdevWithTransport is the transport-aware variant of
-// connectNVMfBdev. Passing NvmfTransportRDMA requires that the SPDK target
-// on the other side exposes an rdma listener for the given address; the
-// kernel also needs nvme_rdma + ib_core loaded on this node.
 func connectNVMfBdevWithTransport(spdkClient *spdkclient.Client, controllerName, address string, transport NvmfTransportType, ctrlrLossTimeout, fastIOFailTimeoutSec int, maxRetries int, retryInterval time.Duration) (bdevName string, err error) {
 	if controllerName == "" || address == "" {
 		return "", fmt.Errorf("controllerName or address is empty")
