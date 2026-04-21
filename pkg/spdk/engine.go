@@ -10,6 +10,7 @@ import (
 
 	"github.com/cockroachdb/errors"
 	"github.com/sirupsen/logrus"
+	"go.uber.org/multierr"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/retry"
 
@@ -45,6 +46,12 @@ type NvmeTcpTarget struct {
 	Nguid     string
 	ANAState  NvmeTCPANAState
 	Transport NvmfTransportType
+
+	// TCPFallbackPort is the secondary TCP listener port used on
+	// RDMA-capable nodes. The fallback listener stays pinned at
+	// NvmeTCPANAStateNonOptimized; ANA switchover only flips the primary.
+	// Zero means no fallback (primary is already TCP).
+	TCPFallbackPort int32
 }
 
 func toSPDKListenerANAState(anaState NvmeTCPANAState) (spdktypes.NvmfSubsystemListenerAnaState, error) {
@@ -177,6 +184,18 @@ func (e *Engine) targetTransport() NvmfTransportType {
 		return DefaultNvmfTransport
 	}
 	return e.NvmeTcpTarget.Transport
+}
+
+// resolveCntlidRange returns the cntlid [min, max] range for this engine's
+// subsystem. Single-listener engines keep the legacy scheme (range size 1);
+// dual-listener RDMA engines draw from a disjoint, offset range so rolling
+// upgrades cannot collide legacy and dual-listener cntlids on the same NQN.
+func (e *Engine) resolveCntlidRange() (uint16, uint16) {
+	if e.targetTransport().IsRDMA() {
+		return getEngineDualCntlidRange(e.Name)
+	}
+	cntlid := getEngineCntlid(e.Name)
+	return cntlid, cntlid
 }
 
 type EngineReplicaStatus struct {
@@ -349,13 +368,13 @@ func (e *Engine) createNVMeTCPTarget(spdkClient *spdkclient.Client, superiorPort
 		return errors.Wrapf(err, "failed to blindly stop exposing RAID bdev for engine target %v", e.Name)
 	}
 
-	cntlid := getEngineCntlid(e.Name)
+	minCntlid, maxCntlid := e.resolveCntlidRange()
 	nsUUID := getStableVolumeNsUUID(e.VolumeName)
 
-	e.log.Infof("Starting to expose RAID bdev for engine target %v on %v:%v with initial ANA state %v, cntlid %v, nsUUID %v",
-		e.Name, e.NvmeTcpTarget.IP, e.NvmeTcpTarget.Port, initialANAState, cntlid, nsUUID)
+	e.log.Infof("Starting to expose RAID bdev for engine target %v on %v:%v with initial ANA state %v, primary transport %v, cntlid [%v,%v], nsUUID %v",
+		e.Name, e.NvmeTcpTarget.IP, e.NvmeTcpTarget.Port, initialANAState, e.NvmeTcpTarget.Transport, minCntlid, maxCntlid, nsUUID)
 	if err := spdkClient.StartExposeBdevWithANAStateAndTransport(e.NvmeTcpTarget.Nqn, e.Name, e.NvmeTcpTarget.Nguid, nsUUID,
-		e.NvmeTcpTarget.IP, strconv.Itoa(int(e.NvmeTcpTarget.Port)), e.NvmeTcpTarget.Transport.ToSPDKTransportType(), spdkANAState, cntlid, cntlid); err != nil {
+		e.NvmeTcpTarget.IP, strconv.Itoa(int(e.NvmeTcpTarget.Port)), e.NvmeTcpTarget.Transport.ToSPDKTransportType(), spdkANAState, minCntlid, maxCntlid); err != nil {
 		// No need to release ports here. The engine will be marked as ERR by
 		// Create's deferred error handler, and Delete will release the ports
 		// when the user cleans up this engine.
@@ -364,6 +383,52 @@ func (e *Engine) createNVMeTCPTarget(spdkClient *spdkclient.Client, superiorPort
 
 	e.NvmeTcpTarget.ANAState = initialANAState
 
+	if e.NvmeTcpTarget.Transport.IsRDMA() {
+		if err := e.addTCPFallbackListener(spdkClient, superiorPortAllocator); err != nil {
+			return errors.Wrapf(err, "failed to add TCP fallback listener for engine target %v", e.Name)
+		}
+	}
+
+	return nil
+}
+
+// addTCPFallbackListener attaches a TCP listener to the primary RDMA
+// subsystem at a freshly allocated port, pinned at ANA non-optimized so
+// RDMA-capable initiators keep using the primary while TCP-only ones can
+// still reach the volume. This listener's ANA state is never touched by
+// switchover; the pinned non-optimized state is the fallback contract.
+func (e *Engine) addTCPFallbackListener(spdkClient *spdkclient.Client, superiorPortAllocator *commonbitmap.Bitmap) error {
+	port, _, err := superiorPortAllocator.AllocateRange(1)
+	if err != nil {
+		return errors.Wrapf(err, "failed to allocate TCP fallback port")
+	}
+
+	listenerANAState, err := toSPDKListenerANAState(NvmeTCPANAStateNonOptimized)
+	if err != nil {
+		return err
+	}
+	if _, err := spdkClient.NvmfSubsystemAddListener(
+		e.NvmeTcpTarget.Nqn,
+		e.NvmeTcpTarget.IP, strconv.Itoa(int(port)),
+		spdktypes.NvmeTransportTypeTCP, spdktypes.NvmeAddressFamilyIPv4,
+	); err != nil {
+		if rErr := superiorPortAllocator.ReleaseRange(port, port); rErr != nil {
+			e.log.WithError(rErr).Warnf("Failed to release fallback port %d after listener add failure", port)
+		}
+		return errors.Wrapf(err, "failed to add TCP fallback listener on port %d", port)
+	}
+	if _, err := spdkClient.NvmfSubsystemListenerSetANAState(
+		e.NvmeTcpTarget.Nqn,
+		e.NvmeTcpTarget.IP, strconv.Itoa(int(port)),
+		spdktypes.NvmeTransportTypeTCP, spdktypes.NvmeAddressFamilyIPv4,
+		listenerANAState, spdktypes.DefaultNvmfANAGroupID,
+	); err != nil {
+		return errors.Wrapf(err, "failed to pin TCP fallback ANA state to non-optimized")
+	}
+
+	e.NvmeTcpTarget.TCPFallbackPort = port
+	e.log.Infof("Added TCP fallback listener for engine target %v on %v:%v (ANA non-optimized, pinned)",
+		e.Name, e.NvmeTcpTarget.IP, port)
 	return nil
 }
 
@@ -716,13 +781,18 @@ func (e *Engine) releasePorts(superiorPortAllocator *commonbitmap.Bitmap) error 
 		return nil
 	}
 
-	err := releasePortIfExists(superiorPortAllocator,
-		map[int32]struct{}{
-			e.NvmeTcpTarget.Port: {},
-		},
-		e.NvmeTcpTarget.Port)
+	ports := map[int32]struct{}{e.NvmeTcpTarget.Port: {}}
+	if e.NvmeTcpTarget.TCPFallbackPort != 0 {
+		ports[e.NvmeTcpTarget.TCPFallbackPort] = struct{}{}
+	}
+
+	err := multierr.Append(
+		releasePortIfExists(superiorPortAllocator, ports, e.NvmeTcpTarget.Port),
+		releasePortIfExists(superiorPortAllocator, ports, e.NvmeTcpTarget.TCPFallbackPort),
+	)
 
 	e.NvmeTcpTarget.Port = 0
+	e.NvmeTcpTarget.TCPFallbackPort = 0
 
 	return err
 }
@@ -2452,7 +2522,7 @@ func (e *Engine) Expand(spdkClient *spdkclient.Client, size uint64) (err error) 
 
 	switch e.Frontend {
 	case types.FrontendSPDKTCPBlockdev, types.FrontendSPDKTCPNvmf:
-		cntlid := getEngineCntlid(e.Name)
+		minCntlid, maxCntlid := e.resolveCntlidRange()
 		nsUUID := getStableVolumeNsUUID(e.VolumeName)
 		// Preserve the current ANA state across the expand. If this engine
 		// was demoted to inaccessible during a switchover, re-exposing with
@@ -2465,12 +2535,33 @@ func (e *Engine) Expand(spdkClient *spdkclient.Client, size uint64) (err error) 
 		if err != nil {
 			return errors.Wrapf(err, "invalid ANA state %q for engine target %v during expand", currentANAState, e.Name)
 		}
-		e.log.Infof("Starting to expose RAID bdev for engine target %v on %v:%v with ANA state %v, cntlid %v, nsUUID %v",
-			e.Name, e.NvmeTcpTarget.IP, e.NvmeTcpTarget.Port, currentANAState, cntlid, nsUUID)
-		if err := spdkClient.StartExposeBdevWithANAState(e.NvmeTcpTarget.Nqn, e.Name, e.NvmeTcpTarget.Nguid, nsUUID,
+		e.log.Infof("Starting to expose RAID bdev for engine target %v on %v:%v with ANA state %v, cntlid [%v,%v], nsUUID %v",
+			e.Name, e.NvmeTcpTarget.IP, e.NvmeTcpTarget.Port, currentANAState, minCntlid, maxCntlid, nsUUID)
+		if err := spdkClient.StartExposeBdevWithANAStateAndTransport(e.NvmeTcpTarget.Nqn, e.Name, e.NvmeTcpTarget.Nguid, nsUUID,
 			e.NvmeTcpTarget.IP, strconv.Itoa(int(e.NvmeTcpTarget.Port)),
-			spdkANAState, cntlid, cntlid); err != nil {
+			e.targetTransport().ToSPDKTransportType(), spdkANAState, minCntlid, maxCntlid); err != nil {
 			return errors.Wrapf(err, "failed to start exposing RAID bdev for engine target %v", e.Name)
+		}
+		if e.targetTransport().IsRDMA() && e.NvmeTcpTarget.TCPFallbackPort != 0 {
+			listenerANAState, err := toSPDKListenerANAState(NvmeTCPANAStateNonOptimized)
+			if err != nil {
+				return err
+			}
+			if _, err := spdkClient.NvmfSubsystemAddListener(
+				e.NvmeTcpTarget.Nqn,
+				e.NvmeTcpTarget.IP, strconv.Itoa(int(e.NvmeTcpTarget.TCPFallbackPort)),
+				spdktypes.NvmeTransportTypeTCP, spdktypes.NvmeAddressFamilyIPv4,
+			); err != nil {
+				return errors.Wrapf(err, "failed to re-add TCP fallback listener for engine target %v after expand", e.Name)
+			}
+			if _, err := spdkClient.NvmfSubsystemListenerSetANAState(
+				e.NvmeTcpTarget.Nqn,
+				e.NvmeTcpTarget.IP, strconv.Itoa(int(e.NvmeTcpTarget.TCPFallbackPort)),
+				spdktypes.NvmeTransportTypeTCP, spdktypes.NvmeAddressFamilyIPv4,
+				listenerANAState, spdktypes.DefaultNvmfANAGroupID,
+			); err != nil {
+				return errors.Wrapf(err, "failed to pin TCP fallback ANA state after expand")
+			}
 		}
 	case types.FrontendEmpty:
 		e.log.Infof("Skipping RAID bdev exposure for engine %s after expansion because frontend is empty", e.Name)

@@ -390,11 +390,6 @@ func generateNsUUID(name string) string {
 	return nsUUID.String() // standard UUID format: 8-4-4-4-12
 }
 
-// getEngineCntlid derives a unique NVMe controller ID from the engine name.
-// Engine names have the format "{volumeName}-e-{ordinal}", where ordinal is
-// 0, 1, 2, etc. The CNTLID must be unique per subsystem NQN to avoid
-// "Duplicate cntlid" errors when the host connects to multiple SPDK targets
-// sharing the same NQN for NVMe multipath.
 func getEngineCntlid(engineName string) uint16 {
 	parts := strings.Split(engineName, "-")
 	if len(parts) > 0 {
@@ -403,4 +398,16 @@ func getEngineCntlid(engineName string) uint16 {
 		}
 	}
 	return 1 // fallback
+}
+
+// dualListenerCntlidBase offsets dual-listener (RDMA + TCP fallback) cntlid
+// ranges out of the 1..~1000 band used by legacy single-listener engines
+// so pre-upgrade and post-upgrade engines sharing the same NQN during a
+// rolling upgrade cannot collide.
+const dualListenerCntlidBase uint16 = 1000
+
+func getEngineDualCntlidRange(engineName string) (uint16, uint16) {
+	ordinal := uint16(getEngineCntlid(engineName) - 1)
+	lo := dualListenerCntlidBase + ordinal*2 + 1
+	return lo, lo + 1
 }
