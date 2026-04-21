@@ -249,7 +249,7 @@ func ServiceReplicaToProtoReplica(r *Replica) *spdkrpc.Replica {
 	return res
 }
 
-func NewReplica(ctx context.Context, replicaName, lvsName, lvsUUID string, specSize uint64, snapshotChecksumEnabled bool, updateCh chan interface{}) *Replica {
+func NewReplica(ctx context.Context, replicaName, lvsName, lvsUUID string, specSize uint64, snapshotChecksumEnabled bool, listenerTransport NvmfTransportType, updateCh chan interface{}) *Replica {
 	log := logrus.StandardLogger().WithFields(logrus.Fields{
 		"replicaName": replicaName,
 		"lvsName":     lvsName,
@@ -271,8 +271,9 @@ func NewReplica(ctx context.Context, replicaName, lvsName, lvsUUID string, specS
 		LvsUUID: lvsUUID,
 		Nqn:     helpertypes.GetNQN(replicaName),
 
-		SpecSize: roundedSpecSize,
-		State:    types.InstanceStatePending,
+		SpecSize:          roundedSpecSize,
+		ListenerTransport: listenerTransport,
+		State:             types.InstanceStatePending,
 
 		Head: nil,
 		ActiveChain: []*Lvol{

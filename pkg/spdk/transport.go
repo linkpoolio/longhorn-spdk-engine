@@ -6,6 +6,8 @@ import (
 
 	"github.com/sirupsen/logrus"
 
+	"github.com/longhorn/go-spdk-helper/pkg/jsonrpc"
+	spdkclient "github.com/longhorn/go-spdk-helper/pkg/spdk/client"
 	spdktypes "github.com/longhorn/go-spdk-helper/pkg/spdk/types"
 )
 
@@ -33,13 +35,8 @@ type TransportCapability struct {
 	RDMA bool
 }
 
-// infinibandSysfsPath is a var so tests can redirect it.
 var infinibandSysfsPath = "/sys/class/infiniband"
 
-// DetectTransport probes /sys/class/infiniband for RDMA devices. It is
-// intentionally coarse: presence of a device entry flips RDMA on, but a
-// working fabric is not verified. The SPDK target's nvmf_create_transport
-// call is the real gate and falls back to TCP on failure.
 func DetectTransport() TransportCapability {
 	entries, err := os.ReadDir(infinibandSysfsPath)
 	if err != nil {
@@ -54,4 +51,16 @@ func DetectTransport() TransportCapability {
 		}
 	}
 	return TransportCapability{}
+}
+
+func NegotiateNodeTransport(spdkClient *spdkclient.Client) NvmfTransportType {
+	if !DetectTransport().RDMA {
+		return NvmfTransportTCP
+	}
+	if _, err := spdkClient.NvmfCreateTransport(spdktypes.NvmeTransportTypeRDMA); err != nil && !jsonrpc.IsJSONRPCRespErrorTransportTypeAlreadyExists(err) {
+		logrus.WithError(err).Warn("SPDK rejected nvmf_create_transport(rdma); falling back to TCP for NVMe-oF")
+		return NvmfTransportTCP
+	}
+	logrus.Info("NVMe-oF RDMA transport negotiated on this node")
+	return NvmfTransportRDMA
 }

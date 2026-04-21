@@ -13,7 +13,7 @@ import (
 func (s *TestSuite) TestSnapshotOperationPreCheckCreateGeneratesName(c *C) {
 	fmt.Println("Testing snapshotOperationPreCheckWithoutLock generates snapshot name for create operation")
 
-	e := NewEngine("engine-a", "vol-a", types.FrontendSPDKTCPBlockdev, 10, make(chan interface{}, 1))
+	e := NewEngine("engine-a", "vol-a", types.FrontendSPDKTCPBlockdev, 10, NvmfTransportTCP, make(chan interface{}, 1))
 
 	snapshotName, err := e.snapshotOperationPreCheckWithoutLock(map[string]*client.SPDKClient{}, "", SnapshotOperationCreate)
 	c.Assert(err, IsNil)
@@ -24,7 +24,7 @@ func (s *TestSuite) TestSnapshotOperationPreCheckCreateGeneratesName(c *C) {
 func (s *TestSuite) TestSnapshotOperationPreCheckDeleteEmptyName(c *C) {
 	fmt.Println("Testing snapshotOperationPreCheckWithoutLock returns error for delete operation with empty snapshot name")
 
-	e := NewEngine("engine-a", "vol-a", types.FrontendSPDKTCPBlockdev, 10, make(chan interface{}, 1))
+	e := NewEngine("engine-a", "vol-a", types.FrontendSPDKTCPBlockdev, 10, NvmfTransportTCP, make(chan interface{}, 1))
 
 	_, err := e.snapshotOperationPreCheckWithoutLock(map[string]*client.SPDKClient{}, "", SnapshotOperationDelete)
 	c.Assert(err, NotNil)
@@ -34,7 +34,7 @@ func (s *TestSuite) TestSnapshotOperationPreCheckDeleteEmptyName(c *C) {
 func (s *TestSuite) TestEngineFrontendSnapshotOperationCreateFailsWhenInitiatorNil(c *C) {
 	fmt.Println("Testing engine frontend snapshotOperation returns error when initiator is nil for create operation")
 
-	ef := NewEngineFrontend("ef-a", "engine-a", "vol-a", types.FrontendSPDKTCPBlockdev, 10, 0, 0, make(chan interface{}, 1))
+	ef := NewEngineFrontend("ef-a", "engine-a", "vol-a", types.FrontendSPDKTCPBlockdev, 10, 0, 0, NvmfTransportTCP, make(chan interface{}, 1))
 	ef.State = types.InstanceStateRunning
 	ef.Frontend = types.FrontendSPDKTCPBlockdev
 	ef.Endpoint = "/dev/longhorn/test"

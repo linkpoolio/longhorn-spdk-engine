@@ -9,7 +9,7 @@ import (
 )
 
 func (s *TestSuite) TestTeardownRemoteRDMAPathIfNeededNoopForTCPPath(c *C) {
-	ef := NewEngineFrontend("ef-a", "engine-a", "vol-a", lhtypes.FrontendSPDKTCPNvmf, 1024, 0, 0, make(chan interface{}, 1))
+	ef := NewEngineFrontend("ef-a", "engine-a", "vol-a", lhtypes.FrontendSPDKTCPNvmf, 1024, 0, 0, NvmfTransportTCP, make(chan interface{}, 1))
 	ef.NvmeTCPPathMap["10.0.0.1:2000"] = &NvmeTCPPath{
 		TargetIP:   "10.0.0.1",
 		TargetPort: 2000,
@@ -29,7 +29,7 @@ func (s *TestSuite) TestTeardownRemoteRDMAPathIfNeededNoopForTCPPath(c *C) {
 }
 
 func (s *TestSuite) TestTeardownRemoteRDMAPathIfNeededDisconnectsRDMAPath(c *C) {
-	ef := NewEngineFrontend("ef-a", "engine-a", "vol-a", lhtypes.FrontendSPDKTCPNvmf, 1024, 0, 0, make(chan interface{}, 1))
+	ef := NewEngineFrontend("ef-a", "engine-a", "vol-a", lhtypes.FrontendSPDKTCPNvmf, 1024, 0, 0, NvmfTransportTCP, make(chan interface{}, 1))
 	ef.NvmeTCPPathMap["10.0.0.1:2000"] = &NvmeTCPPath{
 		TargetIP:   "10.0.0.1",
 		TargetPort: 2000,
@@ -53,7 +53,7 @@ func (s *TestSuite) TestTeardownRemoteRDMAPathIfNeededDisconnectsRDMAPath(c *C) 
 }
 
 func (s *TestSuite) TestTeardownRemoteRDMAPathIfNeededNoopForMissingPath(c *C) {
-	ef := NewEngineFrontend("ef-a", "engine-a", "vol-a", lhtypes.FrontendSPDKTCPNvmf, 1024, 0, 0, make(chan interface{}, 1))
+	ef := NewEngineFrontend("ef-a", "engine-a", "vol-a", lhtypes.FrontendSPDKTCPNvmf, 1024, 0, 0, NvmfTransportTCP, make(chan interface{}, 1))
 	called := false
 	ef.teardownRemoteRDMAPathFn = func(nqn, ip, port string) error {
 		called = true
@@ -65,7 +65,7 @@ func (s *TestSuite) TestTeardownRemoteRDMAPathIfNeededNoopForMissingPath(c *C) {
 }
 
 func (s *TestSuite) TestTeardownRemoteRDMAPathIfNeededEmptyIP(c *C) {
-	ef := NewEngineFrontend("ef-a", "engine-a", "vol-a", lhtypes.FrontendSPDKTCPNvmf, 1024, 0, 0, make(chan interface{}, 1))
+	ef := NewEngineFrontend("ef-a", "engine-a", "vol-a", lhtypes.FrontendSPDKTCPNvmf, 1024, 0, 0, NvmfTransportTCP, make(chan interface{}, 1))
 	called := false
 	ef.teardownRemoteRDMAPathFn = func(nqn, ip, port string) error {
 		called = true
@@ -77,7 +77,7 @@ func (s *TestSuite) TestTeardownRemoteRDMAPathIfNeededEmptyIP(c *C) {
 }
 
 func (s *TestSuite) TestTeardownRemoteRDMAPathIfNeededPropagatesError(c *C) {
-	ef := NewEngineFrontend("ef-a", "engine-a", "vol-a", lhtypes.FrontendSPDKTCPNvmf, 1024, 0, 0, make(chan interface{}, 1))
+	ef := NewEngineFrontend("ef-a", "engine-a", "vol-a", lhtypes.FrontendSPDKTCPNvmf, 1024, 0, 0, NvmfTransportTCP, make(chan interface{}, 1))
 	ef.NvmeTCPPathMap["10.0.0.1:2000"] = &NvmeTCPPath{
 		TargetIP:   "10.0.0.1",
 		TargetPort: 2000,

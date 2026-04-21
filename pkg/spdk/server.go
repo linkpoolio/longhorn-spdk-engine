@@ -63,6 +63,8 @@ type Server struct {
 	// metadataDir is the base path for persisting engine frontend records
 	// (e.g. /var/lib/longhorn). If empty, persistence is disabled.
 	metadataDir string
+
+	nodeTransport NvmfTransportType
 }
 
 func NewServer(ctx context.Context, portStart, portEnd int32) (*Server, error) {
@@ -84,6 +86,8 @@ func NewServer(ctx context.Context, portStart, portEnd int32) (*Server, error) {
 		replicaKeepAliveTimeoutMs); err != nil {
 		return nil, errors.Wrap(err, "failed to set NVMe options")
 	}
+
+	nodeTransport := NegotiateNodeTransport(cli)
 
 	broadcasters := map[types.InstanceType]*broadcaster.Broadcaster{}
 	broadcastChs := map[types.InstanceType]chan interface{}{}
@@ -116,7 +120,8 @@ func NewServer(ctx context.Context, portStart, portEnd int32) (*Server, error) {
 		broadcastChs: broadcastChs,
 		updateChs:    updateChs,
 
-		metadataDir: types.MetadataDir,
+		metadataDir:   types.MetadataDir,
+		nodeTransport: nodeTransport,
 	}
 	s.hotplugActive.Store(true)
 
@@ -411,7 +416,7 @@ func (s *Server) rebuildCachedLvolObjects(state *verifyState) error {
 			lvsUUID := bdevLvol.DriverSpecific.Lvol.LvolStoreUUID
 			specSize := bdevLvol.NumBlocks * uint64(bdevLvol.BlockSize)
 			actualSize := bdevLvol.DriverSpecific.Lvol.NumAllocatedClusters * uint64(defaultClusterSize)
-			state.replicaMap[lvolName] = NewReplica(s.ctx, lvolName, lvsUUIDNameMap[lvsUUID], lvsUUID, specSize, true, s.updateChs[types.InstanceTypeReplica])
+			state.replicaMap[lvolName] = NewReplica(s.ctx, lvolName, lvsUUIDNameMap[lvsUUID], lvsUUID, specSize, true, s.nodeTransport, s.updateChs[types.InstanceTypeReplica])
 			state.replicaMapForSync[lvolName] = state.replicaMap[lvolName]
 			logrus.Infof("Detected one possible existing replica %s(%s) with disk %s(%s), spec size %d, actual size %d", bdevLvol.Aliases[0], bdevLvol.UUID, lvsUUIDNameMap[lvsUUID], lvsUUID, specSize, actualSize)
 		}
@@ -586,7 +591,7 @@ func (s *Server) newReplica(req *spdkrpc.ReplicaCreateRequest) (*Replica, error)
 	if !exists {
 		return nil, fmt.Errorf("lvstore %v(%v) does not exist for replica %v creation", req.LvsName, req.LvsUuid, req.Name)
 	}
-	return NewReplica(s.ctx, req.Name, req.LvsName, req.LvsUuid, req.SpecSize, true, s.updateChs[types.InstanceTypeReplica]), nil
+	return NewReplica(s.ctx, req.Name, req.LvsName, req.LvsUuid, req.SpecSize, true, s.nodeTransport, s.updateChs[types.InstanceTypeReplica]), nil
 }
 
 func (s *Server) getBackingImage(backingImageName, lvsUUID string) (backingImage *BackingImage, err error) {
@@ -912,7 +917,7 @@ func (s *Server) recoverEngineFrontends() {
 		}
 
 		ef := NewEngineFrontend(record.Name, record.EngineName, record.VolumeName,
-			record.Frontend, record.SpecSize, 0, 0, s.updateChs[types.InstanceTypeEngineFrontend])
+			record.Frontend, record.SpecSize, 0, 0, s.nodeTransport, s.updateChs[types.InstanceTypeEngineFrontend])
 		ef.metadataDir = s.metadataDir
 		ef.VolumeNQN = record.VolumeNQN
 		ef.VolumeNGUID = record.VolumeNGUID
