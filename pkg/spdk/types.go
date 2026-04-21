@@ -391,16 +391,15 @@ func generateNsUUID(name string) string {
 }
 
 // getEngineCntlid derives a unique NVMe controller ID from the engine name.
-// Engine names have the format "{volumeName}-e-{ordinal}", where ordinal is
-// 0, 1, 2, etc. The CNTLID must be unique per subsystem NQN to avoid
-// "Duplicate cntlid" errors when the host connects to multiple SPDK targets
-// sharing the same NQN for NVMe multipath.
+// Each engine claims 2 adjacent cntlids (low = cntlid, high = cntlid+1) so
+// that dual-listener (RDMA + TCP fallback) targets have room for both
+// controllers when an initiator multipath-connects to the same subsystem.
 func getEngineCntlid(engineName string) uint16 {
 	parts := strings.Split(engineName, "-")
 	if len(parts) > 0 {
 		if ordinal, err := strconv.Atoi(parts[len(parts)-1]); err == nil {
-			return uint16(ordinal + 1) // CNTLID must be >= 1
+			return uint16((ordinal + 1) * 2) // CNTLID must be >= 1; step by 2
 		}
 	}
-	return 1 // fallback
+	return 2 // fallback
 }
