@@ -63,7 +63,12 @@ func discoverAndConnectNVMeTarget(srcIP string, srcPort int32, maxRetries int, r
 	return subsystemNQN, controllerName, nil
 }
 
-func exposeSnapshotLvolBdev(spdkClient *spdkclient.Client, lvsName, lvolName, ip string, port int32, executor *commonns.Executor) (subsystemNQN, controllerName string, err error) {
+func exposeSnapshotLvolBdev(spdkClient *spdkclient.Client, lvsName, lvolName, ip string, port int32, transport NvmfTransportType, executor *commonns.Executor) (subsystemNQN, controllerName string, err error) {
+	if transport == "" {
+		transport = DefaultNvmfTransport
+	}
+	spdkTransport := transport.ToSPDKTransportType()
+
 	bdevLvolList, err := spdkClient.BdevLvolGet(spdktypes.GetLvolAlias(lvsName, lvolName), 0)
 	if err != nil {
 		return "", "", err
@@ -73,20 +78,21 @@ func exposeSnapshotLvolBdev(spdkClient *spdkclient.Client, lvsName, lvolName, ip
 	}
 
 	portStr := strconv.Itoa(int(port))
-	err = spdkClient.StartExposeBdev(helpertypes.GetNQN(lvolName), bdevLvolList[0].UUID, generateNGUID(lvolName), ip, portStr)
+	err = spdkClient.StartExposeBdevWithTransport(helpertypes.GetNQN(lvolName), bdevLvolList[0].UUID, generateNGUID(lvolName), ip, portStr, spdkTransport)
 	if err != nil {
 		return "", "", errors.Wrapf(err, "failed to expose snapshot lvol bdev %v", lvolName)
 	}
 
+	transportStr := string(transport)
 	for r := 0; r < maxRetries; r++ {
-		subsystemNQN, err = initiator.DiscoverTarget(ip, portStr, executor)
+		subsystemNQN, err = initiator.DiscoverTargetWithTransport(transportStr, ip, portStr, executor)
 		if err != nil {
 			logrus.WithError(err).Errorf("Failed to discover target for snapshot lvol bdev %v", lvolName)
 			time.Sleep(retryInterval)
 			continue
 		}
 
-		controllerName, err = initiator.ConnectTarget(ip, portStr, subsystemNQN, executor)
+		controllerName, err = initiator.ConnectTargetWithTransport(transportStr, ip, portStr, subsystemNQN, executor)
 		if err != nil {
 			logrus.WithError(err).Errorf("Failed to connect target for snapshot lvol bdev %v", lvolName)
 			time.Sleep(retryInterval)
@@ -118,9 +124,11 @@ func splitHostPort(address string) (string, int32, error) {
 	return address, 0, nil
 }
 
-// connectNVMfBdev connects to the NVMe/TCP target, which is exposed by a remote lvol bdev.
-// controllerName is typically the lvol name, and address is the IP:port of the NVMe/TCP target.
 func connectNVMfBdev(spdkClient *spdkclient.Client, controllerName, address string, ctrlrLossTimeout, fastIOFailTimeoutSec int, maxRetries int, retryInterval time.Duration) (bdevName string, err error) {
+	return connectNVMfBdevWithTransport(spdkClient, controllerName, address, DefaultNvmfTransport, ctrlrLossTimeout, fastIOFailTimeoutSec, maxRetries, retryInterval)
+}
+
+func connectNVMfBdevWithTransport(spdkClient *spdkclient.Client, controllerName, address string, transport NvmfTransportType, ctrlrLossTimeout, fastIOFailTimeoutSec int, maxRetries int, retryInterval time.Duration) (bdevName string, err error) {
 	if controllerName == "" || address == "" {
 		return "", fmt.Errorf("controllerName or address is empty")
 	}
@@ -144,6 +152,7 @@ func connectNVMfBdev(spdkClient *spdkclient.Client, controllerName, address stri
 	}
 
 	nvmeBdevNameList := []string{}
+	spdkTransport := transport.ToSPDKTransportType()
 	err = retry.Do(
 		func() error {
 			var err error
@@ -152,7 +161,7 @@ func connectNVMfBdev(spdkClient *spdkclient.Client, controllerName, address stri
 				helpertypes.GetNQN(controllerName),
 				ip,
 				port,
-				spdktypes.NvmeTransportTypeTCP,
+				spdkTransport,
 				spdktypes.NvmeAddressFamilyIPv4,
 				int32(ctrlrLossTimeout),
 				replicaReconnectDelaySec,
@@ -167,14 +176,17 @@ func connectNVMfBdev(spdkClient *spdkclient.Client, controllerName, address stri
 		retry.LastErrorOnly(true),
 		retry.OnRetry(func(n uint, err error) {
 			logrus.WithError(err).Warnf(
-				"Retrying NVMe bdev attach: controller=%s address=%s attempt=%d/%d next_wait=%s",
-				controllerName, address, n+1, maxRetries, retryInterval,
+				"Retrying NVMe bdev attach: controller=%s address=%s transport=%s attempt=%d/%d next_wait=%s",
+				controllerName, address, transport, n+1, maxRetries, retryInterval,
 			)
 		}),
 	)
 
 	if err != nil {
-		return "", fmt.Errorf("attach NVMe controller failed after %d attempts: %w", maxRetries, err)
+		nvmeBdevNameList, err = attemptTCPFallback(spdkClient, controllerName, ip, port, ctrlrLossTimeout, fastIOFailTimeoutSec, transport, err)
+		if err != nil {
+			return "", fmt.Errorf("attach NVMe controller failed after %d attempts: %w", maxRetries, err)
+		}
 	}
 
 	if len(nvmeBdevNameList) != 1 {
@@ -182,6 +194,40 @@ func connectNVMfBdev(spdkClient *spdkclient.Client, controllerName, address stri
 	}
 
 	return nvmeBdevNameList[0], nil
+}
+
+func attemptTCPFallback(spdkClient *spdkclient.Client, controllerName, ip, port string, ctrlrLossTimeout, fastIOFailTimeoutSec int, originalTransport NvmfTransportType, primaryErr error) ([]string, error) {
+	primaryPort, parseErr := strconv.Atoi(port)
+	if parseErr != nil {
+		return nil, primaryErr
+	}
+	fallbackPort := strconv.Itoa(primaryPort + 1)
+
+	if _, detachErr := spdkClient.BdevNvmeDetachController(controllerName); detachErr != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(detachErr) {
+		return nil, primaryErr
+	}
+
+	logrus.WithError(primaryErr).Warnf(
+		"Primary NVMe attach failed (controller=%s transport=%s address=%s:%s); trying TCP fallback on %s:%s",
+		controllerName, originalTransport, ip, port, ip, fallbackPort,
+	)
+
+	list, err := spdkClient.BdevNvmeAttachController(
+		controllerName,
+		helpertypes.GetNQN(controllerName),
+		ip,
+		fallbackPort,
+		spdktypes.NvmeTransportTypeTCP,
+		spdktypes.NvmeAddressFamilyIPv4,
+		int32(ctrlrLossTimeout),
+		replicaReconnectDelaySec,
+		int32(fastIOFailTimeoutSec),
+		replicaMultipath,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("primary attach failed (%v) and TCP fallback to %s:%s also failed: %w", primaryErr, ip, fallbackPort, err)
+	}
+	return list, nil
 }
 
 func disconnectNVMfBdev(spdkClient *spdkclient.Client, bdevName string, maxRetries int, retryInterval time.Duration) error {

@@ -74,6 +74,8 @@ type Replica struct {
 	PortStart int32
 	PortEnd   int32
 
+	ListenerTransport NvmfTransportType
+
 	State    types.InstanceState
 	ErrorMsg string
 
@@ -114,6 +116,27 @@ type Replica struct {
 	log *safelog.SafeLogger
 
 	// TODO: Record error message
+}
+
+func (r *Replica) transport() NvmfTransportType {
+	if r.ListenerTransport == "" {
+		return DefaultNvmfTransport
+	}
+	return r.ListenerTransport
+}
+
+func (r *Replica) addTCPFallbackListener(spdkClient *spdkclient.Client, nqn string) error {
+	if r.transport() == NvmfTransportTCP {
+		return nil
+	}
+	fallbackPort := strconv.Itoa(int(r.PortStart + 1))
+	if _, err := spdkClient.NvmfSubsystemAddListener(
+		nqn, r.IP, fallbackPort,
+		spdktypes.NvmeTransportTypeTCP, spdktypes.NvmeAddressFamilyIPv4,
+	); err != nil {
+		return errors.Wrapf(err, "failed to add TCP fallback listener on %s:%s for nqn %s", r.IP, fallbackPort, nqn)
+	}
+	return nil
 }
 
 type LvolHashStatus struct {
@@ -240,7 +263,7 @@ func ServiceReplicaToProtoReplica(r *Replica) *spdkrpc.Replica {
 	return res
 }
 
-func NewReplica(ctx context.Context, replicaName, lvsName, lvsUUID string, specSize uint64, snapshotChecksumEnabled bool, updateCh chan interface{}) *Replica {
+func NewReplica(ctx context.Context, replicaName, lvsName, lvsUUID string, specSize uint64, snapshotChecksumEnabled bool, listenerTransport NvmfTransportType, updateCh chan interface{}) *Replica {
 	log := logrus.StandardLogger().WithFields(logrus.Fields{
 		"replicaName": replicaName,
 		"lvsName":     lvsName,
@@ -262,8 +285,9 @@ func NewReplica(ctx context.Context, replicaName, lvsName, lvsUUID string, specS
 		LvsUUID: lvsUUID,
 		Nqn:     helpertypes.GetNQN(replicaName),
 
-		SpecSize: roundedSpecSize,
-		State:    types.InstanceStatePending,
+		SpecSize:          roundedSpecSize,
+		ListenerTransport: listenerTransport,
+		State:             types.InstanceStatePending,
 
 		Head: nil,
 		ActiveChain: []*Lvol{
@@ -303,19 +327,18 @@ func (r *Replica) prepareIPAndPorts(portCount int32, superiorPortAllocator *comm
 	}
 	r.IP = podIP
 
-	r.PortStart, r.PortEnd, err = superiorPortAllocator.AllocateRange(portCount)
+	r.PortStart, r.PortEnd, err = superiorPortAllocator.AllocateRange(portCount + 1)
 	if err != nil {
 		return err
 	}
 
-	// Always reserved the 1st port for replica expose and the rest for rebuilding
-	bitmap, err := commonbitmap.NewBitmap(r.PortStart+1, r.PortEnd)
+	bitmap, err := commonbitmap.NewBitmap(r.PortStart+2, r.PortEnd)
 	if err != nil {
 		return err
 	}
 	r.portAllocator = bitmap
 
-	r.log.Infof("Prepared IP %s and Ports [%d, %d] for replica", r.IP, r.PortStart, r.PortEnd)
+	r.log.Infof("Prepared IP %s and Ports [%d, %d] for replica (primary=%d, tcp-fallback=%d)", r.IP, r.PortStart, r.PortEnd, r.PortStart, r.PortStart+1)
 
 	return nil
 }
@@ -1128,7 +1151,10 @@ func (r *Replica) Create(spdkClient *spdkclient.Client, portCount int32, superio
 		return nil, errors.Wrapf(err, "failed to stop exposing replica %v", r.Name)
 	}
 
-	if err := spdkClient.StartExposeBdev(r.Nqn, r.Head.UUID, generateNGUID(r.Name), r.IP, strconv.Itoa(int(r.PortStart))); err != nil {
+	if err := spdkClient.StartExposeBdevWithTransport(r.Nqn, r.Head.UUID, generateNGUID(r.Name), r.IP, strconv.Itoa(int(r.PortStart)), r.transport().ToSPDKTransportType()); err != nil {
+		return nil, err
+	}
+	if err := r.addTCPFallbackListener(spdkClient, r.Nqn); err != nil {
 		return nil, err
 	}
 
@@ -1384,8 +1410,12 @@ func (r *Replica) Expand(spdkClient *spdkclient.Client, size uint64) error {
 
 	// If we had previously exposed the bdev, we must re-expose it after the resize.
 	if reExposeBdev {
-		if err := spdkClient.StartExposeBdev(helpertypes.GetNQN(r.Name), r.Head.UUID, generateNGUID(r.Name), r.IP, strconv.Itoa(int(r.PortStart))); err != nil {
+		nqn := helpertypes.GetNQN(r.Name)
+		if err := spdkClient.StartExposeBdevWithTransport(nqn, r.Head.UUID, generateNGUID(r.Name), r.IP, strconv.Itoa(int(r.PortStart)), r.transport().ToSPDKTransportType()); err != nil {
 			return errors.Wrapf(err, "failed to start expose replica %v after expansion", r.Name)
+		}
+		if err := r.addTCPFallbackListener(spdkClient, nqn); err != nil {
+			return errors.Wrapf(err, "failed to add TCP fallback listener after expansion for replica %v", r.Name)
 		}
 		r.IsExposed = true
 	}
@@ -1738,7 +1768,11 @@ func (r *Replica) SnapshotRevert(spdkClient *spdkclient.Client, snapshotName str
 		}
 		r.IsExposed = false
 
-		if err := spdkClient.StartExposeBdev(helpertypes.GetNQN(r.Name), headLvolUUID, generateNGUID(r.Name), r.IP, strconv.Itoa(int(r.PortStart))); err != nil {
+		nqn := helpertypes.GetNQN(r.Name)
+		if err := spdkClient.StartExposeBdevWithTransport(nqn, headLvolUUID, generateNGUID(r.Name), r.IP, strconv.Itoa(int(r.PortStart)), r.transport().ToSPDKTransportType()); err != nil {
+			return nil, err
+		}
+		if err := r.addTCPFallbackListener(spdkClient, nqn); err != nil {
 			return nil, err
 		}
 		r.IsExposed = true
@@ -2056,9 +2090,9 @@ func (r *Replica) SnapshotCloneDstStart(spdkClient *spdkclient.Client, snapshotN
 	}
 	r.snapshotCloningDstCache.cloningLvol = BdevLvolInfoToServiceLvol(&cloningBdevLvol)
 
-	if err := spdkClient.StartExposeBdev(helpertypes.GetNQN(r.snapshotCloningDstCache.cloningLvol.Name),
+	if err := spdkClient.StartExposeBdevWithTransport(helpertypes.GetNQN(r.snapshotCloningDstCache.cloningLvol.Name),
 		r.snapshotCloningDstCache.cloningLvol.UUID, generateNGUID(r.snapshotCloningDstCache.cloningLvol.Name), r.IP,
-		strconv.Itoa(int(r.snapshotCloningDstCache.cloningPort))); err != nil {
+		strconv.Itoa(int(r.snapshotCloningDstCache.cloningPort)), r.transport().ToSPDKTransportType()); err != nil {
 		return err
 	}
 	dstCloningLvolAddress := net.JoinHostPort(r.IP, strconv.Itoa(int(r.snapshotCloningDstCache.cloningPort)))
@@ -2431,7 +2465,7 @@ func (r *Replica) SnapshotCloneSrcStart(spdkClient *spdkclient.Client, snapshotN
 	}
 
 	dstCloningLvolName := GetReplicaCloningLvolName(dstReplicaName)
-	dstCloningBdevName, err := connectNVMfBdev(spdkClient, dstCloningLvolName, dstCloningLvolAddress,
+	dstCloningBdevName, err := connectNVMfBdevWithTransport(spdkClient, dstCloningLvolName, dstCloningLvolAddress, r.transport(),
 		replicaCtrlrLossTimeoutSec, replicaFastIOFailTimeoutSec, maxRetries, retryInterval)
 	if err != nil {
 		return err
@@ -2560,7 +2594,7 @@ func (r *Replica) RebuildingSrcStart(spdkClient *spdkclient.Client, dstReplicaNa
 	if err != nil {
 		return "", err
 	}
-	if err := spdkClient.StartExposeBdev(helpertypes.GetNQN(snapLvol.Name), snapLvol.UUID, generateNGUID(snapLvol.Name), r.IP, strconv.Itoa(int(port))); err != nil {
+	if err := spdkClient.StartExposeBdevWithTransport(helpertypes.GetNQN(snapLvol.Name), snapLvol.UUID, generateNGUID(snapLvol.Name), r.IP, strconv.Itoa(int(port)), r.transport().ToSPDKTransportType()); err != nil {
 		return "", err
 	}
 	exposedSnapshotLvolAddress = net.JoinHostPort(r.IP, strconv.Itoa(int(port)))
@@ -2643,7 +2677,7 @@ func (r *Replica) rebuildingSrcAttachNoLock(spdkClient *spdkclient.Client, dstRe
 		return nil
 	}
 
-	r.rebuildingSrcCache.dstRebuildingBdevName, err = connectNVMfBdev(spdkClient, dstRebuildingLvolName, dstRebuildingLvolAddress, replicaCtrlrLossTimeoutSec, replicaFastIOFailTimeoutSec, maxRetries, retryInterval)
+	r.rebuildingSrcCache.dstRebuildingBdevName, err = connectNVMfBdevWithTransport(spdkClient, dstRebuildingLvolName, dstRebuildingLvolAddress, r.transport(), replicaCtrlrLossTimeoutSec, replicaFastIOFailTimeoutSec, maxRetries, retryInterval)
 	if err != nil {
 		return errors.Wrapf(err, "failed to connect rebuilding lvol %s with address %s as a NVMe bdev for replica %s rebuilding src attach", dstRebuildingLvolName, dstRebuildingLvolAddress, r.Name)
 	}
@@ -3071,7 +3105,7 @@ func (r *Replica) RebuildingDstStart(spdkClient *spdkclient.Client, srcReplicaNa
 	}
 
 	externalSnapshotLvolName := GetReplicaSnapshotLvolName(srcReplicaName, externalSnapshotName)
-	externalSnapshotBdevName, err := connectNVMfBdev(spdkClient, externalSnapshotLvolName, externalSnapshotAddress,
+	externalSnapshotBdevName, err := connectNVMfBdevWithTransport(spdkClient, externalSnapshotLvolName, externalSnapshotAddress, r.transport(),
 		replicaCtrlrLossTimeoutSec, replicaFastIOFailTimeoutSec, maxRetries, retryInterval)
 	if err != nil {
 		return "", errors.Wrapf(err, "failed to connect the external src snapshot lvol %s with address %s as a NVMf bdev for dst replica %v rebuilding start", externalSnapshotLvolName, externalSnapshotAddress, r.Name)
@@ -3135,7 +3169,11 @@ func (r *Replica) RebuildingDstStart(spdkClient *spdkclient.Client, srcReplicaNa
 	r.Head = BdevLvolInfoToServiceLvol(&headBdevLvol)
 	r.ActiveChain = append(r.ActiveChain, r.Head)
 
-	if err := spdkClient.StartExposeBdev(helpertypes.GetNQN(r.Name), r.Head.UUID, generateNGUID(r.Name), r.IP, strconv.Itoa(int(r.PortStart))); err != nil {
+	nqn := helpertypes.GetNQN(r.Name)
+	if err := spdkClient.StartExposeBdevWithTransport(nqn, r.Head.UUID, generateNGUID(r.Name), r.IP, strconv.Itoa(int(r.PortStart)), r.transport().ToSPDKTransportType()); err != nil {
+		return "", err
+	}
+	if err := r.addTCPFallbackListener(spdkClient, nqn); err != nil {
 		return "", err
 	}
 	r.IsExposed = true
@@ -3572,8 +3610,8 @@ func (r *Replica) rebuildingDstShallowCopyPrepare(spdkClient *spdkclient.Client,
 
 	dstRebuildingLvolAddress = r.rebuildingDstCache.rebuildingLvol.Alias
 	if r.rebuildingDstCache.rebuildingPort != 0 {
-		if err := spdkClient.StartExposeBdev(helpertypes.GetNQN(r.rebuildingDstCache.rebuildingLvol.Name), r.rebuildingDstCache.rebuildingLvol.UUID,
-			generateNGUID(r.rebuildingDstCache.rebuildingLvol.Name), r.IP, strconv.Itoa(int(r.rebuildingDstCache.rebuildingPort))); err != nil {
+		if err := spdkClient.StartExposeBdevWithTransport(helpertypes.GetNQN(r.rebuildingDstCache.rebuildingLvol.Name), r.rebuildingDstCache.rebuildingLvol.UUID,
+			generateNGUID(r.rebuildingDstCache.rebuildingLvol.Name), r.IP, strconv.Itoa(int(r.rebuildingDstCache.rebuildingPort)), r.transport().ToSPDKTransportType()); err != nil {
 			return "", false, err
 		}
 		dstRebuildingLvolAddress = net.JoinHostPort(r.IP, strconv.Itoa(int(r.rebuildingDstCache.rebuildingPort)))

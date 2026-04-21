@@ -38,7 +38,7 @@ func (s *Server) EngineCreate(ctx context.Context, req *spdkrpc.EngineCreateRequ
 	}
 
 	if e == nil {
-		s.engineMap[req.Name] = NewEngine(req.Name, req.VolumeName, req.Frontend, req.SpecSize, s.updateChs[types.InstanceTypeEngine])
+		s.engineMap[req.Name] = NewEngine(req.Name, req.VolumeName, req.Frontend, req.SpecSize, s.nodeTransport, s.updateChs[types.InstanceTypeEngine])
 		e = s.engineMap[req.Name]
 	}
 
@@ -208,6 +208,26 @@ func (s *Server) EngineSetTargetListenerANAState(ctx context.Context, req *spdkr
 		return nil, grpcstatus.Errorf(grpccodes.Internal, "failed to set ANA state %s for engine %s: %v", anaState, req.Name, err)
 	}
 
+	return &emptypb.Empty{}, nil
+}
+
+func (s *Server) EngineRemoveTargetListener(ctx context.Context, req *spdkrpc.EngineRemoveTargetListenerRequest) (ret *emptypb.Empty, err error) {
+	if req == nil || req.Name == "" {
+		return nil, grpcstatus.Error(grpccodes.InvalidArgument, "engine name is required")
+	}
+
+	s.RLock()
+	e := s.engineMap[req.Name]
+	spdkClient := s.spdkClient
+	s.RUnlock()
+
+	if e == nil {
+		return &emptypb.Empty{}, nil
+	}
+
+	if err := e.RemoveTargetListener(spdkClient, NvmfTransportType(req.Transport)); err != nil {
+		return nil, grpcstatus.Errorf(grpccodes.Internal, "failed to remove target listener for engine %s: %v", req.Name, err)
+	}
 	return &emptypb.Empty{}, nil
 }
 

@@ -129,7 +129,7 @@ func (s *TestSuite) TestExtractBackingImageAndDiskUUID(c *C) {
 }
 
 func (s *TestSuite) TestSetReplicaAdderInjectsRealFallback(c *C) {
-	e := NewEngine("test-engine", "test-volume", types.FrontendEmpty, 1, nil)
+	e := NewEngine("test-engine", "test-volume", types.FrontendEmpty, 1, NvmfTransportTCP, nil)
 
 	firstMock := &MockReplicaAdder{}
 	e.SetReplicaAdder(firstMock)

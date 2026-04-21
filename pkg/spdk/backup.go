@@ -147,7 +147,7 @@ func (b *Backup) OpenSnapshot(snapshotName, volumeName string) error {
 	defer b.replica.Unlock()
 
 	b.log.Infof("Exposing snapshot lvol bdev %v", lvolName)
-	subsystemNQN, controllerName, err := exposeSnapshotLvolBdev(b.spdkClient, b.replica.LvsName, lvolName, b.IP, b.Port, b.executor)
+	subsystemNQN, controllerName, err := exposeSnapshotLvolBdev(b.spdkClient, b.replica.LvsName, lvolName, b.IP, b.Port, b.replica.transport(), b.executor)
 	if err != nil {
 		b.log.WithError(err).Errorf("Failed to expose snapshot lvol bdev %v", lvolName)
 		return errors.Wrapf(err, "failed to expose snapshot lvol bdev %v", lvolName)

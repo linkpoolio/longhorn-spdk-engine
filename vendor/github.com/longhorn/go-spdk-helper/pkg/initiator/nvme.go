@@ -12,8 +12,11 @@ import (
 	"github.com/longhorn/go-spdk-helper/pkg/types"
 )
 
-// DiscoverTarget discovers a target
 func DiscoverTarget(ip, port string, executor *commonns.Executor) (subnqn string, err error) {
+	return DiscoverTargetWithTransport(DefaultTransportType, ip, port, executor)
+}
+
+func DiscoverTargetWithTransport(transport, ip, port string, executor *commonns.Executor) (subnqn string, err error) {
 	hostID, err := getHostID(executor)
 	if err != nil {
 		return "", err
@@ -23,7 +26,7 @@ func DiscoverTarget(ip, port string, executor *commonns.Executor) (subnqn string
 		return "", err
 	}
 
-	entries, err := discovery(hostID, hostNQN, ip, port, executor)
+	entries, err := discoveryWithTransport(hostID, hostNQN, transport, ip, port, executor)
 	if err != nil {
 		return "", err
 	}
@@ -37,8 +40,15 @@ func DiscoverTarget(ip, port string, executor *commonns.Executor) (subnqn string
 	return "", fmt.Errorf("found empty subnqn after nvme discover for %s:%s", ip, port)
 }
 
-// ConnectTarget connects to a target
 func ConnectTarget(ip, port, nqn string, executor *commonns.Executor) (controllerName string, err error) {
+	return ConnectTargetWithTransport(DefaultTransportType, ip, port, nqn, executor)
+}
+
+func ConnectTargetWithTransport(transport, ip, port, nqn string, executor *commonns.Executor) (controllerName string, err error) {
+	if transport == "" {
+		transport = DefaultTransportType
+	}
+
 	// Trying to connect an existing subsystem will error out with exit code 114.
 	// Hence, it's better to check the existence first.
 	if devices, err := GetDevices(ip, port, nqn, executor); err == nil && len(devices) > 0 {
@@ -54,7 +64,7 @@ func ConnectTarget(ip, port, nqn string, executor *commonns.Executor) (controlle
 		return "", err
 	}
 
-	return connect(hostID, hostNQN, nqn, DefaultTransportType, ip, port, executor)
+	return connect(hostID, hostNQN, nqn, transport, ip, port, executor)
 }
 
 // DisconnectTarget disconnects from a target

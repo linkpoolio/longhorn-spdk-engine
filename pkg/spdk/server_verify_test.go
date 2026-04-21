@@ -22,7 +22,7 @@ import (
 func (s *TestSuite) TestNewReplicaExistingReplicaUpdatesMetadataIdempotently(c *C) {
 	server := &Server{
 		replicaMap: map[string]*Replica{
-			"r1": NewReplica(context.Background(), "r1", "disk-a", "uuid-a", 1024, true, make(chan interface{}, 1)),
+			"r1": NewReplica(context.Background(), "r1", "disk-a", "uuid-a", 1024, true, NvmfTransportTCP, make(chan interface{}, 1)),
 		},
 	}
 
@@ -43,7 +43,7 @@ func (s *TestSuite) TestNewReplicaExistingReplicaUpdatesMetadataIdempotently(c *
 func (s *TestSuite) TestNewReplicaExistingReplicaAllowsMatchingMetadata(c *C) {
 	server := &Server{
 		replicaMap: map[string]*Replica{
-			"r1": NewReplica(context.Background(), "r1", "disk-a", "uuid-a", 1024, true, make(chan interface{}, 1)),
+			"r1": NewReplica(context.Background(), "r1", "disk-a", "uuid-a", 1024, true, NvmfTransportTCP, make(chan interface{}, 1)),
 		},
 	}
 
@@ -130,9 +130,9 @@ func (s *TestSuite) TestBuildLvsUUIDNameMap(c *C) {
 func (s *TestSuite) TestHandleVerifyErrorBrokenPipe(c *C) {
 	fmt.Println("Testing handleVerifyError with broken pipe error")
 
-	replica := NewReplica(context.Background(), "r1", "disk-a", "uuid-a", 1024, true, make(chan interface{}, 1))
-	engine := NewEngine("e1", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 1024, make(chan interface{}, 1))
-	engineFrontend := NewEngineFrontend("ef1", "e1", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 1024, 0, 0, make(chan interface{}, 1))
+	replica := NewReplica(context.Background(), "r1", "disk-a", "uuid-a", 1024, true, NvmfTransportTCP, make(chan interface{}, 1))
+	engine := NewEngine("e1", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 1024, NvmfTransportTCP, make(chan interface{}, 1))
+	engineFrontend := NewEngineFrontend("ef1", "e1", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 1024, 0, 0, NvmfTransportTCP, make(chan interface{}, 1))
 
 	replica.State = lhtypes.InstanceStateRunning
 	engine.State = lhtypes.InstanceStateRunning
@@ -166,7 +166,7 @@ func (s *TestSuite) TestHandleVerifyErrorBrokenPipe(c *C) {
 func (s *TestSuite) TestHandleVerifyErrorNonBrokenPipeNoStateChange(c *C) {
 	fmt.Println("Testing handleVerifyError with non-broken pipe error does not change state")
 
-	replica := NewReplica(context.Background(), "r1", "disk-a", "uuid-a", 1024, true, make(chan interface{}, 1))
+	replica := NewReplica(context.Background(), "r1", "disk-a", "uuid-a", 1024, true, NvmfTransportTCP, make(chan interface{}, 1))
 	replica.State = lhtypes.InstanceStateRunning
 
 	state := &verifyState{
@@ -186,7 +186,7 @@ func (s *TestSuite) TestHandleVerifyErrorNonBrokenPipeNoStateChange(c *C) {
 func (s *TestSuite) TestHandleVerifyErrorNoopForNilError(c *C) {
 	fmt.Println("Testing handleVerifyError with nil error does not change state")
 
-	replica := NewReplica(context.Background(), "r1", "disk-a", "uuid-a", 1024, true, make(chan interface{}, 1))
+	replica := NewReplica(context.Background(), "r1", "disk-a", "uuid-a", 1024, true, NvmfTransportTCP, make(chan interface{}, 1))
 	replica.State = lhtypes.InstanceStateRunning
 
 	state := &verifyState{
@@ -206,13 +206,13 @@ func (s *TestSuite) TestHandleVerifyErrorNoopForNilError(c *C) {
 func (s *TestSuite) TestHandleVerifyErrorBrokenPipeKeepsStoppedAndError(c *C) {
 	fmt.Println("Testing handleVerifyError with broken pipe error keeps stopped and error states")
 
-	replicaStopped := NewReplica(context.Background(), "r-stopped", "disk-a", "uuid-a", 1024, true, make(chan interface{}, 1))
+	replicaStopped := NewReplica(context.Background(), "r-stopped", "disk-a", "uuid-a", 1024, true, NvmfTransportTCP, make(chan interface{}, 1))
 	replicaStopped.State = lhtypes.InstanceStateStopped
 
-	engineErrored := NewEngine("e-err", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 1024, make(chan interface{}, 1))
+	engineErrored := NewEngine("e-err", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 1024, NvmfTransportTCP, make(chan interface{}, 1))
 	engineErrored.State = lhtypes.InstanceStateError
 
-	engineFrontendRunning := NewEngineFrontend("ef-run", "e-err", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 1024, 0, 0, make(chan interface{}, 1))
+	engineFrontendRunning := NewEngineFrontend("ef-run", "e-err", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 1024, 0, 0, NvmfTransportTCP, make(chan interface{}, 1))
 	engineFrontendRunning.State = lhtypes.InstanceStateRunning
 
 	state := &verifyState{
@@ -245,13 +245,13 @@ func (s *TestSuite) TestNewVerifyStateLockedCopiesMaps(c *C) {
 
 	server := &Server{
 		replicaMap: map[string]*Replica{
-			"r1": NewReplica(context.Background(), "r1", "disk-a", "uuid-a", 1024, true, make(chan interface{}, 1)),
+			"r1": NewReplica(context.Background(), "r1", "disk-a", "uuid-a", 1024, true, NvmfTransportTCP, make(chan interface{}, 1)),
 		},
 		engineMap: map[string]*Engine{
-			"e1": NewEngine("e1", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 1024, make(chan interface{}, 1)),
+			"e1": NewEngine("e1", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 1024, NvmfTransportTCP, make(chan interface{}, 1)),
 		},
 		engineFrontendMap: map[string]*EngineFrontend{
-			"ef1": NewEngineFrontend("ef1", "e1", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 1024, 0, 0, make(chan interface{}, 1)),
+			"ef1": NewEngineFrontend("ef1", "e1", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 1024, 0, 0, NvmfTransportTCP, make(chan interface{}, 1)),
 		},
 		backingImageMap: map[string]*BackingImage{
 			"bi1": NewBackingImage(context.Background(), "bi1", "uuid-bi1", "disk-uuid", 1024, "checksum", make(chan interface{}, 1)),
@@ -332,7 +332,7 @@ func (s *TestSuite) TestEngineFrontendCreateReturnsAlreadyExistsForDuplicate(c *
 
 	updateCh := make(chan interface{}, 1)
 
-	existing := NewEngineFrontend("ef-dup", "engine-a", "vol-a", lhtypes.FrontendSPDKTCPNvmf, 1024, 0, 0, updateCh)
+	existing := NewEngineFrontend("ef-dup", "engine-a", "vol-a", lhtypes.FrontendSPDKTCPNvmf, 1024, 0, 0, NvmfTransportTCP, updateCh)
 
 	srv := &Server{
 		engineFrontendMap: map[string]*EngineFrontend{
@@ -458,7 +458,7 @@ func (s *TestSuite) TestEngineFrontendLifecycleRPCsMapKnownErrors(c *C) {
 		}
 	}
 
-	suspendPrecondition := NewEngineFrontend("ef-test", "engine-a", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 1024, 0, 0, make(chan interface{}, 1))
+	suspendPrecondition := NewEngineFrontend("ef-test", "engine-a", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 1024, 0, 0, NvmfTransportTCP, make(chan interface{}, 1))
 	suspendPrecondition.State = lhtypes.InstanceStateRunning
 	suspendPrecondition.isSwitchingOver = true
 
@@ -467,7 +467,7 @@ func (s *TestSuite) TestEngineFrontendLifecycleRPCsMapKnownErrors(c *C) {
 	c.Assert(ok, Equals, true)
 	c.Assert(st.Code(), Equals, grpccodes.FailedPrecondition)
 
-	resumeUnimplemented := NewEngineFrontend("ef-test", "engine-a", "vol-a", lhtypes.FrontendEmpty, 1024, 0, 0, make(chan interface{}, 1))
+	resumeUnimplemented := NewEngineFrontend("ef-test", "engine-a", "vol-a", lhtypes.FrontendEmpty, 1024, 0, 0, NvmfTransportTCP, make(chan interface{}, 1))
 	resumeUnimplemented.State = lhtypes.InstanceStateSuspended
 
 	_, err = newServer(resumeUnimplemented).EngineFrontendResume(context.Background(), &spdkrpc.EngineFrontendResumeRequest{Name: "ef-test"})
@@ -475,7 +475,7 @@ func (s *TestSuite) TestEngineFrontendLifecycleRPCsMapKnownErrors(c *C) {
 	c.Assert(ok, Equals, true)
 	c.Assert(st.Code(), Equals, grpccodes.Unimplemented)
 
-	deletePrecondition := NewEngineFrontend("ef-test", "engine-a", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 1024, 0, 0, make(chan interface{}, 1))
+	deletePrecondition := NewEngineFrontend("ef-test", "engine-a", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 1024, 0, 0, NvmfTransportTCP, make(chan interface{}, 1))
 	deletePrecondition.isSwitchingOver = true
 
 	_, err = newServer(deletePrecondition).EngineFrontendDelete(context.Background(), &spdkrpc.EngineFrontendDeleteRequest{Name: "ef-test"})
@@ -484,7 +484,7 @@ func (s *TestSuite) TestEngineFrontendLifecycleRPCsMapKnownErrors(c *C) {
 	c.Assert(st.Code(), Equals, grpccodes.FailedPrecondition)
 
 	// Delete while isCreating should also return FailedPrecondition
-	deleteWhileCreating := NewEngineFrontend("ef-test", "engine-a", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 1024, 0, 0, make(chan interface{}, 1))
+	deleteWhileCreating := NewEngineFrontend("ef-test", "engine-a", "vol-a", lhtypes.FrontendSPDKTCPBlockdev, 1024, 0, 0, NvmfTransportTCP, make(chan interface{}, 1))
 	deleteWhileCreating.isCreating = true
 
 	_, err = newServer(deleteWhileCreating).EngineFrontendDelete(context.Background(), &spdkrpc.EngineFrontendDeleteRequest{Name: "ef-test"})

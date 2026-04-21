@@ -234,9 +234,16 @@ func getHostID(executor *commonns.Executor) (string, error) {
 }
 
 func discovery(hostID, hostNQN, ip, port string, executor *commonns.Executor) ([]DiscoveryPageEntry, error) {
+	return discoveryWithTransport(hostID, hostNQN, DefaultTransportType, ip, port, executor)
+}
+
+func discoveryWithTransport(hostID, hostNQN, transportType, ip, port string, executor *commonns.Executor) ([]DiscoveryPageEntry, error) {
+	if transportType == "" {
+		transportType = DefaultTransportType
+	}
 	opts := []string{
 		"discover",
-		"-t", DefaultTransportType,
+		"-t", transportType,
 		"-a", ip,
 		"-s", port,
 		"-o", "json",

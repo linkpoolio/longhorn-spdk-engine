@@ -37,12 +37,13 @@ type EngineFrontendRecord struct {
 }
 
 type EngineFrontendPathRecord struct {
-	TargetIP   string          `json:"targetIP"`
-	TargetPort int32           `json:"targetPort"`
-	EngineName string          `json:"engineName,omitempty"`
-	Nqn        string          `json:"nqn,omitempty"`
-	Nguid      string          `json:"nguid,omitempty"`
-	ANAState   NvmeTCPANAState `json:"anaState,omitempty"`
+	TargetIP   string            `json:"targetIP"`
+	TargetPort int32             `json:"targetPort"`
+	EngineName string            `json:"engineName,omitempty"`
+	Nqn        string            `json:"nqn,omitempty"`
+	Nguid      string            `json:"nguid,omitempty"`
+	ANAState   NvmeTCPANAState   `json:"anaState,omitempty"`
+	Transport  NvmfTransportType `json:"transport,omitempty"`
 }
 
 // engineFrontendRecordDir returns the directory path for a volume's record.
@@ -102,6 +103,7 @@ func saveEngineFrontendRecord(metadataDir string, ef *EngineFrontend) error {
 			Nqn:        path.Nqn,
 			Nguid:      path.Nguid,
 			ANAState:   path.ANAState,
+			Transport:  path.Transport,
 		})
 	}
 	sort.Slice(record.Paths, func(i, j int) bool {
@@ -234,6 +236,7 @@ func loadEngineFrontendRecords(metadataDir string) ([]*EngineFrontendRecord, err
 				Nqn:        record.VolumeNQN,
 				Nguid:      record.VolumeNGUID,
 				ANAState:   NvmeTCPANAStateOptimized,
+				Transport:  DefaultNvmfTransport,
 			}}
 		}
 
