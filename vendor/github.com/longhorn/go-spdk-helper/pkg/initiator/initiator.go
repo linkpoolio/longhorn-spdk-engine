@@ -83,6 +83,12 @@ type NVMeTCPInfo struct {
 	TransportServiceID string
 	ControllerName     string
 	NamespaceName      string
+
+	// Transport is the NVMe-oF transport for this initiator connection.
+	// Empty string means TCP (legacy behavior). Set to "rdma" to use
+	// NVMe-oF RDMA. The name NVMeTCPInfo is retained for backward
+	// compatibility with callers that predate RDMA support.
+	Transport string
 }
 
 type UblkInfo struct {
@@ -772,20 +778,24 @@ func (i *Initiator) discoverAndConnectNVMeTCPTarget(transportAddress, transportS
 			// This avoids "failed to add controller" errors from nvme-cli 2.x
 			// when the kernel already has NVMe-oF connections to the same
 			// target address with the same hostNQN/hostID.
+			transport := i.NVMeTCPInfo.Transport
+			if transport == "" {
+				transport = DefaultTransportType
+			}
 			if i.NVMeTCPInfo.SubsystemNQN != "" {
 				subsystemNQN = i.NVMeTCPInfo.SubsystemNQN
-				i.logger.Infof("Using pre-configured SubsystemNQN %s for target %s:%s, skipping discovery",
-					subsystemNQN, transportAddress, transportServiceID)
+				i.logger.Infof("Using pre-configured SubsystemNQN %s for target %s:%s (transport=%s), skipping discovery",
+					subsystemNQN, transportAddress, transportServiceID, transport)
 			} else {
-				i.logger.Infof("Discovering NVMe/TCP target %s:%s", transportAddress, transportServiceID)
-				subsystemNQN, e = DiscoverTarget(transportAddress, transportServiceID, i.executor)
+				i.logger.Infof("Discovering NVMe-oF target %s:%s (transport=%s)", transportAddress, transportServiceID, transport)
+				subsystemNQN, e = DiscoverTargetWithTransport(transport, transportAddress, transportServiceID, i.executor)
 				if e != nil {
-					return errors.Wrapf(e, "discover NVMe/TCP target %s:%s failed", transportAddress, transportServiceID)
+					return errors.Wrapf(e, "discover NVMe-oF target %s:%s (transport=%s) failed", transportAddress, transportServiceID, transport)
 				}
 			}
 
-			i.logger.Infof("Connecting to NVMe/TCP target %s:%s with subsystemNQN %s", transportAddress, transportServiceID, subsystemNQN)
-			controllerName, e = ConnectTarget(transportAddress, transportServiceID, subsystemNQN, i.executor)
+			i.logger.Infof("Connecting to NVMe-oF target %s:%s with subsystemNQN %s (transport=%s)", transportAddress, transportServiceID, subsystemNQN, transport)
+			controllerName, e = ConnectTargetWithTransport(transport, transportAddress, transportServiceID, subsystemNQN, i.executor)
 			if e != nil {
 				// "already connected" means the path is present in the kernel
 				// but GetDevices() couldn't find a namespace device yet (e.g.

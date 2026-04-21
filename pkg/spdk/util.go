@@ -63,7 +63,15 @@ func discoverAndConnectNVMeTarget(srcIP string, srcPort int32, maxRetries int, r
 	return subsystemNQN, controllerName, nil
 }
 
-func exposeSnapshotLvolBdev(spdkClient *spdkclient.Client, lvsName, lvolName, ip string, port int32, executor *commonns.Executor) (subsystemNQN, controllerName string, err error) {
+// exposeSnapshotLvolBdev exposes a snapshot's lvol as an NVMe-oF target.
+// transport selects the listener transport; an empty value defaults to TCP.
+// The initiator side (discover + connect) uses the same transport.
+func exposeSnapshotLvolBdev(spdkClient *spdkclient.Client, lvsName, lvolName, ip string, port int32, transport NvmfTransportType, executor *commonns.Executor) (subsystemNQN, controllerName string, err error) {
+	if transport == "" {
+		transport = DefaultNvmfTransport
+	}
+	spdkTransport := transport.ToSPDKTransportType()
+
 	bdevLvolList, err := spdkClient.BdevLvolGet(spdktypes.GetLvolAlias(lvsName, lvolName), 0)
 	if err != nil {
 		return "", "", err
@@ -73,20 +81,21 @@ func exposeSnapshotLvolBdev(spdkClient *spdkclient.Client, lvsName, lvolName, ip
 	}
 
 	portStr := strconv.Itoa(int(port))
-	err = spdkClient.StartExposeBdev(helpertypes.GetNQN(lvolName), bdevLvolList[0].UUID, generateNGUID(lvolName), ip, portStr)
+	err = spdkClient.StartExposeBdevWithTransport(helpertypes.GetNQN(lvolName), bdevLvolList[0].UUID, generateNGUID(lvolName), ip, portStr, spdkTransport)
 	if err != nil {
 		return "", "", errors.Wrapf(err, "failed to expose snapshot lvol bdev %v", lvolName)
 	}
 
+	transportStr := string(transport)
 	for r := 0; r < maxRetries; r++ {
-		subsystemNQN, err = initiator.DiscoverTarget(ip, portStr, executor)
+		subsystemNQN, err = initiator.DiscoverTargetWithTransport(transportStr, ip, portStr, executor)
 		if err != nil {
 			logrus.WithError(err).Errorf("Failed to discover target for snapshot lvol bdev %v", lvolName)
 			time.Sleep(retryInterval)
 			continue
 		}
 
-		controllerName, err = initiator.ConnectTarget(ip, portStr, subsystemNQN, executor)
+		controllerName, err = initiator.ConnectTargetWithTransport(transportStr, ip, portStr, subsystemNQN, executor)
 		if err != nil {
 			logrus.WithError(err).Errorf("Failed to connect target for snapshot lvol bdev %v", lvolName)
 			time.Sleep(retryInterval)
@@ -118,9 +127,19 @@ func splitHostPort(address string) (string, int32, error) {
 	return address, 0, nil
 }
 
-// connectNVMfBdev connects to the NVMe/TCP target, which is exposed by a remote lvol bdev.
-// controllerName is typically the lvol name, and address is the IP:port of the NVMe/TCP target.
+// connectNVMfBdev connects to an NVMe-oF target (TCP by default) exposed by
+// a remote lvol bdev. For RDMA use connectNVMfBdevWithTransport.
+// controllerName is typically the lvol name, and address is the IP:port of
+// the target.
 func connectNVMfBdev(spdkClient *spdkclient.Client, controllerName, address string, ctrlrLossTimeout, fastIOFailTimeoutSec int, maxRetries int, retryInterval time.Duration) (bdevName string, err error) {
+	return connectNVMfBdevWithTransport(spdkClient, controllerName, address, DefaultNvmfTransport, ctrlrLossTimeout, fastIOFailTimeoutSec, maxRetries, retryInterval)
+}
+
+// connectNVMfBdevWithTransport is the transport-aware variant of
+// connectNVMfBdev. Passing NvmfTransportRDMA requires that the SPDK target
+// on the other side exposes an rdma listener for the given address; the
+// kernel also needs nvme_rdma + ib_core loaded on this node.
+func connectNVMfBdevWithTransport(spdkClient *spdkclient.Client, controllerName, address string, transport NvmfTransportType, ctrlrLossTimeout, fastIOFailTimeoutSec int, maxRetries int, retryInterval time.Duration) (bdevName string, err error) {
 	if controllerName == "" || address == "" {
 		return "", fmt.Errorf("controllerName or address is empty")
 	}
@@ -144,6 +163,7 @@ func connectNVMfBdev(spdkClient *spdkclient.Client, controllerName, address stri
 	}
 
 	nvmeBdevNameList := []string{}
+	spdkTransport := transport.ToSPDKTransportType()
 	err = retry.Do(
 		func() error {
 			var err error
@@ -152,7 +172,7 @@ func connectNVMfBdev(spdkClient *spdkclient.Client, controllerName, address stri
 				helpertypes.GetNQN(controllerName),
 				ip,
 				port,
-				spdktypes.NvmeTransportTypeTCP,
+				spdkTransport,
 				spdktypes.NvmeAddressFamilyIPv4,
 				int32(ctrlrLossTimeout),
 				replicaReconnectDelaySec,
@@ -167,8 +187,8 @@ func connectNVMfBdev(spdkClient *spdkclient.Client, controllerName, address stri
 		retry.LastErrorOnly(true),
 		retry.OnRetry(func(n uint, err error) {
 			logrus.WithError(err).Warnf(
-				"Retrying NVMe bdev attach: controller=%s address=%s attempt=%d/%d next_wait=%s",
-				controllerName, address, n+1, maxRetries, retryInterval,
+				"Retrying NVMe bdev attach: controller=%s address=%s transport=%s attempt=%d/%d next_wait=%s",
+				controllerName, address, transport, n+1, maxRetries, retryInterval,
 			)
 		}),
 	)

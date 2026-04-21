@@ -55,19 +55,27 @@ func (c *Client) DeleteDevice(bdevAioName, lvsName string) (err error) {
 	return nil
 }
 
-// StartExposeBdev exposes the bdev with the given nqn, bdevName, nguid, ip, and port.
+// StartExposeBdev exposes the bdev with the given nqn, bdevName, nguid, ip,
+// and port over NVMe-oF TCP. For RDMA or mixed listeners use
+// StartExposeBdevWithTransport.
 func (c *Client) StartExposeBdev(nqn, bdevName, nguid, ip, port string) error {
-	logrus.Infof("Exposing bdev with nqn %v, bdevName %v, nguid %v, ip %v, port %v", nqn, bdevName, nguid, ip, port)
+	return c.StartExposeBdevWithTransport(nqn, bdevName, nguid, ip, port, spdktypes.NvmeTransportTypeTCP)
+}
 
-	nvmfTransportList, err := c.NvmfGetTransports("", "")
-	if err != nil {
-		return err
+// StartExposeBdevWithTransport exposes a bdev on the given transport ("tcp"
+// or "rdma"). Selecting RDMA requires the SPDK target process to have been
+// started with `--rdma` or equivalent transport support; the call will fail
+// if nvmf_create_transport rejects the type.
+//
+// Empty transport defaults to TCP for backward compat.
+func (c *Client) StartExposeBdevWithTransport(nqn, bdevName, nguid, ip, port string, transport spdktypes.NvmeTransportType) error {
+	if transport == "" {
+		transport = spdktypes.NvmeTransportTypeTCP
 	}
-	if nvmfTransportList != nil && len(nvmfTransportList) == 0 {
-		logrus.Infof("Creating transport with type %v", spdktypes.NvmeTransportTypeTCP)
-		if _, err := c.NvmfCreateTransport(spdktypes.NvmeTransportTypeTCP); err != nil && !jsonrpc.IsJSONRPCRespErrorTransportTypeAlreadyExists(err) {
-			return err
-		}
+	logrus.Infof("Exposing bdev with nqn %v, bdevName %v, nguid %v, ip %v, port %v, transport %v", nqn, bdevName, nguid, ip, port, transport)
+
+	if err := c.ensureNvmfTransport(transport); err != nil {
+		return err
 	}
 
 	logrus.Infof("Creating subsystem with nqn %v", nqn)
@@ -80,11 +88,30 @@ func (c *Client) StartExposeBdev(nqn, bdevName, nguid, ip, port string) error {
 		return err
 	}
 
-	logrus.Infof("Adding listener with transport address %v, transport service id %v, transport type %v, address family %v to subsystem with nqn %v", ip, port, spdktypes.NvmeTransportTypeTCP, spdktypes.NvmeAddressFamilyIPv4, nqn)
-	if _, err := c.NvmfSubsystemAddListener(nqn, ip, port, spdktypes.NvmeTransportTypeTCP, spdktypes.NvmeAddressFamilyIPv4); err != nil {
+	logrus.Infof("Adding listener with transport address %v, transport service id %v, transport type %v, address family %v to subsystem with nqn %v", ip, port, transport, spdktypes.NvmeAddressFamilyIPv4, nqn)
+	if _, err := c.NvmfSubsystemAddListener(nqn, ip, port, transport, spdktypes.NvmeAddressFamilyIPv4); err != nil {
 		return err
 	}
 
+	return nil
+}
+
+// ensureNvmfTransport creates the requested NVMf transport in SPDK if it is
+// not already present. "Already exists" errors are swallowed (idempotent).
+func (c *Client) ensureNvmfTransport(transport spdktypes.NvmeTransportType) error {
+	existing, err := c.NvmfGetTransports("", "")
+	if err != nil {
+		return err
+	}
+	for _, t := range existing {
+		if t.Trtype == transport {
+			return nil
+		}
+	}
+	logrus.Infof("Creating NVMf transport with type %v", transport)
+	if _, err := c.NvmfCreateTransport(transport); err != nil && !jsonrpc.IsJSONRPCRespErrorTransportTypeAlreadyExists(err) {
+		return err
+	}
 	return nil
 }
 
@@ -95,18 +122,21 @@ func (c *Client) StartExposeBdev(nqn, bdevName, nguid, ip, port string) error {
 // a unique controller-ID range per engine to avoid "Duplicate cntlid" errors
 // when multiple targets share one subsystem NQN. Pass 0 for defaults.
 func (c *Client) StartExposeBdevWithANAState(nqn, bdevName, nguid, nsUUID, ip, port string, anaState spdktypes.NvmfSubsystemListenerAnaState, minCntlid, maxCntlid uint16) error {
-	logrus.Infof("Exposing bdev with nqn %v, bdevName %v, nguid %v, nsUUID %v, ip %v, port %v, anaState %v, minCntlid %v, maxCntlid %v",
-		nqn, bdevName, nguid, nsUUID, ip, port, anaState, minCntlid, maxCntlid)
+	return c.StartExposeBdevWithANAStateAndTransport(nqn, bdevName, nguid, nsUUID, ip, port, spdktypes.NvmeTransportTypeTCP, anaState, minCntlid, maxCntlid)
+}
 
-	nvmfTransportList, err := c.NvmfGetTransports("", "")
-	if err != nil {
-		return err
+// StartExposeBdevWithANAStateAndTransport is the transport-aware variant of
+// StartExposeBdevWithANAState. See that function for a description of the
+// nsUUID / cntlid parameters. An empty transport defaults to TCP.
+func (c *Client) StartExposeBdevWithANAStateAndTransport(nqn, bdevName, nguid, nsUUID, ip, port string, transport spdktypes.NvmeTransportType, anaState spdktypes.NvmfSubsystemListenerAnaState, minCntlid, maxCntlid uint16) error {
+	if transport == "" {
+		transport = spdktypes.NvmeTransportTypeTCP
 	}
-	if nvmfTransportList != nil && len(nvmfTransportList) == 0 {
-		logrus.Infof("Creating transport with type %v", spdktypes.NvmeTransportTypeTCP)
-		if _, err := c.NvmfCreateTransport(spdktypes.NvmeTransportTypeTCP); err != nil && !jsonrpc.IsJSONRPCRespErrorTransportTypeAlreadyExists(err) {
-			return err
-		}
+	logrus.Infof("Exposing bdev with nqn %v, bdevName %v, nguid %v, nsUUID %v, ip %v, port %v, transport %v, anaState %v, minCntlid %v, maxCntlid %v",
+		nqn, bdevName, nguid, nsUUID, ip, port, transport, anaState, minCntlid, maxCntlid)
+
+	if err := c.ensureNvmfTransport(transport); err != nil {
+		return err
 	}
 
 	logrus.Infof("Creating subsystem with nqn %v, minCntlid %v, maxCntlid %v", nqn, minCntlid, maxCntlid)
@@ -119,13 +149,13 @@ func (c *Client) StartExposeBdevWithANAState(nqn, bdevName, nguid, nsUUID, ip, p
 		return err
 	}
 
-	logrus.Infof("Adding listener with transport address %v, transport service id %v, transport type %v, address family %v to subsystem with nqn %v", ip, port, spdktypes.NvmeTransportTypeTCP, spdktypes.NvmeAddressFamilyIPv4, nqn)
-	if _, err := c.NvmfSubsystemAddListener(nqn, ip, port, spdktypes.NvmeTransportTypeTCP, spdktypes.NvmeAddressFamilyIPv4); err != nil {
+	logrus.Infof("Adding listener with transport address %v, transport service id %v, transport type %v, address family %v to subsystem with nqn %v", ip, port, transport, spdktypes.NvmeAddressFamilyIPv4, nqn)
+	if _, err := c.NvmfSubsystemAddListener(nqn, ip, port, transport, spdktypes.NvmeAddressFamilyIPv4); err != nil {
 		return err
 	}
 
 	logrus.Infof("Setting listener ANA state to %v for subsystem with nqn %v", anaState, nqn)
-	if _, err := c.NvmfSubsystemListenerSetANAState(nqn, ip, port, spdktypes.NvmeTransportTypeTCP,
+	if _, err := c.NvmfSubsystemListenerSetANAState(nqn, ip, port, transport,
 		spdktypes.NvmeAddressFamilyIPv4, anaState, spdktypes.DefaultNvmfANAGroupID); err != nil {
 		return err
 	}

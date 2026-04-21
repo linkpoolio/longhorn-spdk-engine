@@ -119,7 +119,15 @@ type Engine struct {
 
 	ctrlrLossTimeout     int
 	fastIOFailTimeoutSec int
-	ReplicaStatusMap     map[string]*EngineReplicaStatus
+
+	// ReplicaTransport selects the NVMe-oF transport used when this engine
+	// attaches replicas (both the normal RAID path and the restore
+	// attach-all path). Empty/unset == TCP. RDMA requires that the local
+	// node has /sys/class/infiniband populated and that the remote replica
+	// is listening on the matching transport.
+	ReplicaTransport NvmfTransportType
+
+	ReplicaStatusMap map[string]*EngineReplicaStatus
 
 	RaidBdevUUID string
 
@@ -159,6 +167,16 @@ type Engine struct {
 	// identically, but all other Engine operations would stall for 10+
 	// seconds on same-node NVMe-oF ETIMEDOUT.
 	replicaAddFinishUnlockedHook func()
+}
+
+// replicaTransport returns the effective transport for replica attachments,
+// folding the empty zero-value into the default (TCP) so every call site can
+// stay oblivious to whether the engine was constructed transport-aware.
+func (e *Engine) replicaTransport() NvmfTransportType {
+	if e.ReplicaTransport == "" {
+		return DefaultNvmfTransport
+	}
+	return e.ReplicaTransport
 }
 
 type EngineReplicaStatus struct {
@@ -355,7 +373,7 @@ func (e *Engine) connectReplicas(spdkClient *spdkclient.Client, replicaAddressMa
 			Address: replicaAddr,
 		}
 
-		bdevName, err := connectNVMfBdev(spdkClient, replicaName, replicaAddr, e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
+		bdevName, err := connectNVMfBdevWithTransport(spdkClient, replicaName, replicaAddr, e.replicaTransport(), e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
 		if err != nil {
 			e.log.WithError(err).Warnf("Failed to get bdev from replica %s with address %s during engine creation, will mark the mode to ERR and continue", replicaName, replicaAddr)
 			e.ReplicaStatusMap[replicaName].Mode = types.ModeERR
@@ -954,7 +972,7 @@ func (e *Engine) replicaAddStart(spdkClient *spdkclient.Client, replicaClients m
 	}
 
 	// Add rebuilding replica head bdev to the base bdev list of the RAID bdev
-	dstHeadLvolBdevName, err := connectNVMfBdev(spdkClient, dstReplicaName, dstHeadLvolAddress, e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
+	dstHeadLvolBdevName, err := connectNVMfBdevWithTransport(spdkClient, dstReplicaName, dstHeadLvolAddress, e.replicaTransport(), e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
 	if err != nil {
 		return nil, startUpdateRequired, nil, err
 	}
@@ -1729,7 +1747,7 @@ func (e *Engine) replicaSnapshotOperation(spdkClient *spdkclient.Client, replica
 		if err := replicaClient.ReplicaSnapshotRevert(replicaName, snapshotName); err != nil {
 			return err
 		}
-		bdevName, err := connectNVMfBdev(spdkClient, replicaName, replicaStatus.Address, e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
+		bdevName, err := connectNVMfBdevWithTransport(spdkClient, replicaName, replicaStatus.Address, e.replicaTransport(), e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
 		if err != nil {
 			return err
 		}
@@ -2224,9 +2242,10 @@ func (e *Engine) BackupRestoreFinish(spdkClient *spdkclient.Client) error {
 		if err != nil {
 			return err
 		}
-		e.log.Infof("Attaching replica %s with address %s before finishing restoration", replicaName, replicaAddress)
+		transport := e.replicaTransport()
+		e.log.Infof("Attaching replica %s with address %s (transport=%s) before finishing restoration", replicaName, replicaAddress, transport)
 		nvmeBdevNameList, err := spdkClient.BdevNvmeAttachController(replicaName, helpertypes.GetNQN(replicaName), replicaIP, replicaPort,
-			spdktypes.NvmeTransportTypeTCP, spdktypes.NvmeAddressFamilyIPv4,
+			transport.ToSPDKTransportType(), spdktypes.NvmeAddressFamilyIPv4,
 			int32(e.ctrlrLossTimeout), replicaReconnectDelaySec, int32(e.fastIOFailTimeoutSec), replicaMultipath)
 		if err != nil {
 			return err
@@ -2542,7 +2561,7 @@ func (e *Engine) expandSingleReplica(spdkClient *spdkclient.Client, replicaName 
 		return err
 	}
 
-	_, err = connectNVMfBdev(spdkClient, replicaName, replicaStatus.Address, e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
+	_, err = connectNVMfBdevWithTransport(spdkClient, replicaName, replicaStatus.Address, e.replicaTransport(), e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
 	return err
 }
 
