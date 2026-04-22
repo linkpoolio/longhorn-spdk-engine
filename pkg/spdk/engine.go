@@ -407,6 +407,12 @@ func (e *Engine) addTCPFallbackListener(spdkClient *spdkclient.Client, superiorP
 	if err != nil {
 		return err
 	}
+	if err := spdkClient.EnsureNvmfTransport(spdktypes.NvmeTransportTypeTCP); err != nil {
+		if rErr := superiorPortAllocator.ReleaseRange(port, port); rErr != nil {
+			e.log.WithError(rErr).Warnf("Failed to release fallback port %d after TCP transport create failure", port)
+		}
+		return errors.Wrapf(err, "failed to ensure TCP transport before adding fallback listener")
+	}
 	if _, err := spdkClient.NvmfSubsystemAddListener(
 		e.NvmeTcpTarget.Nqn,
 		e.NvmeTcpTarget.IP, strconv.Itoa(int(port)),
@@ -2547,6 +2553,9 @@ func (e *Engine) Expand(spdkClient *spdkclient.Client, size uint64) (err error) 
 			if err != nil {
 				return err
 			}
+			if err := spdkClient.EnsureNvmfTransport(spdktypes.NvmeTransportTypeTCP); err != nil {
+				return errors.Wrapf(err, "failed to ensure TCP transport before re-adding fallback listener after expand")
+			}
 			if _, err := spdkClient.NvmfSubsystemAddListener(
 				e.NvmeTcpTarget.Nqn,
 				e.NvmeTcpTarget.IP, strconv.Itoa(int(e.NvmeTcpTarget.TCPFallbackPort)),
@@ -3352,11 +3361,17 @@ func validateAndGetSingleNvmeInfo(replicaName string, bdev *spdktypes.BdevInfo) 
 }
 
 func validateNvmeTransport(replicaName, bdevName string, nvmeInfo spdktypes.NvmeNamespaceInfo) error {
-	if !strings.EqualFold(string(nvmeInfo.Trid.Adrfam), string(spdktypes.NvmeAddressFamilyIPv4)) ||
-		!strings.EqualFold(string(nvmeInfo.Trid.Trtype), string(spdktypes.NvmeTransportTypeTCP)) {
+	if !strings.EqualFold(string(nvmeInfo.Trid.Adrfam), string(spdktypes.NvmeAddressFamilyIPv4)) {
 		return fmt.Errorf(
-			"found invalid address family %s and transport type %s in a remote NVMe base bdev %s during replica %s mode validation",
-			nvmeInfo.Trid.Adrfam, nvmeInfo.Trid.Trtype, bdevName, replicaName,
+			"found invalid address family %s in a remote NVMe base bdev %s during replica %s mode validation",
+			nvmeInfo.Trid.Adrfam, bdevName, replicaName,
+		)
+	}
+	if !strings.EqualFold(string(nvmeInfo.Trid.Trtype), string(spdktypes.NvmeTransportTypeTCP)) &&
+		!strings.EqualFold(string(nvmeInfo.Trid.Trtype), string(spdktypes.NvmeTransportTypeRDMA)) {
+		return fmt.Errorf(
+			"found invalid transport type %s in a remote NVMe base bdev %s during replica %s mode validation",
+			nvmeInfo.Trid.Trtype, bdevName, replicaName,
 		)
 	}
 	return nil
@@ -3364,13 +3379,26 @@ func validateNvmeTransport(replicaName, bdevName string, nvmeInfo spdktypes.Nvme
 
 func validateReplicaAddress(replicaName, bdevName, expectedAddr string, nvmeInfo spdktypes.NvmeNamespaceInfo) error {
 	actualAddr := net.JoinHostPort(nvmeInfo.Trid.Traddr, nvmeInfo.Trid.Trsvcid)
-	if expectedAddr != actualAddr {
-		return fmt.Errorf(
-			"found mismatching between replica bdev %s address %s and the NVMe bdev actual address %s during replica %s mode validation",
-			bdevName, expectedAddr, actualAddr, replicaName,
-		)
+	if expectedAddr == actualAddr {
+		return nil
 	}
-	return nil
+	// Dual-listener replicas expose the primary (RDMA) at PortStart and a TCP
+	// fallback at PortStart+1. attemptTCPFallback() may have connected via the
+	// fallback when the primary was unreachable, in which case the bdev's Trid
+	// will report PortStart+1 while replicaStatus.Address still holds the
+	// primary. Treat that as a valid match.
+	if expectedHost, expectedPortStr, err := net.SplitHostPort(expectedAddr); err == nil {
+		if expectedPort, convErr := strconv.Atoi(expectedPortStr); convErr == nil {
+			fallbackAddr := net.JoinHostPort(expectedHost, strconv.Itoa(expectedPort+1))
+			if actualAddr == fallbackAddr {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf(
+		"found mismatching between replica bdev %s address %s and the NVMe bdev actual address %s during replica %s mode validation",
+		bdevName, expectedAddr, actualAddr, replicaName,
+	)
 }
 
 func validateControllerName(replicaName, bdevName, namespaceBdevName string) error {
