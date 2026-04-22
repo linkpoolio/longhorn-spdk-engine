@@ -3358,11 +3358,17 @@ func validateAndGetSingleNvmeInfo(replicaName string, bdev *spdktypes.BdevInfo) 
 }
 
 func validateNvmeTransport(replicaName, bdevName string, nvmeInfo spdktypes.NvmeNamespaceInfo) error {
-	if !strings.EqualFold(string(nvmeInfo.Trid.Adrfam), string(spdktypes.NvmeAddressFamilyIPv4)) ||
-		!strings.EqualFold(string(nvmeInfo.Trid.Trtype), string(spdktypes.NvmeTransportTypeTCP)) {
+	if !strings.EqualFold(string(nvmeInfo.Trid.Adrfam), string(spdktypes.NvmeAddressFamilyIPv4)) {
 		return fmt.Errorf(
-			"found invalid address family %s and transport type %s in a remote NVMe base bdev %s during replica %s mode validation",
-			nvmeInfo.Trid.Adrfam, nvmeInfo.Trid.Trtype, bdevName, replicaName,
+			"found invalid address family %s in a remote NVMe base bdev %s during replica %s mode validation",
+			nvmeInfo.Trid.Adrfam, bdevName, replicaName,
+		)
+	}
+	if !strings.EqualFold(string(nvmeInfo.Trid.Trtype), string(spdktypes.NvmeTransportTypeTCP)) &&
+		!strings.EqualFold(string(nvmeInfo.Trid.Trtype), string(spdktypes.NvmeTransportTypeRDMA)) {
+		return fmt.Errorf(
+			"found invalid transport type %s in a remote NVMe base bdev %s during replica %s mode validation",
+			nvmeInfo.Trid.Trtype, bdevName, replicaName,
 		)
 	}
 	return nil
