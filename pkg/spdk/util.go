@@ -183,7 +183,10 @@ func connectNVMfBdevWithTransport(spdkClient *spdkclient.Client, controllerName,
 	)
 
 	if err != nil {
-		return "", fmt.Errorf("attach NVMe controller failed after %d attempts: %w", maxRetries, err)
+		nvmeBdevNameList, err = attemptTCPFallback(spdkClient, controllerName, ip, port, ctrlrLossTimeout, fastIOFailTimeoutSec, transport, err)
+		if err != nil {
+			return "", fmt.Errorf("attach NVMe controller failed after %d attempts: %w", maxRetries, err)
+		}
 	}
 
 	if len(nvmeBdevNameList) != 1 {
@@ -191,6 +194,40 @@ func connectNVMfBdevWithTransport(spdkClient *spdkclient.Client, controllerName,
 	}
 
 	return nvmeBdevNameList[0], nil
+}
+
+func attemptTCPFallback(spdkClient *spdkclient.Client, controllerName, ip, port string, ctrlrLossTimeout, fastIOFailTimeoutSec int, originalTransport NvmfTransportType, primaryErr error) ([]string, error) {
+	primaryPort, parseErr := strconv.Atoi(port)
+	if parseErr != nil {
+		return nil, primaryErr
+	}
+	fallbackPort := strconv.Itoa(primaryPort + 1)
+
+	if _, detachErr := spdkClient.BdevNvmeDetachController(controllerName); detachErr != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(detachErr) {
+		return nil, primaryErr
+	}
+
+	logrus.WithError(primaryErr).Warnf(
+		"Primary NVMe attach failed (controller=%s transport=%s address=%s:%s); trying TCP fallback on %s:%s",
+		controllerName, originalTransport, ip, port, ip, fallbackPort,
+	)
+
+	list, err := spdkClient.BdevNvmeAttachController(
+		controllerName,
+		helpertypes.GetNQN(controllerName),
+		ip,
+		fallbackPort,
+		spdktypes.NvmeTransportTypeTCP,
+		spdktypes.NvmeAddressFamilyIPv4,
+		int32(ctrlrLossTimeout),
+		replicaReconnectDelaySec,
+		int32(fastIOFailTimeoutSec),
+		replicaMultipath,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("primary attach failed (%v) and TCP fallback to %s:%s also failed: %w", primaryErr, ip, fallbackPort, err)
+	}
+	return list, nil
 }
 
 func disconnectNVMfBdev(spdkClient *spdkclient.Client, bdevName string, maxRetries int, retryInterval time.Duration) error {
