@@ -1564,11 +1564,16 @@ func (e *Engine) ReplicaDelete(spdkClient *spdkclient.Client, replicaName, repli
 		}
 	}
 	if replicaName == "" {
-		return fmt.Errorf("cannot find replica name with address %s for engine %s replica delete", replicaAddress, e.Name)
+		e.log.Infof("Engine %s has no replica with address %s to delete; treating as complete", e.Name, replicaAddress)
+		return nil
 	}
 	replicaStatus := e.ReplicaStatusMap[replicaName]
 	if replicaStatus == nil {
-		return fmt.Errorf("cannot find replica %s from the replica status map for engine %s replica delete", replicaName, e.Name)
+		if _, err := spdkClient.BdevNvmeDetachController(replicaName); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
+			e.log.WithError(err).Warnf("Failed best-effort detach of controller %s", replicaName)
+		}
+		e.log.Infof("Engine %s does not track replica %s; treating delete as complete", e.Name, replicaName)
+		return nil
 	}
 	if replicaAddress != "" && replicaStatus.Address != replicaAddress {
 		return fmt.Errorf("replica %s recorded address %s does not match the input address %s for engine %s replica delete", replicaName, replicaStatus.Address, replicaAddress, e.Name)
