@@ -130,6 +130,9 @@ func (r *Replica) addTCPFallbackListener(spdkClient *spdkclient.Client, nqn stri
 		return nil
 	}
 	fallbackPort := strconv.Itoa(int(r.PortStart + 1))
+	if err := spdkClient.EnsureNvmfTransport(spdktypes.NvmeTransportTypeTCP); err != nil {
+		return errors.Wrapf(err, "failed to ensure TCP transport before adding fallback listener on %s:%s for nqn %s", r.IP, fallbackPort, nqn)
+	}
 	if _, err := spdkClient.NvmfSubsystemAddListener(
 		nqn, r.IP, fallbackPort,
 		spdktypes.NvmeTransportTypeTCP, spdktypes.NvmeAddressFamilyIPv4,
@@ -598,17 +601,18 @@ func (r *Replica) validateAndUpdate(bdevLvolMap map[string]*spdktypes.BdevInfo, 
 	}
 
 	nqn := helpertypes.GetNQN(r.Name)
-	exposedPort, exposedPortErr := getExposedPort(subsystemMap[nqn])
+	primaryTrtype := r.transport().ToSPDKTransportType()
+	exposedPort, exposedPortErr := getExposedPortForTransport(subsystemMap[nqn], primaryTrtype)
 	if r.IsExposed {
 		if exposedPortErr != nil {
-			return errors.Wrapf(exposedPortErr, "failed to find the actual port in subsystem NQN %s for replica %s, which should be exposed at %d", nqn, r.Name, r.PortStart)
+			return errors.Wrapf(exposedPortErr, "failed to find the actual %s listener port in subsystem NQN %s for replica %s, which should be exposed at %d", primaryTrtype, nqn, r.Name, r.PortStart)
 		}
 		if exposedPort != r.PortStart {
-			return fmt.Errorf("found mismatching between the actual exposed port %d and the recorded port %d for exposed replica %s", exposedPort, r.PortStart, r.Name)
+			return fmt.Errorf("found mismatching between the actual exposed %s port %d and the recorded port %d for exposed replica %s", primaryTrtype, exposedPort, r.PortStart, r.Name)
 		}
 	} else {
 		if exposedPortErr == nil {
-			return fmt.Errorf("found the actual port %d in subsystem NQN %s for replica %s, which should not be exposed", exposedPort, nqn, r.Name)
+			return fmt.Errorf("found the actual %s port %d in subsystem NQN %s for replica %s, which should not be exposed", primaryTrtype, exposedPort, nqn, r.Name)
 		}
 	}
 
@@ -679,24 +683,31 @@ func (r *Replica) SyncSnapshotHashStatus(snapSvcLvol *Lvol) {
 }
 
 func getExposedPort(subsystem *spdktypes.NvmfSubsystem) (exposedPort int32, err error) {
+	return getExposedPortForTransport(subsystem, spdktypes.NvmeTransportTypeTCP)
+}
+
+// getExposedPortForTransport returns the IPv4 listener port for the given
+// transport on the subsystem. Needed because the dual-listener pattern (RDMA
+// primary + TCP fallback at PortStart+1) means a TCP-only lookup returns the
+// fallback port for RDMA replicas, which then fails PortStart equality checks.
+func getExposedPortForTransport(subsystem *spdktypes.NvmfSubsystem, trtype spdktypes.NvmeTransportType) (exposedPort int32, err error) {
 	if subsystem == nil || len(subsystem.ListenAddresses) == 0 {
 		return 0, fmt.Errorf("cannot find the NVMf subsystem")
 	}
 
-	port := 0
 	for _, listenAddr := range subsystem.ListenAddresses {
 		if !strings.EqualFold(string(listenAddr.Adrfam), string(spdktypes.NvmeAddressFamilyIPv4)) ||
-			!strings.EqualFold(string(listenAddr.Trtype), string(spdktypes.NvmeTransportTypeTCP)) {
+			!strings.EqualFold(string(listenAddr.Trtype), string(trtype)) {
 			continue
 		}
-		port, err = strconv.Atoi(listenAddr.Trsvcid)
+		port, err := strconv.Atoi(listenAddr.Trsvcid)
 		if err != nil {
 			return 0, err
 		}
 		return int32(port), nil
 	}
 
-	return 0, fmt.Errorf("cannot find a exposed port in the NVMf subsystem")
+	return 0, fmt.Errorf("cannot find a %s exposed port in the NVMf subsystem", trtype)
 }
 
 func (r *Replica) validateReplicaHead(headBdevLvol *spdktypes.BdevInfo) (err error) {

@@ -88,6 +88,13 @@ func (c *Client) StartExposeBdevWithTransport(nqn, bdevName, nguid, ip, port str
 	return nil
 }
 
+// EnsureNvmfTransport creates the given nvmf transport on the SPDK target if
+// it is not already registered. Safe to call repeatedly; returns nil both when
+// the transport was newly created and when it already existed.
+func (c *Client) EnsureNvmfTransport(transport spdktypes.NvmeTransportType) error {
+	return c.ensureNvmfTransport(transport)
+}
+
 func (c *Client) ensureNvmfTransport(transport spdktypes.NvmeTransportType) error {
 	existing, err := c.NvmfGetTransports("", "")
 	if err != nil {

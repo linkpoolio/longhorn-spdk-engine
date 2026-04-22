@@ -407,6 +407,12 @@ func (e *Engine) addTCPFallbackListener(spdkClient *spdkclient.Client, superiorP
 	if err != nil {
 		return err
 	}
+	if err := spdkClient.EnsureNvmfTransport(spdktypes.NvmeTransportTypeTCP); err != nil {
+		if rErr := superiorPortAllocator.ReleaseRange(port, port); rErr != nil {
+			e.log.WithError(rErr).Warnf("Failed to release fallback port %d after TCP transport create failure", port)
+		}
+		return errors.Wrapf(err, "failed to ensure TCP transport before adding fallback listener")
+	}
 	if _, err := spdkClient.NvmfSubsystemAddListener(
 		e.NvmeTcpTarget.Nqn,
 		e.NvmeTcpTarget.IP, strconv.Itoa(int(port)),
