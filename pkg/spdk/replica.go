@@ -130,6 +130,9 @@ func (r *Replica) addTCPFallbackListener(spdkClient *spdkclient.Client, nqn stri
 		return nil
 	}
 	fallbackPort := strconv.Itoa(int(r.PortStart + 1))
+	if err := spdkClient.EnsureNvmfTransport(spdktypes.NvmeTransportTypeTCP); err != nil {
+		return errors.Wrapf(err, "failed to ensure TCP transport before adding fallback listener on %s:%s for nqn %s", r.IP, fallbackPort, nqn)
+	}
 	if _, err := spdkClient.NvmfSubsystemAddListener(
 		nqn, r.IP, fallbackPort,
 		spdktypes.NvmeTransportTypeTCP, spdktypes.NvmeAddressFamilyIPv4,
@@ -326,6 +329,11 @@ func (r *Replica) prepareIPAndPorts(portCount int32, superiorPortAllocator *comm
 		return err
 	}
 	r.IP = podIP
+
+	if r.PortStart != 0 && r.PortEnd != 0 && r.portAllocator != nil {
+		r.log.Infof("Reusing reserved IP %s and Ports [%d, %d] for replica (primary=%d, tcp-fallback=%d)", r.IP, r.PortStart, r.PortEnd, r.PortStart, r.PortStart+1)
+		return nil
+	}
 
 	r.PortStart, r.PortEnd, err = superiorPortAllocator.AllocateRange(portCount + 1)
 	if err != nil {
@@ -598,17 +606,18 @@ func (r *Replica) validateAndUpdate(bdevLvolMap map[string]*spdktypes.BdevInfo, 
 	}
 
 	nqn := helpertypes.GetNQN(r.Name)
-	exposedPort, exposedPortErr := getExposedPort(subsystemMap[nqn])
+	primaryTrtype := r.transport().ToSPDKTransportType()
+	exposedPort, exposedPortErr := getExposedPortForTransport(subsystemMap[nqn], primaryTrtype)
 	if r.IsExposed {
 		if exposedPortErr != nil {
-			return errors.Wrapf(exposedPortErr, "failed to find the actual port in subsystem NQN %s for replica %s, which should be exposed at %d", nqn, r.Name, r.PortStart)
+			return errors.Wrapf(exposedPortErr, "failed to find the actual %s listener port in subsystem NQN %s for replica %s, which should be exposed at %d", primaryTrtype, nqn, r.Name, r.PortStart)
 		}
 		if exposedPort != r.PortStart {
-			return fmt.Errorf("found mismatching between the actual exposed port %d and the recorded port %d for exposed replica %s", exposedPort, r.PortStart, r.Name)
+			return fmt.Errorf("found mismatching between the actual exposed %s port %d and the recorded port %d for exposed replica %s", primaryTrtype, exposedPort, r.PortStart, r.Name)
 		}
 	} else {
 		if exposedPortErr == nil {
-			return fmt.Errorf("found the actual port %d in subsystem NQN %s for replica %s, which should not be exposed", exposedPort, nqn, r.Name)
+			return fmt.Errorf("found the actual %s port %d in subsystem NQN %s for replica %s, which should not be exposed", primaryTrtype, exposedPort, nqn, r.Name)
 		}
 	}
 
@@ -679,24 +688,31 @@ func (r *Replica) SyncSnapshotHashStatus(snapSvcLvol *Lvol) {
 }
 
 func getExposedPort(subsystem *spdktypes.NvmfSubsystem) (exposedPort int32, err error) {
+	return getExposedPortForTransport(subsystem, spdktypes.NvmeTransportTypeTCP)
+}
+
+// getExposedPortForTransport returns the IPv4 listener port for the given
+// transport on the subsystem. Needed because the dual-listener pattern (RDMA
+// primary + TCP fallback at PortStart+1) means a TCP-only lookup returns the
+// fallback port for RDMA replicas, which then fails PortStart equality checks.
+func getExposedPortForTransport(subsystem *spdktypes.NvmfSubsystem, trtype spdktypes.NvmeTransportType) (exposedPort int32, err error) {
 	if subsystem == nil || len(subsystem.ListenAddresses) == 0 {
 		return 0, fmt.Errorf("cannot find the NVMf subsystem")
 	}
 
-	port := 0
 	for _, listenAddr := range subsystem.ListenAddresses {
 		if !strings.EqualFold(string(listenAddr.Adrfam), string(spdktypes.NvmeAddressFamilyIPv4)) ||
-			!strings.EqualFold(string(listenAddr.Trtype), string(spdktypes.NvmeTransportTypeTCP)) {
+			!strings.EqualFold(string(listenAddr.Trtype), string(trtype)) {
 			continue
 		}
-		port, err = strconv.Atoi(listenAddr.Trsvcid)
+		port, err := strconv.Atoi(listenAddr.Trsvcid)
 		if err != nil {
 			return 0, err
 		}
 		return int32(port), nil
 	}
 
-	return 0, fmt.Errorf("cannot find a exposed port in the NVMf subsystem")
+	return 0, fmt.Errorf("cannot find a %s exposed port in the NVMf subsystem", trtype)
 }
 
 func (r *Replica) validateReplicaHead(headBdevLvol *spdktypes.BdevInfo) (err error) {
@@ -1308,7 +1324,10 @@ func (r *Replica) Delete(spdkClient *spdkclient.Client, cleanupRequired bool, su
 		r.isSnapshotCloning = false
 	}
 
-	// The port can be released once the rebuilding and expose are stopped.
+	if !cleanupRequired {
+		return nil
+	}
+
 	if r.PortStart != 0 {
 		if err := superiorPortAllocator.ReleaseRange(r.PortStart, r.PortEnd); err != nil {
 			return errors.Wrapf(err, "failed to release port %d to %d during replica deletion with cleanup flag %v", r.PortStart, r.PortEnd, cleanupRequired)
@@ -1316,10 +1335,6 @@ func (r *Replica) Delete(spdkClient *spdkclient.Client, cleanupRequired bool, su
 		r.portAllocator = nil
 		r.PortStart, r.PortEnd = 0, 0
 		updateRequired = true
-	}
-
-	if !cleanupRequired {
-		return nil
 	}
 
 	// Use r.Alias here since we don't know if an errored replicas still contains the head lvol
@@ -2095,6 +2110,9 @@ func (r *Replica) SnapshotCloneDstStart(spdkClient *spdkclient.Client, snapshotN
 		strconv.Itoa(int(r.snapshotCloningDstCache.cloningPort)), r.transport().ToSPDKTransportType()); err != nil {
 		return err
 	}
+	if err := r.addTCPFallbackListener(spdkClient, helpertypes.GetNQN(r.snapshotCloningDstCache.cloningLvol.Name)); err != nil {
+		return err
+	}
 	dstCloningLvolAddress := net.JoinHostPort(r.IP, strconv.Itoa(int(r.snapshotCloningDstCache.cloningPort)))
 
 	// Ask src replica to start cloning
@@ -2595,6 +2613,9 @@ func (r *Replica) RebuildingSrcStart(spdkClient *spdkclient.Client, dstReplicaNa
 		return "", err
 	}
 	if err := spdkClient.StartExposeBdevWithTransport(helpertypes.GetNQN(snapLvol.Name), snapLvol.UUID, generateNGUID(snapLvol.Name), r.IP, strconv.Itoa(int(port)), r.transport().ToSPDKTransportType()); err != nil {
+		return "", err
+	}
+	if err := r.addTCPFallbackListener(spdkClient, helpertypes.GetNQN(snapLvol.Name)); err != nil {
 		return "", err
 	}
 	exposedSnapshotLvolAddress = net.JoinHostPort(r.IP, strconv.Itoa(int(port)))
@@ -3612,6 +3633,9 @@ func (r *Replica) rebuildingDstShallowCopyPrepare(spdkClient *spdkclient.Client,
 	if r.rebuildingDstCache.rebuildingPort != 0 {
 		if err := spdkClient.StartExposeBdevWithTransport(helpertypes.GetNQN(r.rebuildingDstCache.rebuildingLvol.Name), r.rebuildingDstCache.rebuildingLvol.UUID,
 			generateNGUID(r.rebuildingDstCache.rebuildingLvol.Name), r.IP, strconv.Itoa(int(r.rebuildingDstCache.rebuildingPort)), r.transport().ToSPDKTransportType()); err != nil {
+			return "", false, err
+		}
+		if err := r.addTCPFallbackListener(spdkClient, helpertypes.GetNQN(r.rebuildingDstCache.rebuildingLvol.Name)); err != nil {
 			return "", false, err
 		}
 		dstRebuildingLvolAddress = net.JoinHostPort(r.IP, strconv.Itoa(int(r.rebuildingDstCache.rebuildingPort)))

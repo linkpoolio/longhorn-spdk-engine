@@ -195,7 +195,7 @@ func (e *Engine) resolveCntlidRange() (uint16, uint16) {
 		return getEngineDualCntlidRange(e.Name)
 	}
 	cntlid := getEngineCntlid(e.Name)
-	return cntlid, cntlid
+	return cntlid, cntlid + 3
 }
 
 type EngineReplicaStatus struct {
@@ -356,7 +356,14 @@ func (e *Engine) createNVMeTCPTarget(spdkClient *spdkclient.Client, superiorPort
 	e.NvmeTcpTarget.Port = port
 	e.NvmeTcpTarget.Nqn = getStableVolumeNQN(e.VolumeName)
 	e.NvmeTcpTarget.Nguid = getStableVolumeNGUID(e.VolumeName)
-	e.NvmeTcpTarget.Transport = e.replicaTransport()
+	// Engine target serves the host-side kernel NVMe initiator (spdk-tcp-blockdev
+	// frontend), which is always TCP. Keeping this on TCP regardless of the
+	// replica<->engine transport avoids the dual-listener split-port problem:
+	// the kernel has no way to reach an RDMA-only engine listener, and the
+	// separately-allocated "TCP fallback" port never matches the address the
+	// frontend connects to. replicaTransport() still controls RDMA for the
+	// inter-SPDK replica attach, which is where the bandwidth benefit lives.
+	e.NvmeTcpTarget.Transport = NvmfTransportTCP
 
 	spdkANAState, err := toSPDKListenerANAState(initialANAState)
 	if err != nil {
@@ -406,6 +413,12 @@ func (e *Engine) addTCPFallbackListener(spdkClient *spdkclient.Client, superiorP
 	listenerANAState, err := toSPDKListenerANAState(NvmeTCPANAStateNonOptimized)
 	if err != nil {
 		return err
+	}
+	if err := spdkClient.EnsureNvmfTransport(spdktypes.NvmeTransportTypeTCP); err != nil {
+		if rErr := superiorPortAllocator.ReleaseRange(port, port); rErr != nil {
+			e.log.WithError(rErr).Warnf("Failed to release fallback port %d after TCP transport create failure", port)
+		}
+		return errors.Wrapf(err, "failed to ensure TCP transport before adding fallback listener")
 	}
 	if _, err := spdkClient.NvmfSubsystemAddListener(
 		e.NvmeTcpTarget.Nqn,
@@ -1053,59 +1066,77 @@ func (e *Engine) replicaAddStart(spdkClient *spdkclient.Client, replicaClients m
 	opts := &api.SnapshotOptions{
 		Timestamp: util.Now(),
 	}
+	addLog := e.log.WithFields(map[string]interface{}{
+		"dstReplica":     dstReplicaName,
+		"srcReplica":     srcReplicaName,
+		"rebuildSnapshot": snapshotName,
+	})
 
+	addLog.Info("replicaAddStart step=snapshotCreate")
 	var replicasErr error
 	startUpdateRequired, replicasErr, engineErr = e.snapshotOperationWithoutLock(spdkClient, replicaClients, snapshotName, SnapshotOperationCreate, opts)
 	if replicasErr != nil {
+		addLog.WithError(replicasErr).Error("replicaAddStart failed step=snapshotCreate")
 		return nil, startUpdateRequired, engineErr, replicasErr
 	}
 	if engineErr != nil {
+		addLog.WithError(engineErr).Error("replicaAddStart engineErr step=snapshotCreate")
 		return nil, startUpdateRequired, engineErr, nil
 	}
 	e.checkAndUpdateInfoFromReplicasNoLock()
 
+	addLog.Info("replicaAddStart step=getRebuildingSnapshotList")
 	rebuildingSnapshotList, err = getRebuildingSnapshotList(srcReplicaServiceCli, srcReplicaName)
 	if err != nil {
+		addLog.WithError(err).Error("replicaAddStart failed step=getRebuildingSnapshotList")
 		return nil, startUpdateRequired, nil, err
 	}
 
-	// Ask the source replica to expose the newly created snapshot if the source replica and destination replica are not on the same node.
+	addLog.Info("replicaAddStart step=rebuildingSrcStart")
 	externalSnapshotAddress, err := srcReplicaServiceCli.ReplicaRebuildingSrcStart(srcReplicaName, dstReplicaName, dstReplicaAddress, snapshotName)
 	if err != nil {
+		addLog.WithError(err).Error("replicaAddStart failed step=rebuildingSrcStart")
 		return nil, startUpdateRequired, nil, err
 	}
 
-	// The destination replica attaches the source replica exposed snapshot as the external snapshot then create a head based on it.
+	addLog.Info("replicaAddStart step=rebuildingDstStart")
 	dstHeadLvolAddress, err := dstReplicaServiceCli.ReplicaRebuildingDstStart(dstReplicaName, srcReplicaName, srcReplicaAddress, snapshotName, externalSnapshotAddress, rebuildingSnapshotList)
 	if err != nil {
+		addLog.WithError(err).Error("replicaAddStart failed step=rebuildingDstStart")
 		return nil, startUpdateRequired, nil, err
 	}
 
-	// Ensure the dst head lvol size matches the engine spec size before connecting and growing the RAID.
+	addLog.Info("replicaAddStart step=ensureRebuildingReplicaSize")
 	if err := e.ensureRebuildingReplicaSize(dstReplicaServiceCli, dstReplicaName); err != nil {
+		addLog.WithError(err).Error("replicaAddStart failed step=ensureRebuildingReplicaSize")
 		return nil, startUpdateRequired, nil, err
 	}
 
-	// Add rebuilding replica head bdev to the base bdev list of the RAID bdev
+	addLog.Info("replicaAddStart step=connectNVMfBdev")
 	dstHeadLvolBdevName, err := connectNVMfBdevWithTransport(spdkClient, dstReplicaName, dstHeadLvolAddress, e.replicaTransport(), e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
 	if err != nil {
+		addLog.WithError(err).Error("replicaAddStart failed step=connectNVMfBdev")
 		return nil, startUpdateRequired, nil, err
 	}
 
-	// Double-confirm the actual bdev size reported by SPDK after connecting.
+	addLog.WithField("dstHeadBdev", dstHeadLvolBdevName).Info("replicaAddStart step=bdevGetBdevs")
 	bdevList, err := spdkClient.BdevGetBdevs(dstHeadLvolBdevName, 0)
 	if err != nil {
+		addLog.WithError(err).WithField("dstHeadBdev", dstHeadLvolBdevName).Error("replicaAddStart failed step=bdevGetBdevs")
 		return nil, startUpdateRequired, nil, errors.Wrapf(err, "failed to get bdev info for rebuilding replica %s head bdev %s", dstReplicaName, dstHeadLvolBdevName)
 	}
 	if len(bdevList) != 1 {
+		addLog.WithField("dstHeadBdev", dstHeadLvolBdevName).WithField("bdevCount", len(bdevList)).Error("replicaAddStart failed step=bdevGetBdevs (wrong count)")
 		return nil, startUpdateRequired, nil, fmt.Errorf("expected 1 bdev for rebuilding replica %s head bdev %s, got %d", dstReplicaName, dstHeadLvolBdevName, len(bdevList))
 	}
 	if err := validateReplicaBdevSize(e, dstReplicaName, &bdevList[0]); err != nil {
+		addLog.WithError(err).WithField("dstHeadBdev", dstHeadLvolBdevName).Error("replicaAddStart failed step=validateReplicaBdevSize")
 		return nil, startUpdateRequired, nil, errors.Wrapf(err, "rebuilding replica %s head bdev %s has wrong size, cannot add to engine %s", dstReplicaName, dstHeadLvolBdevName, e.Name)
 	}
 
-	e.log.Infof("Adding rebuilding replica %s head bdev %s to the base bdev list for engine %s", dstReplicaName, dstHeadLvolBdevName, e.Name)
+	addLog.WithField("dstHeadBdev", dstHeadLvolBdevName).Info("replicaAddStart step=bdevRaidGrowBaseBdev")
 	if _, err := spdkClient.BdevRaidGrowBaseBdev(e.Name, dstHeadLvolBdevName); err != nil {
+		addLog.WithError(err).WithField("dstHeadBdev", dstHeadLvolBdevName).Error("replicaAddStart failed step=bdevRaidGrowBaseBdev")
 		return nil, startUpdateRequired, nil, errors.Wrapf(err, "failed to adding the rebuilding replica %s head bdev %s to the base bdev list for engine %s", dstReplicaName, dstHeadLvolBdevName, e.Name)
 	}
 
@@ -1551,11 +1582,16 @@ func (e *Engine) ReplicaDelete(spdkClient *spdkclient.Client, replicaName, repli
 		}
 	}
 	if replicaName == "" {
-		return fmt.Errorf("cannot find replica name with address %s for engine %s replica delete", replicaAddress, e.Name)
+		e.log.Infof("Engine %s has no replica with address %s to delete; treating as complete", e.Name, replicaAddress)
+		return nil
 	}
 	replicaStatus := e.ReplicaStatusMap[replicaName]
 	if replicaStatus == nil {
-		return fmt.Errorf("cannot find replica %s from the replica status map for engine %s replica delete", replicaName, e.Name)
+		if _, err := spdkClient.BdevNvmeDetachController(replicaName); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
+			e.log.WithError(err).Warnf("Failed best-effort detach of controller %s", replicaName)
+		}
+		e.log.Infof("Engine %s does not track replica %s; treating delete as complete", e.Name, replicaName)
+		return nil
 	}
 	if replicaAddress != "" && replicaStatus.Address != replicaAddress {
 		return fmt.Errorf("replica %s recorded address %s does not match the input address %s for engine %s replica delete", replicaName, replicaStatus.Address, replicaAddress, e.Name)
@@ -2547,6 +2583,9 @@ func (e *Engine) Expand(spdkClient *spdkclient.Client, size uint64) (err error) 
 			if err != nil {
 				return err
 			}
+			if err := spdkClient.EnsureNvmfTransport(spdktypes.NvmeTransportTypeTCP); err != nil {
+				return errors.Wrapf(err, "failed to ensure TCP transport before re-adding fallback listener after expand")
+			}
 			if _, err := spdkClient.NvmfSubsystemAddListener(
 				e.NvmeTcpTarget.Nqn,
 				e.NvmeTcpTarget.IP, strconv.Itoa(int(e.NvmeTcpTarget.TCPFallbackPort)),
@@ -3352,11 +3391,17 @@ func validateAndGetSingleNvmeInfo(replicaName string, bdev *spdktypes.BdevInfo) 
 }
 
 func validateNvmeTransport(replicaName, bdevName string, nvmeInfo spdktypes.NvmeNamespaceInfo) error {
-	if !strings.EqualFold(string(nvmeInfo.Trid.Adrfam), string(spdktypes.NvmeAddressFamilyIPv4)) ||
-		!strings.EqualFold(string(nvmeInfo.Trid.Trtype), string(spdktypes.NvmeTransportTypeTCP)) {
+	if !strings.EqualFold(string(nvmeInfo.Trid.Adrfam), string(spdktypes.NvmeAddressFamilyIPv4)) {
 		return fmt.Errorf(
-			"found invalid address family %s and transport type %s in a remote NVMe base bdev %s during replica %s mode validation",
-			nvmeInfo.Trid.Adrfam, nvmeInfo.Trid.Trtype, bdevName, replicaName,
+			"found invalid address family %s in a remote NVMe base bdev %s during replica %s mode validation",
+			nvmeInfo.Trid.Adrfam, bdevName, replicaName,
+		)
+	}
+	if !strings.EqualFold(string(nvmeInfo.Trid.Trtype), string(spdktypes.NvmeTransportTypeTCP)) &&
+		!strings.EqualFold(string(nvmeInfo.Trid.Trtype), string(spdktypes.NvmeTransportTypeRDMA)) {
+		return fmt.Errorf(
+			"found invalid transport type %s in a remote NVMe base bdev %s during replica %s mode validation",
+			nvmeInfo.Trid.Trtype, bdevName, replicaName,
 		)
 	}
 	return nil
@@ -3364,13 +3409,26 @@ func validateNvmeTransport(replicaName, bdevName string, nvmeInfo spdktypes.Nvme
 
 func validateReplicaAddress(replicaName, bdevName, expectedAddr string, nvmeInfo spdktypes.NvmeNamespaceInfo) error {
 	actualAddr := net.JoinHostPort(nvmeInfo.Trid.Traddr, nvmeInfo.Trid.Trsvcid)
-	if expectedAddr != actualAddr {
-		return fmt.Errorf(
-			"found mismatching between replica bdev %s address %s and the NVMe bdev actual address %s during replica %s mode validation",
-			bdevName, expectedAddr, actualAddr, replicaName,
-		)
+	if expectedAddr == actualAddr {
+		return nil
 	}
-	return nil
+	// Dual-listener replicas expose the primary (RDMA) at PortStart and a TCP
+	// fallback at PortStart+1. attemptTCPFallback() may have connected via the
+	// fallback when the primary was unreachable, in which case the bdev's Trid
+	// will report PortStart+1 while replicaStatus.Address still holds the
+	// primary. Treat that as a valid match.
+	if expectedHost, expectedPortStr, err := net.SplitHostPort(expectedAddr); err == nil {
+		if expectedPort, convErr := strconv.Atoi(expectedPortStr); convErr == nil {
+			fallbackAddr := net.JoinHostPort(expectedHost, strconv.Itoa(expectedPort+1))
+			if actualAddr == fallbackAddr {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf(
+		"found mismatching between replica bdev %s address %s and the NVMe bdev actual address %s during replica %s mode validation",
+		bdevName, expectedAddr, actualAddr, replicaName,
+	)
 }
 
 func validateControllerName(replicaName, bdevName, namespaceBdevName string) error {

@@ -88,6 +88,7 @@ func NewServer(ctx context.Context, portStart, portEnd int32) (*Server, error) {
 	}
 
 	nodeTransport := NegotiateNodeTransport(cli)
+	StartTransportReprobe(ctx, cli, nodeTransport)
 
 	broadcasters := map[types.InstanceType]*broadcaster.Broadcaster{}
 	broadcastChs := map[types.InstanceType]chan interface{}{}

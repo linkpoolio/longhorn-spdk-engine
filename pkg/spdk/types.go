@@ -400,14 +400,11 @@ func getEngineCntlid(engineName string) uint16 {
 	return 1 // fallback
 }
 
-// dualListenerCntlidBase offsets dual-listener (RDMA + TCP fallback) cntlid
-// ranges out of the 1..~1000 band used by legacy single-listener engines
-// so pre-upgrade and post-upgrade engines sharing the same NQN during a
-// rolling upgrade cannot collide.
 const dualListenerCntlidBase uint16 = 1000
+const dualListenerCntlidSlotsPerEngine uint16 = 8
 
 func getEngineDualCntlidRange(engineName string) (uint16, uint16) {
 	ordinal := uint16(getEngineCntlid(engineName) - 1)
-	lo := dualListenerCntlidBase + ordinal*2 + 1
-	return lo, lo + 1
+	lo := dualListenerCntlidBase + ordinal*dualListenerCntlidSlotsPerEngine + 1
+	return lo, lo + dualListenerCntlidSlotsPerEngine - 1
 }

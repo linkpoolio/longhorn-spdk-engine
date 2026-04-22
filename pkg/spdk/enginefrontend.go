@@ -2481,6 +2481,7 @@ func (ef *EngineFrontend) ValidateAndUpdate(spdkClient *spdkclient.Client) (err 
 			if ef.State != types.InstanceStateError {
 				ef.log.WithError(err).Error("Setting engine frontend to error state due to validation failure")
 				ef.State = types.InstanceStateError
+				ef.Endpoint = ""
 				updateRequired = true
 			}
 			ef.ErrorMsg = err.Error()
