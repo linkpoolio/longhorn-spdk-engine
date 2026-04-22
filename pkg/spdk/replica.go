@@ -330,6 +330,17 @@ func (r *Replica) prepareIPAndPorts(portCount int32, superiorPortAllocator *comm
 	}
 	r.IP = podIP
 
+	// Reuse any ports still reserved for this replica from a prior Create whose
+	// Delete ran with cleanupRequired=false. The engine side pins bdev_nvme to
+	// the replica's PortStart; if we reallocated a new range on every restart
+	// cycle, the engine's controller would go stale and retry-storm the
+	// reactor until SPDK dies. Keeping the port stable across stop/start
+	// preserves in-flight engine attachments.
+	if r.PortStart != 0 && r.PortEnd != 0 && r.portAllocator != nil {
+		r.log.Infof("Reusing reserved IP %s and Ports [%d, %d] for replica (primary=%d, tcp-fallback=%d)", r.IP, r.PortStart, r.PortEnd, r.PortStart, r.PortStart+1)
+		return nil
+	}
+
 	r.PortStart, r.PortEnd, err = superiorPortAllocator.AllocateRange(portCount + 1)
 	if err != nil {
 		return err
@@ -1319,7 +1330,16 @@ func (r *Replica) Delete(spdkClient *spdkclient.Client, cleanupRequired bool, su
 		r.isSnapshotCloning = false
 	}
 
-	// The port can be released once the rebuilding and expose are stopped.
+	// Only release the port range on full cleanup. For a stop-for-restart
+	// (cleanupRequired=false) the Replica struct stays in replicaMap and the
+	// next Create reuses PortStart/PortEnd. Releasing + reallocating on each
+	// cycle makes ports climb monotonically; engines that still hold a
+	// bdev_nvme controller to the old port then retry-storm the reactor on
+	// reconnect and SPDK dies.
+	if !cleanupRequired {
+		return nil
+	}
+
 	if r.PortStart != 0 {
 		if err := superiorPortAllocator.ReleaseRange(r.PortStart, r.PortEnd); err != nil {
 			return errors.Wrapf(err, "failed to release port %d to %d during replica deletion with cleanup flag %v", r.PortStart, r.PortEnd, cleanupRequired)
@@ -1327,10 +1347,6 @@ func (r *Replica) Delete(spdkClient *spdkclient.Client, cleanupRequired bool, su
 		r.portAllocator = nil
 		r.PortStart, r.PortEnd = 0, 0
 		updateRequired = true
-	}
-
-	if !cleanupRequired {
-		return nil
 	}
 
 	// Use r.Alias here since we don't know if an errored replicas still contains the head lvol
