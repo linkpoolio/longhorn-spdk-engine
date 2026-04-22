@@ -125,6 +125,20 @@ func (r *Replica) transport() NvmfTransportType {
 	return r.ListenerTransport
 }
 
+func (r *Replica) addTCPFallbackListener(spdkClient *spdkclient.Client, nqn string) error {
+	if r.transport() == NvmfTransportTCP {
+		return nil
+	}
+	fallbackPort := strconv.Itoa(int(r.PortStart + 1))
+	if _, err := spdkClient.NvmfSubsystemAddListener(
+		nqn, r.IP, fallbackPort,
+		spdktypes.NvmeTransportTypeTCP, spdktypes.NvmeAddressFamilyIPv4,
+	); err != nil {
+		return errors.Wrapf(err, "failed to add TCP fallback listener on %s:%s for nqn %s", r.IP, fallbackPort, nqn)
+	}
+	return nil
+}
+
 type LvolHashStatus struct {
 	State            string
 	Error            string
@@ -313,19 +327,18 @@ func (r *Replica) prepareIPAndPorts(portCount int32, superiorPortAllocator *comm
 	}
 	r.IP = podIP
 
-	r.PortStart, r.PortEnd, err = superiorPortAllocator.AllocateRange(portCount)
+	r.PortStart, r.PortEnd, err = superiorPortAllocator.AllocateRange(portCount + 1)
 	if err != nil {
 		return err
 	}
 
-	// Always reserved the 1st port for replica expose and the rest for rebuilding
-	bitmap, err := commonbitmap.NewBitmap(r.PortStart+1, r.PortEnd)
+	bitmap, err := commonbitmap.NewBitmap(r.PortStart+2, r.PortEnd)
 	if err != nil {
 		return err
 	}
 	r.portAllocator = bitmap
 
-	r.log.Infof("Prepared IP %s and Ports [%d, %d] for replica", r.IP, r.PortStart, r.PortEnd)
+	r.log.Infof("Prepared IP %s and Ports [%d, %d] for replica (primary=%d, tcp-fallback=%d)", r.IP, r.PortStart, r.PortEnd, r.PortStart, r.PortStart+1)
 
 	return nil
 }
@@ -1141,6 +1154,9 @@ func (r *Replica) Create(spdkClient *spdkclient.Client, portCount int32, superio
 	if err := spdkClient.StartExposeBdevWithTransport(r.Nqn, r.Head.UUID, generateNGUID(r.Name), r.IP, strconv.Itoa(int(r.PortStart)), r.transport().ToSPDKTransportType()); err != nil {
 		return nil, err
 	}
+	if err := r.addTCPFallbackListener(spdkClient, r.Nqn); err != nil {
+		return nil, err
+	}
 
 	r.IsExposed = true
 	r.State = types.InstanceStateRunning
@@ -1394,8 +1410,12 @@ func (r *Replica) Expand(spdkClient *spdkclient.Client, size uint64) error {
 
 	// If we had previously exposed the bdev, we must re-expose it after the resize.
 	if reExposeBdev {
-		if err := spdkClient.StartExposeBdevWithTransport(helpertypes.GetNQN(r.Name), r.Head.UUID, generateNGUID(r.Name), r.IP, strconv.Itoa(int(r.PortStart)), r.transport().ToSPDKTransportType()); err != nil {
+		nqn := helpertypes.GetNQN(r.Name)
+		if err := spdkClient.StartExposeBdevWithTransport(nqn, r.Head.UUID, generateNGUID(r.Name), r.IP, strconv.Itoa(int(r.PortStart)), r.transport().ToSPDKTransportType()); err != nil {
 			return errors.Wrapf(err, "failed to start expose replica %v after expansion", r.Name)
+		}
+		if err := r.addTCPFallbackListener(spdkClient, nqn); err != nil {
+			return errors.Wrapf(err, "failed to add TCP fallback listener after expansion for replica %v", r.Name)
 		}
 		r.IsExposed = true
 	}
@@ -1748,7 +1768,11 @@ func (r *Replica) SnapshotRevert(spdkClient *spdkclient.Client, snapshotName str
 		}
 		r.IsExposed = false
 
-		if err := spdkClient.StartExposeBdevWithTransport(helpertypes.GetNQN(r.Name), headLvolUUID, generateNGUID(r.Name), r.IP, strconv.Itoa(int(r.PortStart)), r.transport().ToSPDKTransportType()); err != nil {
+		nqn := helpertypes.GetNQN(r.Name)
+		if err := spdkClient.StartExposeBdevWithTransport(nqn, headLvolUUID, generateNGUID(r.Name), r.IP, strconv.Itoa(int(r.PortStart)), r.transport().ToSPDKTransportType()); err != nil {
+			return nil, err
+		}
+		if err := r.addTCPFallbackListener(spdkClient, nqn); err != nil {
 			return nil, err
 		}
 		r.IsExposed = true
@@ -3145,7 +3169,11 @@ func (r *Replica) RebuildingDstStart(spdkClient *spdkclient.Client, srcReplicaNa
 	r.Head = BdevLvolInfoToServiceLvol(&headBdevLvol)
 	r.ActiveChain = append(r.ActiveChain, r.Head)
 
-	if err := spdkClient.StartExposeBdevWithTransport(helpertypes.GetNQN(r.Name), r.Head.UUID, generateNGUID(r.Name), r.IP, strconv.Itoa(int(r.PortStart)), r.transport().ToSPDKTransportType()); err != nil {
+	nqn := helpertypes.GetNQN(r.Name)
+	if err := spdkClient.StartExposeBdevWithTransport(nqn, r.Head.UUID, generateNGUID(r.Name), r.IP, strconv.Itoa(int(r.PortStart)), r.transport().ToSPDKTransportType()); err != nil {
+		return "", err
+	}
+	if err := r.addTCPFallbackListener(spdkClient, nqn); err != nil {
 		return "", err
 	}
 	r.IsExposed = true
