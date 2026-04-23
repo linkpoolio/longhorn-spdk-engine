@@ -38,6 +38,13 @@ type BdevRaidCreateRequest struct {
 	StripSizeKb uint32        `json:"strip_size_kb"`
 	BaseBdevs   []string      `json:"base_bdevs"`
 	UUID        string        `json:"uuid,omitempty"`
+	// DeltaBitmap enables per-base-bdev dirty-region tracking on raid1 so a
+	// disconnected base bdev can be rebuilt incrementally (only dirty
+	// regions) instead of a full resync after reconnect. Ignored for other
+	// RAID levels. Requires each base bdev to have a non-zero
+	// optimal_io_boundary — the region size is derived from
+	// min(optimal_io_boundary) × blocklen.
+	DeltaBitmap bool `json:"delta_bitmap,omitempty"`
 }
 
 type BdevRaidDeleteRequest struct {
@@ -64,4 +71,21 @@ type BdevRaidRemoveBaseBdevRequest struct {
 type BdevRaidGrowBaseBdevRequest struct {
 	RaidName string `json:"raid_name"`
 	BaseName string `json:"base_name"`
+}
+
+// BdevRaidBaseBdevDeltaBitmapRequest is the common request for the three
+// delta-bitmap RPCs (stop, get, clear). All three key off a base bdev name
+// rather than a raid name because a faulty base bdev owns its own bitmap and
+// faulty state.
+type BdevRaidBaseBdevDeltaBitmapRequest struct {
+	BaseBdevName string `json:"base_bdev_name"`
+}
+
+// BdevRaidBaseBdevDeltaBitmapResponse holds the bitmap payload returned by
+// bdev_raid_get_base_bdev_delta_bitmap. DeltaBitmap is a base64-encoded
+// spdk_bit_array; RegionSize is in bytes and equals
+// raid.optimal_io_boundary × raid.blocklen.
+type BdevRaidBaseBdevDeltaBitmapResponse struct {
+	DeltaBitmap string `json:"delta_bitmap"`
+	RegionSize  uint64 `json:"region_size"`
 }
