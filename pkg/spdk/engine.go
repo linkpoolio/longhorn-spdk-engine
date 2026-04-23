@@ -136,6 +136,12 @@ type Engine struct {
 
 	NvmeTcpTarget *NvmeTcpTarget
 
+	// metadataDir, when non-empty, enables on-disk persistence of engine state
+	// to <metadataDir>/engines/<name>/engine.json. Mirrors the pattern in
+	// replica.go and enginefrontend.go; the server wires this at engine
+	// construction time. Recovery uses loadEngineRecords + restoreFromRecord.
+	metadataDir string
+
 	State    types.InstanceState
 	ErrorMsg string
 
@@ -328,6 +334,10 @@ func (e *Engine) Create(spdkClient *spdkclient.Client, replicaAddressMap map[str
 	}
 
 	e.State = types.InstanceStateRunning
+
+	if saveErr := saveEngineRecord(e.metadataDir, e); saveErr != nil {
+		e.log.WithError(saveErr).Warnf("Failed to persist engine record for %s after create", e.Name)
+	}
 
 	e.log.Info("Created engine target")
 
@@ -765,6 +775,10 @@ func (e *Engine) Delete(spdkClient *spdkclient.Client, superiorPortAllocator *co
 	requireUpdate, err = e.disconnectReplicas(spdkClient)
 	if err != nil {
 		return err
+	}
+
+	if rmErr := removeEngineRecord(e.metadataDir, e.Name); rmErr != nil {
+		e.log.WithError(rmErr).Warnf("Failed to remove persisted engine record for %s", e.Name)
 	}
 
 	e.log.Info("Deleted engine")
@@ -1497,6 +1511,10 @@ func (e *Engine) replicaAddFinish(srcReplicaServiceCli, dstReplicaServiceCli *cl
 
 	e.checkAndUpdateInfoFromReplicasNoLock()
 
+	if saveErr := saveEngineRecord(e.metadataDir, e); saveErr != nil {
+		e.log.WithError(saveErr).Warnf("Failed to persist engine record for %s after replica-add finish", e.Name)
+	}
+
 	if dstReplicaErr != nil {
 		e.log.Errorf("Engine failed to finish rebuilding replica %s from healthy replica %s (dstErr=%v)", dstReplicaName, srcReplicaName, dstReplicaErr)
 	} else if dstReplicaStatus != nil && dstReplicaStatus.Mode == types.ModeERR {
@@ -1619,6 +1637,10 @@ func (e *Engine) ReplicaDelete(spdkClient *spdkclient.Client, replicaName, repli
 	e.log.UpdateLoggerWithWarnOnFailure(logrus.Fields{
 		"replicaStatusMap": e.ReplicaStatusMap,
 	}, "Failed to update logger with replica status map during engine creation")
+
+	if saveErr := saveEngineRecord(e.metadataDir, e); saveErr != nil {
+		e.log.WithError(saveErr).Warnf("Failed to persist engine record for %s after replica delete", e.Name)
+	}
 
 	return nil
 }
@@ -2397,7 +2419,7 @@ func (e *Engine) BackupRestoreFinish(spdkClient *spdkclient.Client) error {
 		e.log.Infof("Attaching replica %s with address %s (transport=%s) before finishing restoration", replicaName, replicaAddress, transport)
 		nvmeBdevNameList, err := spdkClient.BdevNvmeAttachController(replicaName, helpertypes.GetNQN(replicaName), replicaIP, replicaPort,
 			transport.ToSPDKTransportType(), spdktypes.NvmeAddressFamilyIPv4,
-			int32(e.ctrlrLossTimeout), replicaReconnectDelaySec, int32(e.fastIOFailTimeoutSec), replicaMultipath)
+			int32(e.ctrlrLossTimeout), int32(replicaReconnectDelaySec), int32(e.fastIOFailTimeoutSec), replicaMultipath)
 		if err != nil {
 			return err
 		}

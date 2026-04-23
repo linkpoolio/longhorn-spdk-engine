@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -48,26 +49,28 @@ const (
 )
 
 const (
-	// Timeouts for RAID base bdev (replica)
-	// The ctrlr_loss_timeout_sec setting applies to the base bdev's NVMe controller
-	// and defines the timeout duration (30 seconds) for SPDK to attempt reconnecting to the controller
-	// after losing connection.
-	//
-	// When an instance manager containing a replica is deleted, SPDK starts to reconnect to the base bdev's controller.
-	// If the connection cannot be reestablished within the ctrlr_loss_timeout_sec period, the base bdev is removed from the RAID bdev.
-	//
-	// Because the ctrl-loss-tmo for the NVMe/TCP initiator connecting to the RAID target is also set to 30 seconds,
-	// replicaCtrlrLossTimeoutSec and replicaFastIOFailTimeoutSec are set to 15 seconds and 10 seconds, respectively.
-	//
-	// If an I/O operation to a replica (base bdev) is unresponsive within 10 seconds, an I/O error is returned,
-	// and the base bdev is deleted after 5 seconds.
+	replicaMultipath = "disable"
+)
+
+// Replica NVMe-oF timeouts. Defaults match upstream's const values but can be
+// overridden per-IM via env vars set by longhorn-manager's instance_manager_controller
+// from the data-engine Setting CRs. Kept as vars so all existing bare-identifier
+// call sites continue to compile.
+var (
 	replicaCtrlrLossTimeoutSec  = 15
 	replicaReconnectDelaySec    = 2
 	replicaFastIOFailTimeoutSec = 10
 	replicaTransportAckTimeout  = 10
 	replicaKeepAliveTimeoutMs   = 10000
-	replicaMultipath            = "disable"
 )
+
+func init() {
+	replicaCtrlrLossTimeoutSec = envIntOrDefault("LONGHORN_V2_REPLICA_CTRLR_LOSS_TIMEOUT_SEC", replicaCtrlrLossTimeoutSec)
+	replicaReconnectDelaySec = envIntOrDefault("LONGHORN_V2_REPLICA_RECONNECT_DELAY_SEC", replicaReconnectDelaySec)
+	replicaFastIOFailTimeoutSec = envIntOrDefault("LONGHORN_V2_REPLICA_FAST_IO_FAIL_TIMEOUT_SEC", replicaFastIOFailTimeoutSec)
+	replicaTransportAckTimeout = envIntOrDefault("LONGHORN_V2_REPLICA_TRANSPORT_ACK_TIMEOUT", replicaTransportAckTimeout)
+	replicaKeepAliveTimeoutMs = envIntOrDefault("LONGHORN_V2_REPLICA_KEEP_ALIVE_TIMEOUT_MS", replicaKeepAliveTimeoutMs)
+}
 
 var (
 	// ErrEngineFrontendCreateInvalidArgument indicates the create request carries
@@ -407,4 +410,16 @@ func getEngineDualCntlidRange(engineName string) (uint16, uint16) {
 	ordinal := uint16(getEngineCntlid(engineName) - 1)
 	lo := dualListenerCntlidBase + ordinal*dualListenerCntlidSlotsPerEngine + 1
 	return lo, lo + dualListenerCntlidSlotsPerEngine - 1
+}
+
+func envIntOrDefault(name string, def int) int {
+	raw, ok := os.LookupEnv(name)
+	if !ok || raw == "" {
+		return def
+	}
+	v, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		return def
+	}
+	return v
 }

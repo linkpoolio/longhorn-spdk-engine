@@ -73,17 +73,22 @@ func NewServer(ctx context.Context, portStart, portEnd int32) (*Server, error) {
 		return nil, err
 	}
 
-	bitmap, err := commonbitmap.NewBitmap(portStart, portEnd)
+	replicaRecords, err := loadReplicaRecords(types.MetadataDir)
+	if err != nil {
+		logrus.WithError(err).Warn("Failed to load persisted replica records; port ranges will be reallocated")
+	}
+
+	bitmap, err := newPortAllocatorWithReservations(portStart, portEnd, replicaRecords)
 	if err != nil {
 		return nil, err
 	}
 
 	if _, err = cli.BdevNvmeSetOptions(
-		replicaCtrlrLossTimeoutSec,
-		replicaReconnectDelaySec,
-		replicaFastIOFailTimeoutSec,
-		replicaTransportAckTimeout,
-		replicaKeepAliveTimeoutMs); err != nil {
+		int32(replicaCtrlrLossTimeoutSec),
+		int32(replicaReconnectDelaySec),
+		int32(replicaFastIOFailTimeoutSec),
+		int32(replicaTransportAckTimeout),
+		int32(replicaKeepAliveTimeoutMs)); err != nil {
 		return nil, errors.Wrap(err, "failed to set NVMe options")
 	}
 
@@ -143,6 +148,7 @@ func NewServer(ctx context.Context, portStart, portEnd int32) (*Server, error) {
 	// RecoverFromHost do not block on the unbuffered channel.
 	go s.broadcasting()
 
+	s.recoverEngines()
 	s.recoverEngineFrontends()
 
 	// TODO: There is no need to maintain the replica map in cache when we can use one SPDK JSON API call to fetch the Lvol tree/chain info
@@ -417,8 +423,17 @@ func (s *Server) rebuildCachedLvolObjects(state *verifyState) error {
 			lvsUUID := bdevLvol.DriverSpecific.Lvol.LvolStoreUUID
 			specSize := bdevLvol.NumBlocks * uint64(bdevLvol.BlockSize)
 			actualSize := bdevLvol.DriverSpecific.Lvol.NumAllocatedClusters * uint64(defaultClusterSize)
-			state.replicaMap[lvolName] = NewReplica(s.ctx, lvolName, lvsUUIDNameMap[lvsUUID], lvsUUID, specSize, true, s.nodeTransport, s.updateChs[types.InstanceTypeReplica])
-			state.replicaMapForSync[lvolName] = state.replicaMap[lvolName]
+			r := NewReplica(s.ctx, lvolName, lvsUUIDNameMap[lvsUUID], lvsUUID, specSize, true, s.nodeTransport, s.updateChs[types.InstanceTypeReplica])
+			r.metadataDir = s.metadataDir
+			if records, _ := loadReplicaRecords(s.metadataDir); records != nil {
+				if rec, ok := records[lvolName]; ok {
+					if err := r.restoreFromRecord(rec); err != nil {
+						logrus.WithError(err).Warnf("Failed to restore persisted state for replica %s; will use fresh port allocation", lvolName)
+					}
+				}
+			}
+			state.replicaMap[lvolName] = r
+			state.replicaMapForSync[lvolName] = r
 			logrus.Infof("Detected one possible existing replica %s(%s) with disk %s(%s), spec size %d, actual size %d", bdevLvol.Aliases[0], bdevLvol.UUID, lvsUUIDNameMap[lvsUUID], lvsUUID, specSize, actualSize)
 		}
 	}
@@ -592,7 +607,9 @@ func (s *Server) newReplica(req *spdkrpc.ReplicaCreateRequest) (*Replica, error)
 	if !exists {
 		return nil, fmt.Errorf("lvstore %v(%v) does not exist for replica %v creation", req.LvsName, req.LvsUuid, req.Name)
 	}
-	return NewReplica(s.ctx, req.Name, req.LvsName, req.LvsUuid, req.SpecSize, true, s.nodeTransport, s.updateChs[types.InstanceTypeReplica]), nil
+	r = NewReplica(s.ctx, req.Name, req.LvsName, req.LvsUuid, req.SpecSize, true, s.nodeTransport, s.updateChs[types.InstanceTypeReplica])
+	r.metadataDir = s.metadataDir
+	return r, nil
 }
 
 func (s *Server) getBackingImage(backingImageName, lvsUUID string) (backingImage *BackingImage, err error) {
@@ -887,6 +904,52 @@ func (s *Server) GetReplicaStruct(name string) *Replica {
 	s.RLock()
 	defer s.RUnlock()
 	return s.replicaMap[name]
+}
+
+// recoverEngines loads persisted engine records from disk and rehydrates
+// s.engineMap before the first monitoring tick runs. After an IM restart
+// the SPDK RAID bdev, base bdev_nvme controllers, and NVMe-oF target all
+// survive (they are re-established when SPDK replays blobstore + reconnects),
+// but the in-memory Engine struct is gone. Without this rehydration step,
+// the manager's first EngineGet returns NotFound and the manager falls back
+// to EngineCreate, which re-runs replica-attach against already-attached
+// bdev_nvme controllers and can fail mid-recovery.
+//
+// Engines reloaded here are placeholder state. The next verify() tick calls
+// ValidateAndUpdate which reconciles the record against live SPDK bdev state
+// and marks the engine Running or Error based on what actually exists.
+func (s *Server) recoverEngines() {
+	if s.metadataDir == "" {
+		return
+	}
+
+	records, err := loadEngineRecords(s.metadataDir)
+	if err != nil {
+		logrus.WithError(err).Error("Failed to load engine records for recovery")
+		return
+	}
+	if len(records) == 0 {
+		return
+	}
+
+	logrus.Infof("Recovering %d engine(s) from persisted records", len(records))
+
+	s.Lock()
+	defer s.Unlock()
+	for name, rec := range records {
+		if _, exists := s.engineMap[name]; exists {
+			continue
+		}
+		transport := rec.ReplicaTransport
+		if transport == "" {
+			transport = s.nodeTransport
+		}
+		e := NewEngine(rec.Name, rec.VolumeName, rec.Frontend, rec.SpecSize, transport, s.updateChs[types.InstanceTypeEngine])
+		e.metadataDir = s.metadataDir
+		e.restoreFromRecord(rec)
+		e.State = types.InstanceStateRunning
+		s.engineMap[name] = e
+	}
 }
 
 // recoverEngineFrontends loads persisted engine frontend records from disk
