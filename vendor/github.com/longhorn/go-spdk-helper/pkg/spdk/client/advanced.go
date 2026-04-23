@@ -17,7 +17,7 @@ func (c *Client) AddDevice(devicePath, name string, clusterSize uint32) (bdevAio
 		name = filepath.Base(devicePath)
 	}
 
-	if _, err := c.BdevAioCreate(devicePath, name, 4096); err != nil {
+	if _, err := c.BdevAioCreate(devicePath, name, 4096, false); err != nil {
 		return "", "", "", err
 	}
 

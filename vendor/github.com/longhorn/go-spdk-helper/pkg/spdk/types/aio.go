@@ -16,6 +16,7 @@ type BdevAioCreateRequest struct {
 	Name      string `json:"name"`
 	Filename  string `json:"filename"`
 	BlockSize uint64 `json:"block_size,omitzero"`
+	NoWait    bool   `json:"nowait,omitempty"`
 }
 
 type BdevAioDeleteRequest struct {
