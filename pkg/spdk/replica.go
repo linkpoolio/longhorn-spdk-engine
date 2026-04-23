@@ -330,12 +330,6 @@ func (r *Replica) prepareIPAndPorts(portCount int32, superiorPortAllocator *comm
 	}
 	r.IP = podIP
 
-	// Reuse any ports still reserved for this replica from a prior Create whose
-	// Delete ran with cleanupRequired=false. The engine side pins bdev_nvme to
-	// the replica's PortStart; if we reallocated a new range on every restart
-	// cycle, the engine's controller would go stale and retry-storm the
-	// reactor until SPDK dies. Keeping the port stable across stop/start
-	// preserves in-flight engine attachments.
 	if r.PortStart != 0 && r.PortEnd != 0 && r.portAllocator != nil {
 		r.log.Infof("Reusing reserved IP %s and Ports [%d, %d] for replica (primary=%d, tcp-fallback=%d)", r.IP, r.PortStart, r.PortEnd, r.PortStart, r.PortStart+1)
 		return nil
@@ -1330,12 +1324,6 @@ func (r *Replica) Delete(spdkClient *spdkclient.Client, cleanupRequired bool, su
 		r.isSnapshotCloning = false
 	}
 
-	// Only release the port range on full cleanup. For a stop-for-restart
-	// (cleanupRequired=false) the Replica struct stays in replicaMap and the
-	// next Create reuses PortStart/PortEnd. Releasing + reallocating on each
-	// cycle makes ports climb monotonically; engines that still hold a
-	// bdev_nvme controller to the old port then retry-storm the reactor on
-	// reconnect and SPDK dies.
 	if !cleanupRequired {
 		return nil
 	}
@@ -2122,6 +2110,9 @@ func (r *Replica) SnapshotCloneDstStart(spdkClient *spdkclient.Client, snapshotN
 		strconv.Itoa(int(r.snapshotCloningDstCache.cloningPort)), r.transport().ToSPDKTransportType()); err != nil {
 		return err
 	}
+	if err := r.addTCPFallbackListener(spdkClient, helpertypes.GetNQN(r.snapshotCloningDstCache.cloningLvol.Name)); err != nil {
+		return err
+	}
 	dstCloningLvolAddress := net.JoinHostPort(r.IP, strconv.Itoa(int(r.snapshotCloningDstCache.cloningPort)))
 
 	// Ask src replica to start cloning
@@ -2622,6 +2613,9 @@ func (r *Replica) RebuildingSrcStart(spdkClient *spdkclient.Client, dstReplicaNa
 		return "", err
 	}
 	if err := spdkClient.StartExposeBdevWithTransport(helpertypes.GetNQN(snapLvol.Name), snapLvol.UUID, generateNGUID(snapLvol.Name), r.IP, strconv.Itoa(int(port)), r.transport().ToSPDKTransportType()); err != nil {
+		return "", err
+	}
+	if err := r.addTCPFallbackListener(spdkClient, helpertypes.GetNQN(snapLvol.Name)); err != nil {
 		return "", err
 	}
 	exposedSnapshotLvolAddress = net.JoinHostPort(r.IP, strconv.Itoa(int(port)))
@@ -3639,6 +3633,9 @@ func (r *Replica) rebuildingDstShallowCopyPrepare(spdkClient *spdkclient.Client,
 	if r.rebuildingDstCache.rebuildingPort != 0 {
 		if err := spdkClient.StartExposeBdevWithTransport(helpertypes.GetNQN(r.rebuildingDstCache.rebuildingLvol.Name), r.rebuildingDstCache.rebuildingLvol.UUID,
 			generateNGUID(r.rebuildingDstCache.rebuildingLvol.Name), r.IP, strconv.Itoa(int(r.rebuildingDstCache.rebuildingPort)), r.transport().ToSPDKTransportType()); err != nil {
+			return "", false, err
+		}
+		if err := r.addTCPFallbackListener(spdkClient, helpertypes.GetNQN(r.rebuildingDstCache.rebuildingLvol.Name)); err != nil {
 			return "", false, err
 		}
 		dstRebuildingLvolAddress = net.JoinHostPort(r.IP, strconv.Itoa(int(r.rebuildingDstCache.rebuildingPort)))
