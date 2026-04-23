@@ -14,15 +14,20 @@ import (
 )
 
 // EngineCreate creates and starts an engine instance with the requested replicas.
-func (c *SPDKClient) EngineCreate(name, volumeName, frontend string, specSize uint64, replicaAddressMap map[string]string, portCount int32, salvageRequested bool) (*api.Engine, error) {
+// replicaTransportAddressMap is optional and carries transport-qualified
+// addresses so the engine can pick whichever transport matches its own node
+// transport (RDMA when supported, TCP otherwise) for each replica. When nil or
+// empty, the engine falls back to replicaAddressMap with its own
+// replicaTransport for every replica.
+func (c *SPDKClient) EngineCreate(name, volumeName, frontend string, specSize uint64, replicaAddressMap map[string]string, replicaTransportAddressMap map[string]*spdkrpc.ReplicaTransportAddresses, portCount int32, salvageRequested bool) (*api.Engine, error) {
 	if name == "" {
 		return nil, fmt.Errorf("failed to start engine: missing required parameter name")
 	}
 	if volumeName == "" {
 		return nil, fmt.Errorf("failed to start engine: missing required parameter volumeName")
 	}
-	if len(replicaAddressMap) == 0 {
-		return nil, fmt.Errorf("failed to start engine: missing required parameter replicaAddressMap")
+	if len(replicaAddressMap) == 0 && len(replicaTransportAddressMap) == 0 {
+		return nil, fmt.Errorf("failed to start engine: missing required parameter replicaAddressMap or replicaTransportAddressMap")
 	}
 
 	client := c.getSPDKServiceClient()
@@ -30,13 +35,14 @@ func (c *SPDKClient) EngineCreate(name, volumeName, frontend string, specSize ui
 	defer cancel()
 
 	resp, err := client.EngineCreate(ctx, &spdkrpc.EngineCreateRequest{
-		Name:              name,
-		VolumeName:        volumeName,
-		Frontend:          frontend,
-		SpecSize:          specSize,
-		ReplicaAddressMap: replicaAddressMap,
-		PortCount:         portCount,
-		SalvageRequested:  salvageRequested,
+		Name:                       name,
+		VolumeName:                 volumeName,
+		Frontend:                   frontend,
+		SpecSize:                   specSize,
+		ReplicaAddressMap:          replicaAddressMap,
+		ReplicaTransportAddressMap: replicaTransportAddressMap,
+		PortCount:                  portCount,
+		SalvageRequested:           salvageRequested,
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to start engine")
