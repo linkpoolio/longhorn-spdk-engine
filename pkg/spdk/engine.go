@@ -225,6 +225,24 @@ type EngineReplicaStatus struct {
 	Address  string
 	BdevName string
 	Mode     types.Mode
+	// Transport records the NVMe-oF transport the engine picked for this
+	// replica at Create time, so that reconnect paths (snapshot revert,
+	// expand, salvage) can dial the right transport instead of defaulting
+	// to the engine's own replicaTransport — important when a transport
+	// mismatch between engine node and storage node forced the engine to
+	// pick the replica's TCP fallback address. Empty in records persisted
+	// before this field was added; callers fall back to e.replicaTransport().
+	Transport NvmfTransportType
+}
+
+// transportOrDefault returns the per-replica Transport if set, otherwise the
+// supplied default (typically the engine's replicaTransport). Used by reconnect
+// paths so older persisted records without the Transport field still work.
+func (s *EngineReplicaStatus) transportOrDefault(def NvmfTransportType) NvmfTransportType {
+	if s == nil || s.Transport == "" {
+		return def
+	}
+	return s.Transport
 }
 
 func NewEngine(engineName, volumeName, frontend string, specSize uint64, replicaTransport NvmfTransportType, engineUpdateCh chan interface{}) *Engine {
@@ -269,13 +287,14 @@ func NewEngine(engineName, volumeName, frontend string, specSize uint64, replica
 	return e
 }
 
-func (e *Engine) Create(spdkClient *spdkclient.Client, replicaAddressMap map[string]string, portCount int32, superiorPortAllocator *commonbitmap.Bitmap,
+func (e *Engine) Create(spdkClient *spdkclient.Client, replicaAddressMap map[string]string, replicaTransportAddressMap map[string]*spdkrpc.ReplicaTransportAddresses, portCount int32, superiorPortAllocator *commonbitmap.Bitmap,
 	salvageRequested bool) (ret *spdkrpc.Engine, err error) {
 	e.log.WithFields(logrus.Fields{
-		"portCount":         portCount,
-		"replicaAddressMap": replicaAddressMap,
-		"salvageRequested":  salvageRequested,
-		"frontend":          e.Frontend,
+		"portCount":                  portCount,
+		"replicaAddressMap":          replicaAddressMap,
+		"replicaTransportAddressMap": replicaTransportAddressMap,
+		"salvageRequested":           salvageRequested,
+		"frontend":                   e.Frontend,
 	}).Info("Creating engine")
 
 	requireUpdate := true
@@ -326,7 +345,7 @@ func (e *Engine) Create(spdkClient *spdkclient.Client, replicaAddressMap map[str
 		}
 	}
 
-	replicaBdevList := e.connectReplicas(spdkClient, replicaAddressMap)
+	replicaBdevList := e.connectReplicas(spdkClient, replicaAddressMap, replicaTransportAddressMap)
 
 	e.log.UpdateLoggerWithWarnOnFailure(logrus.Fields{
 		"replicaStatusMap": e.ReplicaStatusMap,
@@ -476,16 +495,26 @@ func (e *Engine) addTCPFallbackListener(spdkClient *spdkclient.Client, superiorP
 
 // connectReplicas connects to each replica's NVMf bdev and populates
 // ReplicaStatusMap. It returns the list of successfully connected bdev names.
-func (e *Engine) connectReplicas(spdkClient *spdkclient.Client, replicaAddressMap map[string]string) []string {
+//
+// When the transport-aware map (replicaTransportAddressMap) contains an entry
+// for a replica, the engine picks the transport that matches its own node
+// transport and dials the address paired with that transport; this skips the
+// 30s connection-refused retry when the engine's transport differs from the
+// replica's primary listener. If the transport-aware map is empty (legacy
+// caller) or the entry lacks a matching address, falls back to the single
+// address in replicaAddressMap dialed with e.replicaTransport().
+func (e *Engine) connectReplicas(spdkClient *spdkclient.Client, replicaAddressMap map[string]string, replicaTransportAddressMap map[string]*spdkrpc.ReplicaTransportAddresses) []string {
 	replicaBdevList := []string{}
 	for replicaName, replicaAddr := range replicaAddressMap {
+		addr, transport := e.pickReplicaAddress(replicaName, replicaAddr, replicaTransportAddressMap)
 		e.ReplicaStatusMap[replicaName] = &EngineReplicaStatus{
-			Address: replicaAddr,
+			Address:   addr,
+			Transport: transport,
 		}
 
-		bdevName, err := connectNVMfBdevWithTransport(spdkClient, replicaName, replicaAddr, e.replicaTransport(), e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
+		bdevName, err := connectNVMfBdevWithTransport(spdkClient, replicaName, addr, transport, e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
 		if err != nil {
-			e.log.WithError(err).Warnf("Failed to get bdev from replica %s with address %s during engine creation, will mark the mode to ERR and continue", replicaName, replicaAddr)
+			e.log.WithError(err).Warnf("Failed to get bdev from replica %s with address %s (transport=%s) during engine creation, will mark the mode to ERR and continue", replicaName, addr, transport)
 			e.ReplicaStatusMap[replicaName].Mode = types.ModeERR
 		} else {
 			// TODO: Check if a replica is really a RW replica rather than a rebuilding failed replica
@@ -495,6 +524,24 @@ func (e *Engine) connectReplicas(spdkClient *spdkclient.Client, replicaAddressMa
 		}
 	}
 	return replicaBdevList
+}
+
+// pickReplicaAddress returns (address, transport) to dial for a single replica.
+// When the transport-aware map contains a matching entry, prefers the address
+// for the engine's own node transport (RDMA when supported, TCP otherwise).
+// Falls back to the legacy single address dialed with the engine's transport.
+func (e *Engine) pickReplicaAddress(replicaName, legacyAddress string, replicaTransportAddressMap map[string]*spdkrpc.ReplicaTransportAddresses) (string, NvmfTransportType) {
+	tAddrs, ok := replicaTransportAddressMap[replicaName]
+	if !ok || tAddrs == nil {
+		return legacyAddress, e.replicaTransport()
+	}
+	if e.replicaTransport().IsRDMA() && tAddrs.RdmaAddress != "" {
+		return tAddrs.RdmaAddress, NvmfTransportRDMA
+	}
+	if tAddrs.TcpAddress != "" {
+		return tAddrs.TcpAddress, NvmfTransportTCP
+	}
+	return legacyAddress, e.replicaTransport()
 }
 
 func (e *Engine) SetTargetListenerANAState(spdkClient *spdkclient.Client, anaState NvmeTCPANAState) error {
@@ -1939,7 +1986,7 @@ func (e *Engine) replicaSnapshotOperation(spdkClient *spdkclient.Client, replica
 		if err := replicaClient.ReplicaSnapshotRevert(replicaName, snapshotName); err != nil {
 			return err
 		}
-		bdevName, err := connectNVMfBdevWithTransport(spdkClient, replicaName, replicaStatus.Address, e.replicaTransport(), e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
+		bdevName, err := connectNVMfBdevWithTransport(spdkClient, replicaName, replicaStatus.Address, replicaStatus.transportOrDefault(e.replicaTransport()), e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
 		if err != nil {
 			return err
 		}
@@ -2777,7 +2824,7 @@ func (e *Engine) expandSingleReplica(spdkClient *spdkclient.Client, replicaName 
 		return err
 	}
 
-	_, err = connectNVMfBdevWithTransport(spdkClient, replicaName, replicaStatus.Address, e.replicaTransport(), e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
+	_, err = connectNVMfBdevWithTransport(spdkClient, replicaName, replicaStatus.Address, replicaStatus.transportOrDefault(e.replicaTransport()), e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
 	return err
 }
 
