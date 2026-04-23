@@ -148,6 +148,7 @@ func NewServer(ctx context.Context, portStart, portEnd int32) (*Server, error) {
 	// RecoverFromHost do not block on the unbuffered channel.
 	go s.broadcasting()
 
+	s.recoverEngines()
 	s.recoverEngineFrontends()
 
 	// TODO: There is no need to maintain the replica map in cache when we can use one SPDK JSON API call to fetch the Lvol tree/chain info
@@ -903,6 +904,52 @@ func (s *Server) GetReplicaStruct(name string) *Replica {
 	s.RLock()
 	defer s.RUnlock()
 	return s.replicaMap[name]
+}
+
+// recoverEngines loads persisted engine records from disk and rehydrates
+// s.engineMap before the first monitoring tick runs. After an IM restart
+// the SPDK RAID bdev, base bdev_nvme controllers, and NVMe-oF target all
+// survive (they are re-established when SPDK replays blobstore + reconnects),
+// but the in-memory Engine struct is gone. Without this rehydration step,
+// the manager's first EngineGet returns NotFound and the manager falls back
+// to EngineCreate, which re-runs replica-attach against already-attached
+// bdev_nvme controllers and can fail mid-recovery.
+//
+// Engines reloaded here are placeholder state. The next verify() tick calls
+// ValidateAndUpdate which reconciles the record against live SPDK bdev state
+// and marks the engine Running or Error based on what actually exists.
+func (s *Server) recoverEngines() {
+	if s.metadataDir == "" {
+		return
+	}
+
+	records, err := loadEngineRecords(s.metadataDir)
+	if err != nil {
+		logrus.WithError(err).Error("Failed to load engine records for recovery")
+		return
+	}
+	if len(records) == 0 {
+		return
+	}
+
+	logrus.Infof("Recovering %d engine(s) from persisted records", len(records))
+
+	s.Lock()
+	defer s.Unlock()
+	for name, rec := range records {
+		if _, exists := s.engineMap[name]; exists {
+			continue
+		}
+		transport := rec.ReplicaTransport
+		if transport == "" {
+			transport = s.nodeTransport
+		}
+		e := NewEngine(rec.Name, rec.VolumeName, rec.Frontend, rec.SpecSize, transport, s.updateChs[types.InstanceTypeEngine])
+		e.metadataDir = s.metadataDir
+		e.restoreFromRecord(rec)
+		e.State = types.InstanceStateRunning
+		s.engineMap[name] = e
+	}
 }
 
 // recoverEngineFrontends loads persisted engine frontend records from disk
