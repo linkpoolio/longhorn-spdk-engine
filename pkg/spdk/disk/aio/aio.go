@@ -31,7 +31,11 @@ func (d *DiskDriverAio) DiskCreate(spdkClient *spdkclient.Client, diskName, disk
 		return "", errors.Wrap(err, "failed to validate disk creation")
 	}
 
-	return spdkClient.BdevAioCreate(diskPath, diskName, blockSize, true)
+	// NB: longhorn-spdk (0fdfe357b, "bdev_aio: disable RWF_NOWAIT") undefs
+	// RWF_NOWAIT at the top of bdev_aio.c to avoid an EAGAIN infinite loop
+	// on Linux loop devices. Passing nowait=true makes bdev_aio_open fail
+	// outright. Stay at false until the SPDK fork re-enables the flag.
+	return spdkClient.BdevAioCreate(diskPath, diskName, blockSize, false)
 }
 
 func (d *DiskDriverAio) DiskDelete(spdkClient *spdkclient.Client, diskName, diskPath string) (deleted bool, err error) {
