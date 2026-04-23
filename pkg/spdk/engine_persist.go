@@ -62,9 +62,11 @@ func saveEngineRecord(metadataDir string, e *Engine) error {
 			continue
 		}
 		replicaStatusCopy[name] = &EngineReplicaStatus{
-			Address:  status.Address,
-			BdevName: status.BdevName,
-			Mode:     status.Mode,
+			Address:       status.Address,
+			DialedAddress: status.DialedAddress,
+			BdevName:      status.BdevName,
+			Mode:          status.Mode,
+			Transport:     status.Transport,
 		}
 	}
 
