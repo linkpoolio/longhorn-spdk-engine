@@ -152,6 +152,13 @@ type Engine struct {
 	// if the base bdev layer doesn't report optimal_io_boundary.
 	deltaBitmapEnabled bool
 
+	// ReplicaDirtyBitmaps maps replica name → last-captured dirty bitmap
+	// from the moment the replica transitioned to ERR. Used on reconnect
+	// to drive incremental (shallow-copy-only-the-dirty-regions) rebuild
+	// instead of full resync. Entries are cleared once the replica
+	// returns to RW. Survives IM restart via EngineRecord.
+	ReplicaDirtyBitmaps map[string]*ReplicaDirtyBitmap
+
 	State    types.InstanceState
 	ErrorMsg string
 
@@ -2962,11 +2969,14 @@ func (e *Engine) ValidateAndUpdate(spdkClient *spdkclient.Client) (err error) {
 		return err
 	}
 
+	previousModes := e.snapshotReplicaModesNoLock()
 	containValidReplica := e.validateReplicaStatusMapNoLock(bdevMap, &updateRequired)
 
 	e.log.UpdateLoggerWithWarnOnFailure(logrus.Fields{
 		"replicaStatusMap": e.ReplicaStatusMap,
 	}, "Failed to update logger with replica status map during engine creation")
+
+	e.captureBitmapsForFaultedReplicasNoLock(spdkClient, previousModes)
 
 	if !containValidReplica {
 		e.State = types.InstanceStateError
@@ -2978,6 +2988,20 @@ func (e *Engine) ValidateAndUpdate(spdkClient *spdkclient.Client) (err error) {
 	e.checkAndUpdateInfoFromReplicasNoLock()
 
 	return nil
+}
+
+// snapshotReplicaModesNoLock returns the current mode per replica so that a
+// follow-up validate pass can tell which replicas just transitioned to ERR
+// and are candidates for bitmap capture.
+func (e *Engine) snapshotReplicaModesNoLock() map[string]types.Mode {
+	prev := make(map[string]types.Mode, len(e.ReplicaStatusMap))
+	for name, status := range e.ReplicaStatusMap {
+		if status == nil {
+			continue
+		}
+		prev[name] = status.Mode
+	}
+	return prev
 }
 
 func (e *Engine) shouldSkipValidateAndUpdateNoLock() bool {
