@@ -535,6 +535,26 @@ func (e *Engine) pickReplicaAddress(replicaName, legacyAddress string, replicaTr
 	if !ok || tAddrs == nil {
 		return legacyAddress, e.replicaTransport()
 	}
+	return e.pickFromTransportAddresses(legacyAddress, tAddrs)
+}
+
+// pickRebuildDstAddress returns (address, transport) for the rebuild-dst head
+// attach in replicaAddStart. Same selection rule as pickReplicaAddress but
+// takes the transport pair directly since rebuild uses a single replica, not
+// a map.
+func (e *Engine) pickRebuildDstAddress(legacyAddress string, tAddrs *spdkrpc.ReplicaTransportAddresses) (string, NvmfTransportType) {
+	return e.pickFromTransportAddresses(legacyAddress, tAddrs)
+}
+
+// pickFromTransportAddresses is the shared selection rule: prefer the address
+// whose transport matches the engine's own node transport. RDMA wins when both
+// the engine supports RDMA and the replica exposes RDMA. Otherwise TCP.
+// Falls back to the legacy single address with the engine's default transport
+// when the transport pair is nil or missing the preferred address.
+func (e *Engine) pickFromTransportAddresses(legacyAddress string, tAddrs *spdkrpc.ReplicaTransportAddresses) (string, NvmfTransportType) {
+	if tAddrs == nil {
+		return legacyAddress, e.replicaTransport()
+	}
 	if e.replicaTransport().IsRDMA() && tAddrs.RdmaAddress != "" {
 		return tAddrs.RdmaAddress, NvmfTransportRDMA
 	}
@@ -1180,7 +1200,7 @@ func (e *Engine) replicaAddStart(spdkClient *spdkclient.Client, replicaClients m
 	}
 
 	addLog.Info("replicaAddStart step=rebuildingDstStart")
-	dstHeadLvolAddress, err := dstReplicaServiceCli.ReplicaRebuildingDstStart(dstReplicaName, srcReplicaName, srcReplicaAddress, snapshotName, externalSnapshotAddress, rebuildingSnapshotList)
+	dstHeadLvolAddress, dstHeadLvolTransportAddrs, err := dstReplicaServiceCli.ReplicaRebuildingDstStart(dstReplicaName, srcReplicaName, srcReplicaAddress, snapshotName, externalSnapshotAddress, rebuildingSnapshotList)
 	if err != nil {
 		addLog.WithError(err).Error("replicaAddStart failed step=rebuildingDstStart")
 		return nil, startUpdateRequired, nil, err
@@ -1192,8 +1212,13 @@ func (e *Engine) replicaAddStart(spdkClient *spdkclient.Client, replicaClients m
 		return nil, startUpdateRequired, nil, err
 	}
 
+	// Prefer the transport-qualified address matching the engine's own transport
+	// so the attach doesn't waste 30 retries dialing the wrong transport against
+	// the replica's primary port. Falls back to the legacy single address when
+	// talking to an older dst replica that didn't populate the transport pair.
 	addLog.Info("replicaAddStart step=connectNVMfBdev")
-	dstHeadLvolBdevName, err := connectNVMfBdevWithTransport(spdkClient, dstReplicaName, dstHeadLvolAddress, e.replicaTransport(), e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
+	attachAddr, attachTransport := e.pickRebuildDstAddress(dstHeadLvolAddress, dstHeadLvolTransportAddrs)
+	dstHeadLvolBdevName, err := connectNVMfBdevWithTransport(spdkClient, dstReplicaName, attachAddr, attachTransport, e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
 	if err != nil {
 		addLog.WithError(err).Error("replicaAddStart failed step=connectNVMfBdev")
 		return nil, startUpdateRequired, nil, err
