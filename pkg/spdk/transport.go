@@ -1,8 +1,11 @@
 package spdk
 
 import (
+	"context"
 	"os"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/sirupsen/logrus"
 
@@ -19,6 +22,8 @@ const (
 )
 
 const DefaultNvmfTransport = NvmfTransportTCP
+
+const defaultTransportReprobeInterval = 60 * time.Second
 
 func (t NvmfTransportType) ToSPDKTransportType() spdktypes.NvmeTransportType {
 	switch t {
@@ -63,4 +68,32 @@ func NegotiateNodeTransport(spdkClient *spdkclient.Client) NvmfTransportType {
 	}
 	logrus.Info("NVMe-oF RDMA transport negotiated on this node")
 	return NvmfTransportRDMA
+}
+
+var rdmaReprobeLogged atomic.Bool
+
+func StartTransportReprobe(ctx context.Context, spdkClient *spdkclient.Client, negotiated NvmfTransportType) {
+	if negotiated == NvmfTransportRDMA {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(defaultTransportReprobeInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if !DetectTransport().RDMA {
+					continue
+				}
+				if _, err := spdkClient.NvmfCreateTransport(spdktypes.NvmeTransportTypeRDMA); err != nil && !jsonrpc.IsJSONRPCRespErrorTransportTypeAlreadyExists(err) {
+					continue
+				}
+				if rdmaReprobeLogged.CompareAndSwap(false, true) {
+					logrus.Warn("RDMA transport is now available on this node but engines are running with TCP; restart the instance-manager pod to migrate to RDMA")
+				}
+			}
+		}
+	}()
 }
