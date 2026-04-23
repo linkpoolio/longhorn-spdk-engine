@@ -40,6 +40,7 @@ func (s *Server) EngineCreate(ctx context.Context, req *spdkrpc.EngineCreateRequ
 	if e == nil {
 		s.engineMap[req.Name] = NewEngine(req.Name, req.VolumeName, req.Frontend, req.SpecSize, s.nodeTransport, s.updateChs[types.InstanceTypeEngine])
 		e = s.engineMap[req.Name]
+		e.metadataDir = s.metadataDir
 	}
 
 	spdkClient := s.spdkClient
