@@ -58,3 +58,25 @@ func (s *TestSuite) TestEnvIntOrDefaultNegative(c *C) {
 	defer setenv(c, envName, "-1")()
 	c.Assert(envIntOrDefault(envName, 10), Equals, -1)
 }
+
+func (s *TestSuite) TestDefaultRaidDeltaBitmapEnabledDefaultsOn(c *C) {
+	// Unset → default on. Guards against a future refactor that flips the
+	// default off silently (would break incremental rebuild for every
+	// existing cluster that doesn't set the env).
+	c.Assert(os.Unsetenv("LONGHORN_V2_RAID_DELTA_BITMAP"), IsNil)
+	c.Assert(defaultRaidDeltaBitmapEnabled(), Equals, true)
+}
+
+func (s *TestSuite) TestDefaultRaidDeltaBitmapEnabledHonorsFalseVariants(c *C) {
+	for _, raw := range []string{"0", "false", "FALSE", "no", "off", "  false  "} {
+		defer setenv(c, "LONGHORN_V2_RAID_DELTA_BITMAP", raw)()
+		c.Assert(defaultRaidDeltaBitmapEnabled(), Equals, false, Commentf("raw=%q should disable", raw))
+	}
+}
+
+func (s *TestSuite) TestDefaultRaidDeltaBitmapEnabledAnyOtherValueIsOn(c *C) {
+	for _, raw := range []string{"1", "true", "yes", "on", "", "random-garbage"} {
+		defer setenv(c, "LONGHORN_V2_RAID_DELTA_BITMAP", raw)()
+		c.Assert(defaultRaidDeltaBitmapEnabled(), Equals, true, Commentf("raw=%q should enable", raw))
+	}
+}
