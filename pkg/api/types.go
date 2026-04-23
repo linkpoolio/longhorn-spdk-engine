@@ -24,6 +24,8 @@ type Replica struct {
 	IP               string           `json:"ip"`
 	PortStart        int32            `json:"port_start"`
 	PortEnd          int32            `json:"port_end"`
+	TcpPort          int32            `json:"tcp_port,omitempty"`
+	RdmaPort         int32            `json:"rdma_port,omitempty"`
 	State            string           `json:"state"`
 	ErrorMsg         string           `json:"error_msg"`
 	Rebuilding       bool             `json:"rebuilding"`
@@ -96,6 +98,8 @@ func ProtoReplicaToReplica(r *spdkrpc.Replica) *Replica {
 		IP:         r.Ip,
 		PortStart:  r.PortStart,
 		PortEnd:    r.PortEnd,
+		TcpPort:    r.TcpPort,
+		RdmaPort:   r.RdmaPort,
 		State:      r.State,
 		ErrorMsg:   r.ErrorMsg,
 		Rebuilding: r.Rebuilding,
@@ -127,6 +131,8 @@ func ReplicaToProtoReplica(r *Replica) *spdkrpc.Replica {
 		Ip:         r.IP,
 		PortStart:  r.PortStart,
 		PortEnd:    r.PortEnd,
+		TcpPort:    r.TcpPort,
+		RdmaPort:   r.RdmaPort,
 		Head:       LvolToProtoLvol(r.Head),
 		Snapshots:  snapshots,
 		Rebuilding: r.Rebuilding,

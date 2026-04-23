@@ -127,11 +127,22 @@ func (r *Replica) transport() NvmfTransportType {
 	return r.ListenerTransport
 }
 
+// tcpFallbackPort is the TCP fallback listener's port for this replica. By
+// convention the fallback sits one port above the primary. prepareIPAndPorts
+// reserves this slot with AllocateRange(portCount+1) and the internal
+// portAllocator bitmap starts at PortStart+2, so rebuild/clone allocations
+// never collide with the fallback. listenerPortsForTransport and
+// addTCPFallbackListener must both go through this helper so the convention
+// stays in a single place.
+func (r *Replica) tcpFallbackPort() int32 {
+	return r.PortStart + 1
+}
+
 func (r *Replica) addTCPFallbackListener(spdkClient *spdkclient.Client, nqn string) error {
 	if r.transport() == NvmfTransportTCP {
 		return nil
 	}
-	fallbackPort := strconv.Itoa(int(r.PortStart + 1))
+	fallbackPort := strconv.Itoa(int(r.tcpFallbackPort()))
 	if err := spdkClient.EnsureNvmfTransport(spdktypes.NvmeTransportTypeTCP); err != nil {
 		return errors.Wrapf(err, "failed to ensure TCP transport before adding fallback listener on %s:%s for nqn %s", r.IP, fallbackPort, nqn)
 	}
@@ -234,7 +245,42 @@ type DeepCopyStatus struct {
 	Error             string `json:"error,omitempty"`
 }
 
+// listenerPortsForTransport returns the TCP and RDMA listener ports that this
+// replica exposes. On TCP-only storage nodes the single TCP listener lives at
+// PortStart and RDMA is not exposed; on RDMA-capable nodes the RDMA listener
+// is at PortStart and the TCP fallback is at tcpFallbackPort(). Returns (0, 0)
+// when PortStart is unset.
+func (r *Replica) listenerPortsForTransport() (tcpPort, rdmaPort int32) {
+	if r.PortStart == 0 {
+		return 0, 0
+	}
+	if r.transport().IsRDMA() {
+		return r.tcpFallbackPort(), r.PortStart
+	}
+	return r.PortStart, 0
+}
+
+// headLvolTransportAddresses returns the transport-qualified addresses for
+// this replica's main NQN. rdma_address is empty on TCP-only nodes. Used by
+// ReplicaRebuildingDstStart to give the engine both addresses so it can dial
+// whichever transport matches its own node transport.
+func (r *Replica) headLvolTransportAddresses() *spdkrpc.ReplicaTransportAddresses {
+	tcpPort, rdmaPort := r.listenerPortsForTransport()
+	if tcpPort == 0 && rdmaPort == 0 {
+		return nil
+	}
+	addrs := &spdkrpc.ReplicaTransportAddresses{}
+	if tcpPort != 0 {
+		addrs.TcpAddress = net.JoinHostPort(r.IP, strconv.Itoa(int(tcpPort)))
+	}
+	if rdmaPort != 0 {
+		addrs.RdmaAddress = net.JoinHostPort(r.IP, strconv.Itoa(int(rdmaPort)))
+	}
+	return addrs
+}
+
 func ServiceReplicaToProtoReplica(r *Replica) *spdkrpc.Replica {
+	tcpPort, rdmaPort := r.listenerPortsForTransport()
 	res := &spdkrpc.Replica{
 		Name:      r.Name,
 		LvsName:   r.LvsName,
@@ -244,6 +290,8 @@ func ServiceReplicaToProtoReplica(r *Replica) *spdkrpc.Replica {
 		Ip:        r.IP,
 		PortStart: r.PortStart,
 		PortEnd:   r.PortEnd,
+		TcpPort:   tcpPort,
+		RdmaPort:  rdmaPort,
 		State:     string(r.State),
 		ErrorMsg:  r.ErrorMsg,
 	}
@@ -333,7 +381,7 @@ func (r *Replica) prepareIPAndPorts(portCount int32, superiorPortAllocator *comm
 	r.IP = podIP
 
 	if r.PortStart != 0 && r.PortEnd != 0 && r.portAllocator != nil {
-		r.log.Infof("Reusing reserved IP %s and Ports [%d, %d] for replica (primary=%d, tcp-fallback=%d)", r.IP, r.PortStart, r.PortEnd, r.PortStart, r.PortStart+1)
+		r.log.Infof("Reusing reserved IP %s and Ports [%d, %d] for replica (primary=%d, tcp-fallback=%d)", r.IP, r.PortStart, r.PortEnd, r.PortStart, r.tcpFallbackPort())
 		return nil
 	}
 
@@ -348,7 +396,7 @@ func (r *Replica) prepareIPAndPorts(portCount int32, superiorPortAllocator *comm
 	}
 	r.portAllocator = bitmap
 
-	r.log.Infof("Prepared IP %s and Ports [%d, %d] for replica (primary=%d, tcp-fallback=%d)", r.IP, r.PortStart, r.PortEnd, r.PortStart, r.PortStart+1)
+	r.log.Infof("Prepared IP %s and Ports [%d, %d] for replica (primary=%d, tcp-fallback=%d)", r.IP, r.PortStart, r.PortEnd, r.PortStart, r.tcpFallbackPort())
 
 	if err := saveReplicaRecord(r.metadataDir, r); err != nil {
 		r.log.WithError(err).Warn("Failed to persist replica port record; reconnect-after-restart may reallocate ports")
