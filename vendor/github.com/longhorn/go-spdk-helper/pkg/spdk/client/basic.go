@@ -41,12 +41,19 @@ func (c *Client) BdevGetBdevs(name string, timeout uint64) (bdevInfoList []spdkt
 	return bdevInfoList, json.Unmarshal(cmdOutput, &bdevInfoList)
 }
 
-// BdevAioCreate constructs Linux AIO bdev.
-func (c *Client) BdevAioCreate(filePath, name string, blockSize uint64) (bdevName string, err error) {
+// BdevAioCreate constructs Linux AIO bdev. nowait sets RWF_NOWAIT on iocb
+// read/write submissions (not on fallocate/UNMAP, which uses a separate
+// synchronous path). Requires the backing filename to be a block device;
+// the SPDK side fails bdev create if passed on a regular file. SPDK v26.01
+// flipped the default from on to off (commit 3a396cb) to dodge a kernel
+// bug where io_getevents could return -EAGAIN infinitely on some kernels;
+// upstream Longhorn v1.11.x pins SPDK v25.09 where it is still default-on.
+func (c *Client) BdevAioCreate(filePath, name string, blockSize uint64, nowait bool) (bdevName string, err error) {
 	req := spdktypes.BdevAioCreateRequest{
 		Name:      name,
 		Filename:  filePath,
 		BlockSize: blockSize,
+		NoWait:    nowait,
 	}
 
 	// Long blob recovery time might be needed if the spdk_tgt is not shutdown gracefully.
