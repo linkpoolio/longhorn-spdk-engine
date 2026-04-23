@@ -423,3 +423,21 @@ func envIntOrDefault(name string, def int) int {
 	}
 	return v
 }
+
+// defaultRaidDeltaBitmapEnabled returns whether new v2 raid1 bdevs should
+// enable per-base-bdev dirty-region tracking. Defaults on; operators can
+// force off by setting LONGHORN_V2_RAID_DELTA_BITMAP=0 on the IM pod (e.g.
+// if the base bdev layer exposes optimal_io_boundary=0 and would reject
+// raid1 startup).
+func defaultRaidDeltaBitmapEnabled() bool {
+	raw, ok := os.LookupEnv("LONGHORN_V2_RAID_DELTA_BITMAP")
+	if !ok {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}

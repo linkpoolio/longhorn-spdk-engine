@@ -42,6 +42,7 @@ func (s *TestSuite) TestSaveAndLoadEngineRecord(c *C) {
 	tmpDir := c.MkDir()
 
 	e := newTestEngine("engine-a", "vol-a")
+	e.deltaBitmapEnabled = true
 	e.ReplicaStatusMap["replica-1"] = &EngineReplicaStatus{Address: "10.0.0.2:4420", BdevName: "bdev-1", Mode: "RW"}
 	e.ReplicaStatusMap["replica-2"] = &EngineReplicaStatus{Address: "10.0.0.3:4421", BdevName: "bdev-2", Mode: "WO"}
 
@@ -66,6 +67,27 @@ func (s *TestSuite) TestSaveAndLoadEngineRecord(c *C) {
 	c.Assert(rec.NvmeTcpTarget.IP, Equals, "10.0.0.1")
 	c.Assert(rec.NvmeTcpTarget.Port, Equals, int32(3000))
 	c.Assert(rec.NvmeTcpTarget.Nqn, Equals, "nqn.example:engine-a")
+	c.Assert(rec.DeltaBitmapEnabled, Equals, true)
+}
+
+func (s *TestSuite) TestSaveAndLoadEngineRecordPreservesDeltaBitmapDisabled(c *C) {
+	tmpDir := c.MkDir()
+
+	// Explicit false round-trips cleanly even with omitempty encoding:
+	// restoreFromRecord needs to observe the persisted value, not a zero-value default.
+	e := newTestEngine("engine-off", "vol-off")
+	e.deltaBitmapEnabled = false
+
+	c.Assert(saveEngineRecord(tmpDir, e), IsNil)
+	records, err := loadEngineRecords(tmpDir)
+	c.Assert(err, IsNil)
+	rec := records["engine-off"]
+	c.Assert(rec, NotNil)
+	c.Assert(rec.DeltaBitmapEnabled, Equals, false)
+
+	fresh := &Engine{log: e.log}
+	fresh.restoreFromRecord(rec)
+	c.Assert(fresh.deltaBitmapEnabled, Equals, false)
 }
 
 func (s *TestSuite) TestSaveEngineRecordIsAtomic(c *C) {
@@ -178,6 +200,7 @@ func (s *TestSuite) TestEngineRestoreFromRecord(c *C) {
 
 	// Stage a record on disk.
 	original := newTestEngine("engine-x", "vol-x")
+	original.deltaBitmapEnabled = true
 	original.ReplicaStatusMap["r1"] = &EngineReplicaStatus{Address: "10.0.0.5:4420", BdevName: "bdev-r1", Mode: "RW"}
 	c.Assert(saveEngineRecord(tmpDir, original), IsNil)
 
@@ -200,6 +223,7 @@ func (s *TestSuite) TestEngineRestoreFromRecord(c *C) {
 	c.Assert(fresh.ReplicaStatusMap["r1"].BdevName, Equals, "bdev-r1")
 	c.Assert(fresh.NvmeTcpTarget, NotNil)
 	c.Assert(fresh.NvmeTcpTarget.Port, Equals, int32(3000))
+	c.Assert(fresh.deltaBitmapEnabled, Equals, true)
 
 	// Mutating the restored map must not reach back into the record — verifies
 	// the deep copy in restoreFromRecord. If the record is reloaded on a

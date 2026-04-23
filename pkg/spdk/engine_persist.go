@@ -27,14 +27,15 @@ const (
 // base-bdev relationship can be re-established against the existing SPDK
 // objects that survived the restart.
 type EngineRecord struct {
-	Name             string                          `json:"name"`
-	VolumeName       string                          `json:"volumeName"`
-	Frontend         string                          `json:"frontend"`
-	SpecSize         uint64                          `json:"specSize"`
-	RaidBdevUUID     string                          `json:"raidBdevUUID,omitempty"`
-	ReplicaTransport NvmfTransportType               `json:"replicaTransport,omitempty"`
-	ReplicaStatusMap map[string]*EngineReplicaStatus `json:"replicaStatusMap,omitempty"`
-	NvmeTcpTarget    *NvmeTcpTarget                  `json:"nvmeTcpTarget,omitempty"`
+	Name               string                          `json:"name"`
+	VolumeName         string                          `json:"volumeName"`
+	Frontend           string                          `json:"frontend"`
+	SpecSize           uint64                          `json:"specSize"`
+	RaidBdevUUID       string                          `json:"raidBdevUUID,omitempty"`
+	ReplicaTransport   NvmfTransportType               `json:"replicaTransport,omitempty"`
+	ReplicaStatusMap   map[string]*EngineReplicaStatus `json:"replicaStatusMap,omitempty"`
+	NvmeTcpTarget      *NvmeTcpTarget                  `json:"nvmeTcpTarget,omitempty"`
+	DeltaBitmapEnabled bool                            `json:"deltaBitmapEnabled,omitempty"`
 }
 
 func engineRecordDir(metadataDir, engineName string) string {
@@ -73,14 +74,15 @@ func saveEngineRecord(metadataDir string, e *Engine) error {
 	}
 
 	rec := EngineRecord{
-		Name:             e.Name,
-		VolumeName:       e.VolumeName,
-		Frontend:         e.Frontend,
-		SpecSize:         e.SpecSize,
-		RaidBdevUUID:     e.RaidBdevUUID,
-		ReplicaTransport: e.ReplicaTransport,
-		ReplicaStatusMap: replicaStatusCopy,
-		NvmeTcpTarget:    nvmeTarget,
+		Name:               e.Name,
+		VolumeName:         e.VolumeName,
+		Frontend:           e.Frontend,
+		SpecSize:           e.SpecSize,
+		RaidBdevUUID:       e.RaidBdevUUID,
+		ReplicaTransport:   e.ReplicaTransport,
+		ReplicaStatusMap:   replicaStatusCopy,
+		NvmeTcpTarget:      nvmeTarget,
+		DeltaBitmapEnabled: e.deltaBitmapEnabled,
 	}
 
 	dir := engineRecordDir(metadataDir, e.Name)
@@ -216,7 +218,8 @@ func (e *Engine) restoreFromRecord(rec *EngineRecord) {
 		t := *rec.NvmeTcpTarget
 		e.NvmeTcpTarget = &t
 	}
-	e.log.Infof("Restored engine %s (volume=%s) from persisted record: replicas=%d raid=%s",
-		e.Name, e.VolumeName, len(e.ReplicaStatusMap), e.RaidBdevUUID)
+	e.deltaBitmapEnabled = rec.DeltaBitmapEnabled
+	e.log.Infof("Restored engine %s (volume=%s) from persisted record: replicas=%d raid=%s deltaBitmap=%v",
+		e.Name, e.VolumeName, len(e.ReplicaStatusMap), e.RaidBdevUUID, e.deltaBitmapEnabled)
 }
 
