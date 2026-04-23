@@ -164,7 +164,7 @@ func connectNVMfBdevWithTransport(spdkClient *spdkclient.Client, controllerName,
 				spdkTransport,
 				spdktypes.NvmeAddressFamilyIPv4,
 				int32(ctrlrLossTimeout),
-				replicaReconnectDelaySec,
+				int32(replicaReconnectDelaySec),
 				int32(fastIOFailTimeoutSec),
 				replicaMultipath,
 			)
@@ -220,7 +220,7 @@ func attemptTCPFallback(spdkClient *spdkclient.Client, controllerName, ip, port 
 		spdktypes.NvmeTransportTypeTCP,
 		spdktypes.NvmeAddressFamilyIPv4,
 		int32(ctrlrLossTimeout),
-		replicaReconnectDelaySec,
+		int32(replicaReconnectDelaySec),
 		int32(fastIOFailTimeoutSec),
 		replicaMultipath,
 	)
