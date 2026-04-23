@@ -62,6 +62,13 @@ var (
 	replicaFastIOFailTimeoutSec = 10
 	replicaTransportAckTimeout  = 10
 	replicaKeepAliveTimeoutMs   = 10000
+
+	// defaultLvolClearMethod controls the clear_method passed to
+	// bdev_lvol_create_lvstore and bdev_lvol_create. Empty string means
+	// "use SPDK default" (unmap). Longhorn installs running on kernels or
+	// bdevs where UNMAP issues synchronous fallocate(PUNCH_HOLE) on the
+	// reactor can override to "none" via LONGHORN_V2_LVOL_CLEAR_METHOD.
+	defaultLvolClearMethod = ""
 )
 
 func init() {
@@ -70,6 +77,9 @@ func init() {
 	replicaFastIOFailTimeoutSec = envIntOrDefault("LONGHORN_V2_REPLICA_FAST_IO_FAIL_TIMEOUT_SEC", replicaFastIOFailTimeoutSec)
 	replicaTransportAckTimeout = envIntOrDefault("LONGHORN_V2_REPLICA_TRANSPORT_ACK_TIMEOUT", replicaTransportAckTimeout)
 	replicaKeepAliveTimeoutMs = envIntOrDefault("LONGHORN_V2_REPLICA_KEEP_ALIVE_TIMEOUT_MS", replicaKeepAliveTimeoutMs)
+	if v, ok := os.LookupEnv("LONGHORN_V2_LVOL_CLEAR_METHOD"); ok {
+		defaultLvolClearMethod = strings.TrimSpace(v)
+	}
 }
 
 var (
