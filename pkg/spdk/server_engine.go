@@ -48,10 +48,10 @@ func (s *Server) EngineCreate(ctx context.Context, req *spdkrpc.EngineCreateRequ
 	return e.Create(spdkClient, req.ReplicaAddressMap, req.PortCount, s.portAllocator, req.SalvageRequested)
 }
 
-// EngineDelete deletes an engine
 func (s *Server) EngineDelete(ctx context.Context, req *spdkrpc.EngineDeleteRequest) (ret *emptypb.Empty, err error) {
 	s.RLock()
 	e := s.engineMap[req.Name]
+	ef := s.engineFrontendMap[req.Name]
 	spdkClient := s.spdkClient
 	s.RUnlock()
 
@@ -59,13 +59,20 @@ func (s *Server) EngineDelete(ctx context.Context, req *spdkrpc.EngineDeleteRequ
 		if err == nil {
 			s.Lock()
 			delete(s.engineMap, req.Name)
+			delete(s.engineFrontendMap, req.Name)
 			s.Unlock()
 		}
 	}()
 
+	if ef != nil {
+		if efErr := ef.Delete(spdkClient); efErr != nil {
+			return nil, toEngineFrontendLifecycleGRPCError(efErr, "failed to delete engine frontend %v during engine delete cascade", req.Name)
+		}
+	}
+
 	if e != nil {
-		if err := e.Delete(spdkClient, s.portAllocator); err != nil {
-			return nil, err
+		if eErr := e.Delete(spdkClient, s.portAllocator); eErr != nil {
+			return nil, eErr
 		}
 	}
 
