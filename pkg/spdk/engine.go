@@ -1066,59 +1066,77 @@ func (e *Engine) replicaAddStart(spdkClient *spdkclient.Client, replicaClients m
 	opts := &api.SnapshotOptions{
 		Timestamp: util.Now(),
 	}
+	addLog := e.log.WithFields(map[string]interface{}{
+		"dstReplica":     dstReplicaName,
+		"srcReplica":     srcReplicaName,
+		"rebuildSnapshot": snapshotName,
+	})
 
+	addLog.Info("replicaAddStart step=snapshotCreate")
 	var replicasErr error
 	startUpdateRequired, replicasErr, engineErr = e.snapshotOperationWithoutLock(spdkClient, replicaClients, snapshotName, SnapshotOperationCreate, opts)
 	if replicasErr != nil {
+		addLog.WithError(replicasErr).Error("replicaAddStart failed step=snapshotCreate")
 		return nil, startUpdateRequired, engineErr, replicasErr
 	}
 	if engineErr != nil {
+		addLog.WithError(engineErr).Error("replicaAddStart engineErr step=snapshotCreate")
 		return nil, startUpdateRequired, engineErr, nil
 	}
 	e.checkAndUpdateInfoFromReplicasNoLock()
 
+	addLog.Info("replicaAddStart step=getRebuildingSnapshotList")
 	rebuildingSnapshotList, err = getRebuildingSnapshotList(srcReplicaServiceCli, srcReplicaName)
 	if err != nil {
+		addLog.WithError(err).Error("replicaAddStart failed step=getRebuildingSnapshotList")
 		return nil, startUpdateRequired, nil, err
 	}
 
-	// Ask the source replica to expose the newly created snapshot if the source replica and destination replica are not on the same node.
+	addLog.Info("replicaAddStart step=rebuildingSrcStart")
 	externalSnapshotAddress, err := srcReplicaServiceCli.ReplicaRebuildingSrcStart(srcReplicaName, dstReplicaName, dstReplicaAddress, snapshotName)
 	if err != nil {
+		addLog.WithError(err).Error("replicaAddStart failed step=rebuildingSrcStart")
 		return nil, startUpdateRequired, nil, err
 	}
 
-	// The destination replica attaches the source replica exposed snapshot as the external snapshot then create a head based on it.
+	addLog.Info("replicaAddStart step=rebuildingDstStart")
 	dstHeadLvolAddress, err := dstReplicaServiceCli.ReplicaRebuildingDstStart(dstReplicaName, srcReplicaName, srcReplicaAddress, snapshotName, externalSnapshotAddress, rebuildingSnapshotList)
 	if err != nil {
+		addLog.WithError(err).Error("replicaAddStart failed step=rebuildingDstStart")
 		return nil, startUpdateRequired, nil, err
 	}
 
-	// Ensure the dst head lvol size matches the engine spec size before connecting and growing the RAID.
+	addLog.Info("replicaAddStart step=ensureRebuildingReplicaSize")
 	if err := e.ensureRebuildingReplicaSize(dstReplicaServiceCli, dstReplicaName); err != nil {
+		addLog.WithError(err).Error("replicaAddStart failed step=ensureRebuildingReplicaSize")
 		return nil, startUpdateRequired, nil, err
 	}
 
-	// Add rebuilding replica head bdev to the base bdev list of the RAID bdev
+	addLog.Info("replicaAddStart step=connectNVMfBdev")
 	dstHeadLvolBdevName, err := connectNVMfBdevWithTransport(spdkClient, dstReplicaName, dstHeadLvolAddress, e.replicaTransport(), e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
 	if err != nil {
+		addLog.WithError(err).Error("replicaAddStart failed step=connectNVMfBdev")
 		return nil, startUpdateRequired, nil, err
 	}
 
-	// Double-confirm the actual bdev size reported by SPDK after connecting.
+	addLog.WithField("dstHeadBdev", dstHeadLvolBdevName).Info("replicaAddStart step=bdevGetBdevs")
 	bdevList, err := spdkClient.BdevGetBdevs(dstHeadLvolBdevName, 0)
 	if err != nil {
+		addLog.WithError(err).WithField("dstHeadBdev", dstHeadLvolBdevName).Error("replicaAddStart failed step=bdevGetBdevs")
 		return nil, startUpdateRequired, nil, errors.Wrapf(err, "failed to get bdev info for rebuilding replica %s head bdev %s", dstReplicaName, dstHeadLvolBdevName)
 	}
 	if len(bdevList) != 1 {
+		addLog.WithField("dstHeadBdev", dstHeadLvolBdevName).WithField("bdevCount", len(bdevList)).Error("replicaAddStart failed step=bdevGetBdevs (wrong count)")
 		return nil, startUpdateRequired, nil, fmt.Errorf("expected 1 bdev for rebuilding replica %s head bdev %s, got %d", dstReplicaName, dstHeadLvolBdevName, len(bdevList))
 	}
 	if err := validateReplicaBdevSize(e, dstReplicaName, &bdevList[0]); err != nil {
+		addLog.WithError(err).WithField("dstHeadBdev", dstHeadLvolBdevName).Error("replicaAddStart failed step=validateReplicaBdevSize")
 		return nil, startUpdateRequired, nil, errors.Wrapf(err, "rebuilding replica %s head bdev %s has wrong size, cannot add to engine %s", dstReplicaName, dstHeadLvolBdevName, e.Name)
 	}
 
-	e.log.Infof("Adding rebuilding replica %s head bdev %s to the base bdev list for engine %s", dstReplicaName, dstHeadLvolBdevName, e.Name)
+	addLog.WithField("dstHeadBdev", dstHeadLvolBdevName).Info("replicaAddStart step=bdevRaidGrowBaseBdev")
 	if _, err := spdkClient.BdevRaidGrowBaseBdev(e.Name, dstHeadLvolBdevName); err != nil {
+		addLog.WithError(err).WithField("dstHeadBdev", dstHeadLvolBdevName).Error("replicaAddStart failed step=bdevRaidGrowBaseBdev")
 		return nil, startUpdateRequired, nil, errors.Wrapf(err, "failed to adding the rebuilding replica %s head bdev %s to the base bdev list for engine %s", dstReplicaName, dstHeadLvolBdevName, e.Name)
 	}
 
