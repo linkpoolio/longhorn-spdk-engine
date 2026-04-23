@@ -69,6 +69,16 @@ var (
 	// bdevs where UNMAP issues synchronous fallocate(PUNCH_HOLE) on the
 	// reactor can override to "none" via LONGHORN_V2_LVOL_CLEAR_METHOD.
 	defaultLvolClearMethod = ""
+
+	// defaultLvstoreClusterSize controls the cluster_sz passed to
+	// bdev_lvol_create_lvstore on new disk registration. The value is fixed
+	// at lvstore creation time and cannot be changed; existing disks keep
+	// their original cluster size. Larger clusters reduce the per-cluster
+	// blob_sync_md cost that caps v2 replica rebuild throughput (upstream
+	// SPDK issue #359), at the cost of higher CoW amplification on
+	// snapshotted blobs. Override via LONGHORN_V2_LVSTORE_CLUSTER_SIZE
+	// (bytes, uint32).
+	defaultLvstoreClusterSize uint32 = 1 * 1024 * 1024
 )
 
 func init() {
@@ -79,6 +89,11 @@ func init() {
 	replicaKeepAliveTimeoutMs = envIntOrDefault("LONGHORN_V2_REPLICA_KEEP_ALIVE_TIMEOUT_MS", replicaKeepAliveTimeoutMs)
 	if v, ok := os.LookupEnv("LONGHORN_V2_LVOL_CLEAR_METHOD"); ok {
 		defaultLvolClearMethod = strings.TrimSpace(v)
+	}
+	if v, ok := os.LookupEnv("LONGHORN_V2_LVSTORE_CLUSTER_SIZE"); ok {
+		if parsed, err := strconv.ParseUint(strings.TrimSpace(v), 10, 32); err == nil && parsed > 0 {
+			defaultLvstoreClusterSize = uint32(parsed)
+		}
 	}
 }
 
