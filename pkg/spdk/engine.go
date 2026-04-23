@@ -1563,17 +1563,15 @@ func (e *Engine) ReplicaDelete(spdkClient *spdkclient.Client, replicaName, repli
 			}
 		}
 	}
-	// Idempotent: if the replica isn't in the map there is nothing to
-	// detach. This happens when SPDK restarts mid-rebuild and loses the
-	// in-memory ReplicaStatusMap — the manager's follow-up cleanup should
-	// not be treated as a hard failure, since the post-condition ("replica
-	// is not in the engine") already holds.
 	if replicaName == "" {
 		e.log.Infof("Engine %s has no replica with address %s to delete; treating as complete", e.Name, replicaAddress)
 		return nil
 	}
 	replicaStatus := e.ReplicaStatusMap[replicaName]
 	if replicaStatus == nil {
+		if _, err := spdkClient.BdevNvmeDetachController(replicaName); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
+			e.log.WithError(err).Warnf("Failed best-effort detach of controller %s", replicaName)
+		}
 		e.log.Infof("Engine %s does not track replica %s; treating delete as complete", e.Name, replicaName)
 		return nil
 	}
