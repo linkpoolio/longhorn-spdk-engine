@@ -195,7 +195,7 @@ func (e *Engine) resolveCntlidRange() (uint16, uint16) {
 		return getEngineDualCntlidRange(e.Name)
 	}
 	cntlid := getEngineCntlid(e.Name)
-	return cntlid, cntlid
+	return cntlid, cntlid + 3
 }
 
 type EngineReplicaStatus struct {
