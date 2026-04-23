@@ -260,6 +260,25 @@ func (r *Replica) listenerPortsForTransport() (tcpPort, rdmaPort int32) {
 	return r.PortStart, 0
 }
 
+// headLvolTransportAddresses returns the transport-qualified addresses for
+// this replica's main NQN. rdma_address is empty on TCP-only nodes. Used by
+// ReplicaRebuildingDstStart to give the engine both addresses so it can dial
+// whichever transport matches its own node transport.
+func (r *Replica) headLvolTransportAddresses() *spdkrpc.ReplicaTransportAddresses {
+	tcpPort, rdmaPort := r.listenerPortsForTransport()
+	if tcpPort == 0 && rdmaPort == 0 {
+		return nil
+	}
+	addrs := &spdkrpc.ReplicaTransportAddresses{}
+	if tcpPort != 0 {
+		addrs.TcpAddress = net.JoinHostPort(r.IP, strconv.Itoa(int(tcpPort)))
+	}
+	if rdmaPort != 0 {
+		addrs.RdmaAddress = net.JoinHostPort(r.IP, strconv.Itoa(int(rdmaPort)))
+	}
+	return addrs
+}
+
 func ServiceReplicaToProtoReplica(r *Replica) *spdkrpc.Replica {
 	tcpPort, rdmaPort := r.listenerPortsForTransport()
 	res := &spdkrpc.Replica{
