@@ -244,6 +244,10 @@ func disconnectNVMfBdev(spdkClient *spdkclient.Client, bdevName string, maxRetri
 				if jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
 					return nil
 				}
+				if isRPCConnectionTimedOut(err) {
+					logrus.WithError(err).Warnf("NVMe bdev detach timed out (controller=%s, remote target unresponsive); trusting ctrlr_loss_timeout to reap, skipping retry", controllerName)
+					return nil
+				}
 				return err
 			}
 			return nil
@@ -259,6 +263,21 @@ func disconnectNVMfBdev(spdkClient *spdkclient.Client, bdevName string, maxRetri
 			)
 		}),
 	)
+}
+
+func isRPCConnectionTimedOut(err error) bool {
+	if err == nil {
+		return false
+	}
+	jsonRPCError, ok := err.(jsonrpc.JSONClientError)
+	if !ok {
+		return false
+	}
+	responseError, ok := jsonRPCError.ErrorDetail.(*jsonrpc.ResponseError)
+	if !ok {
+		return false
+	}
+	return responseError.Code == -110
 }
 
 func GetSnapXattr(spdkClient *spdkclient.Client, alias, key string) (string, error) {
