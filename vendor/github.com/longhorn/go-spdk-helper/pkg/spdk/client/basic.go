@@ -777,7 +777,9 @@ func (c *Client) BdevLvolRename(oldName, newName string) (renamed bool, err erro
 //		"baseBdevs": Required. The bdev list used as the underlying disk of the RAID.
 //
 //	 	"uuid": Optional. Create the raid bdev with specific uuid
-func (c *Client) BdevRaidCreate(name string, raidLevel spdktypes.BdevRaidLevel, stripSizeKb uint32, baseBdevs []string, uuid string) (created bool, err error) {
+//
+//	 	"deltaBitmap": Optional. Enables per-base-bdev dirty-region tracking on raid1 so a disconnected base bdev rebuilds incrementally. Ignored for non-raid1 levels.
+func (c *Client) BdevRaidCreate(name string, raidLevel spdktypes.BdevRaidLevel, stripSizeKb uint32, baseBdevs []string, uuid string, deltaBitmap bool) (created bool, err error) {
 	if raidLevel != spdktypes.BdevRaidLevel0 && raidLevel != spdktypes.BdevRaidLevelRaid0 && raidLevel != spdktypes.BdevRaidLevel5f && raidLevel != spdktypes.BdevRaidLevelRaid5f {
 		stripSizeKb = 0
 	}
@@ -786,6 +788,7 @@ func (c *Client) BdevRaidCreate(name string, raidLevel spdktypes.BdevRaidLevel, 
 		RaidLevel:   raidLevel,
 		StripSizeKb: stripSizeKb,
 		BaseBdevs:   baseBdevs,
+		DeltaBitmap: deltaBitmap,
 	}
 
 	if uuid != "" {
@@ -934,6 +937,57 @@ func (c *Client) BdevRaidGrowBaseBdev(raidName, baseBdevName string) (growed boo
 	}
 
 	return growed, json.Unmarshal(cmdOutput, &growed)
+}
+
+// BdevRaidStopBaseBdevDeltaBitmap stops recording dirty regions for a faulty
+// base bdev and aggregates per-channel bitmaps into a single base_info bitmap
+// that can be retrieved via BdevRaidGetBaseBdevDeltaBitmap. SPDK briefly
+// quiesces the raid bdev during this call. The base bdev transitions to the
+// FAULTY_STOPPED state; further writes no longer dirty the bitmap. A 600s
+// poller inside SPDK will auto-clear faulty state if the bitmap is not
+// reclaimed in time — callers should pair this with a timely Get + Clear.
+func (c *Client) BdevRaidStopBaseBdevDeltaBitmap(baseBdevName string) (stopped bool, err error) {
+	req := spdktypes.BdevRaidBaseBdevDeltaBitmapRequest{BaseBdevName: baseBdevName}
+
+	cmdOutput, err := c.jsonCli.SendCommand("bdev_raid_stop_base_bdev_delta_bitmap", req)
+	if err != nil {
+		return false, err
+	}
+
+	return stopped, json.Unmarshal(cmdOutput, &stopped)
+}
+
+// BdevRaidGetBaseBdevDeltaBitmap returns the aggregated dirty-region bitmap
+// for a base bdev that has previously been stopped via
+// BdevRaidStopBaseBdevDeltaBitmap. The bitmap is base64-encoded (one bit per
+// region); RegionSize is in bytes. Bit i set means the i-th region is dirty
+// and must be re-copied during reconnect.
+func (c *Client) BdevRaidGetBaseBdevDeltaBitmap(baseBdevName string) (*spdktypes.BdevRaidBaseBdevDeltaBitmapResponse, error) {
+	req := spdktypes.BdevRaidBaseBdevDeltaBitmapRequest{BaseBdevName: baseBdevName}
+
+	cmdOutput, err := c.jsonCli.SendCommand("bdev_raid_get_base_bdev_delta_bitmap", req)
+	if err != nil {
+		return nil, err
+	}
+
+	resp := &spdktypes.BdevRaidBaseBdevDeltaBitmapResponse{}
+	return resp, json.Unmarshal(cmdOutput, resp)
+}
+
+// BdevRaidClearBaseBdevFaultyState clears the FAULTY/FAULTY_STOPPED state on
+// a base bdev, tearing down the aggregated bitmap. Callers should invoke
+// this once the bitmap has been persisted and the base bdev is ready to be
+// re-added (or, if the base bdev is permanently gone, to free the tracking
+// state). Returns true on success.
+func (c *Client) BdevRaidClearBaseBdevFaultyState(baseBdevName string) (cleared bool, err error) {
+	req := spdktypes.BdevRaidBaseBdevDeltaBitmapRequest{BaseBdevName: baseBdevName}
+
+	cmdOutput, err := c.jsonCli.SendCommand("bdev_raid_clear_base_bdev_faulty_state", req)
+	if err != nil {
+		return false, err
+	}
+
+	return cleared, json.Unmarshal(cmdOutput, &cleared)
 }
 
 // BdevNvmeAttachController constructs NVMe bdev.
