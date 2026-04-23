@@ -940,8 +940,14 @@ func (s *Server) recoverEngines() {
 		if _, exists := s.engineMap[name]; exists {
 			continue
 		}
+		// Upgrade TCP→RDMA when the node has negotiated RDMA since the record was
+		// written. Engines created on pre-RDMA images persist replicaTransport=tcp;
+		// without this, a rolling IM upgrade to an RDMA-capable image leaves those
+		// engines dialing TCP to the replica's primary port (which exposes RDMA),
+		// burning 30s of retries per replica per attach before falling back to the
+		// TCP secondary. Downgrade is left alone so a deliberate TCP pin survives.
 		transport := rec.ReplicaTransport
-		if transport == "" {
+		if transport == "" || (transport == NvmfTransportTCP && s.nodeTransport == NvmfTransportRDMA) {
 			transport = s.nodeTransport
 		}
 		e := NewEngine(rec.Name, rec.VolumeName, rec.Frontend, rec.SpecSize, transport, s.updateChs[types.InstanceTypeEngine])
