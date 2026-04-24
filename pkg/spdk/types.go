@@ -79,6 +79,18 @@ var (
 	// snapshotted blobs. Override via LONGHORN_V2_LVSTORE_CLUSTER_SIZE
 	// (bytes, uint32).
 	defaultLvstoreClusterSize uint32 = 1 * 1024 * 1024
+
+	// defaultThinProvision controls the thin_provision flag passed to
+	// bdev_lvol_create. true (upstream default) allocates clusters
+	// lazily on first write, which triggers a per-cluster spdk_blob_sync_md
+	// barrier — a hard serialization point that caps first-write throughput
+	// on fresh regions at ~25 IOPS per blob on our hardware (slow mkfs on
+	// large volumes, slow rebuild shallow_copy, see SPDK #359). Set to
+	// false via LONGHORN_V2_LVOL_THIN_PROVISION=false for installs where
+	// the underlying bdev is already thick-allocated (e.g. a fixed-size
+	// LVM LV) so the blobstore-level thin tracking adds no capacity
+	// savings and only contributes latency.
+	defaultThinProvision = true
 )
 
 func init() {
@@ -93,6 +105,14 @@ func init() {
 	if v, ok := os.LookupEnv("LONGHORN_V2_LVSTORE_CLUSTER_SIZE"); ok {
 		if parsed, err := strconv.ParseUint(strings.TrimSpace(v), 10, 32); err == nil && parsed > 0 {
 			defaultLvstoreClusterSize = uint32(parsed)
+		}
+	}
+	if v, ok := os.LookupEnv("LONGHORN_V2_LVOL_THIN_PROVISION"); ok {
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "0", "false", "no", "off":
+			defaultThinProvision = false
+		case "1", "true", "yes", "on":
+			defaultThinProvision = true
 		}
 	}
 }
