@@ -56,12 +56,41 @@ const (
 // overridden per-IM via env vars set by longhorn-manager's instance_manager_controller
 // from the data-engine Setting CRs. Kept as vars so all existing bare-identifier
 // call sites continue to compile.
+//
+// replicaCtrlrLossTimeoutSec lowered from upstream 15s to 3s: when a remote
+// replica IM disappears mid-rebuild, every RDMA_CM_EVENT_REJECTED from the
+// dying peer triggers bdev_nvme_failover_ctrlr reactively (no cooldown),
+// starving the local reactor until ctrlr_loss fires and the ctrlr is reaped.
+// At 15s we saw spdk_tgt crash with broken-pipe on /var/tmp/spdk.sock. 3s
+// trims the spam window below the liveness threshold.
+//
+// rebuildCtrlrLossTimeoutSec / rebuildFastIOFailTimeoutSec apply only to the
+// three rebuild-path bdev_nvme attachments in replica.go (clone src->dst,
+// rebuild src->dst-rebuilding-lvol, rebuild dst->src-snapshot). Rebuild is
+// inherently restartable, so sub-second failover is safe here and makes
+// teardown-during-rebuild crash-proof.
 var (
-	replicaCtrlrLossTimeoutSec  = 15
+	replicaCtrlrLossTimeoutSec  = 3
 	replicaReconnectDelaySec    = 2
 	replicaFastIOFailTimeoutSec = 10
 	replicaTransportAckTimeout  = 10
 	replicaKeepAliveTimeoutMs   = 10000
+
+	// SPDK bdev_nvme invariants enforced by bdev_nvme_check_io_error_resiliency_params:
+	//   ctrlr_loss_timeout_sec == 0 requires reconnect_delay_sec == 0 (no retry)
+	//   ctrlr_loss_timeout_sec  > 0 requires 0 < reconnect_delay_sec <= ctrlr_loss_timeout_sec
+	//   fast_io_fail_timeout_sec (when > 0) must be <= ctrlr_loss_timeout_sec
+	//
+	// (2, 1, 2) gives the rebuild path a 2 s hard ceiling on retry exposure
+	// (one reconnect attempt after 1 s, in-flight IOs fail after 2 s). That is
+	// ~7x tighter than the upstream (15, 2, 10) default which at 15 s let a
+	// dying peer spam bdev_nvme_failover_ctrlr_unsafe fast enough to saturate
+	// the reactor poller and crash spdk_tgt with a broken /var/tmp/spdk.sock.
+	// Rebuild is restartable, so a 2 s tolerance for transient RDMA blips is
+	// fine and the manager restarts from scratch on harder failures.
+	rebuildCtrlrLossTimeoutSec  = 2
+	rebuildReconnectDelaySec    = 1
+	rebuildFastIOFailTimeoutSec = 2
 
 	// defaultLvolClearMethod controls the clear_method passed to
 	// bdev_lvol_create_lvstore and bdev_lvol_create. Empty string means
@@ -99,6 +128,9 @@ func init() {
 	replicaFastIOFailTimeoutSec = envIntOrDefault("LONGHORN_V2_REPLICA_FAST_IO_FAIL_TIMEOUT_SEC", replicaFastIOFailTimeoutSec)
 	replicaTransportAckTimeout = envIntOrDefault("LONGHORN_V2_REPLICA_TRANSPORT_ACK_TIMEOUT", replicaTransportAckTimeout)
 	replicaKeepAliveTimeoutMs = envIntOrDefault("LONGHORN_V2_REPLICA_KEEP_ALIVE_TIMEOUT_MS", replicaKeepAliveTimeoutMs)
+	rebuildCtrlrLossTimeoutSec = envIntOrDefault("LONGHORN_V2_REBUILD_CTRLR_LOSS_TIMEOUT_SEC", rebuildCtrlrLossTimeoutSec)
+	rebuildFastIOFailTimeoutSec = envIntOrDefault("LONGHORN_V2_REBUILD_FAST_IO_FAIL_TIMEOUT_SEC", rebuildFastIOFailTimeoutSec)
+	rebuildReconnectDelaySec = envIntOrDefault("LONGHORN_V2_REBUILD_RECONNECT_DELAY_SEC", rebuildReconnectDelaySec)
 	if v, ok := os.LookupEnv("LONGHORN_V2_LVOL_CLEAR_METHOD"); ok {
 		defaultLvolClearMethod = strings.TrimSpace(v)
 	}

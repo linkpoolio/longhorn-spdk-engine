@@ -125,10 +125,19 @@ func splitHostPort(address string) (string, int32, error) {
 }
 
 func connectNVMfBdev(spdkClient *spdkclient.Client, controllerName, address string, ctrlrLossTimeout, fastIOFailTimeoutSec int, maxRetries int, retryInterval time.Duration) (bdevName string, err error) {
-	return connectNVMfBdevWithTransport(spdkClient, controllerName, address, DefaultNvmfTransport, ctrlrLossTimeout, fastIOFailTimeoutSec, maxRetries, retryInterval)
+	return connectNVMfBdevWithReconnect(spdkClient, controllerName, address, DefaultNvmfTransport, ctrlrLossTimeout, replicaReconnectDelaySec, fastIOFailTimeoutSec, maxRetries, retryInterval)
 }
 
 func connectNVMfBdevWithTransport(spdkClient *spdkclient.Client, controllerName, address string, transport NvmfTransportType, ctrlrLossTimeout, fastIOFailTimeoutSec int, maxRetries int, retryInterval time.Duration) (bdevName string, err error) {
+	return connectNVMfBdevWithReconnect(spdkClient, controllerName, address, transport, ctrlrLossTimeout, replicaReconnectDelaySec, fastIOFailTimeoutSec, maxRetries, retryInterval)
+}
+
+// connectNVMfBdevWithReconnect is the full-option variant. SPDK requires
+// reconnectDelaySec <= ctrlrLossTimeoutSec (both in seconds, 0 = disabled).
+// Rebuild-path callers should pass rebuildCtrlrLossTimeoutSec +
+// rebuildReconnectDelaySec so a teardown-during-rebuild cannot spam the
+// reactor with indefinite failover retries.
+func connectNVMfBdevWithReconnect(spdkClient *spdkclient.Client, controllerName, address string, transport NvmfTransportType, ctrlrLossTimeout, reconnectDelay, fastIOFailTimeoutSec int, maxRetries int, retryInterval time.Duration) (bdevName string, err error) {
 	if controllerName == "" || address == "" {
 		return "", fmt.Errorf("controllerName or address is empty")
 	}
@@ -164,7 +173,7 @@ func connectNVMfBdevWithTransport(spdkClient *spdkclient.Client, controllerName,
 				spdkTransport,
 				spdktypes.NvmeAddressFamilyIPv4,
 				int32(ctrlrLossTimeout),
-				int32(replicaReconnectDelaySec),
+				int32(reconnectDelay),
 				int32(fastIOFailTimeoutSec),
 				replicaMultipath,
 			)
@@ -183,7 +192,7 @@ func connectNVMfBdevWithTransport(spdkClient *spdkclient.Client, controllerName,
 	)
 
 	if err != nil {
-		nvmeBdevNameList, err = attemptTCPFallback(spdkClient, controllerName, ip, port, ctrlrLossTimeout, fastIOFailTimeoutSec, transport, err)
+		nvmeBdevNameList, err = attemptTCPFallback(spdkClient, controllerName, ip, port, ctrlrLossTimeout, reconnectDelay, fastIOFailTimeoutSec, transport, err)
 		if err != nil {
 			return "", fmt.Errorf("attach NVMe controller failed after %d attempts: %w", maxRetries, err)
 		}
@@ -196,7 +205,7 @@ func connectNVMfBdevWithTransport(spdkClient *spdkclient.Client, controllerName,
 	return nvmeBdevNameList[0], nil
 }
 
-func attemptTCPFallback(spdkClient *spdkclient.Client, controllerName, ip, port string, ctrlrLossTimeout, fastIOFailTimeoutSec int, originalTransport NvmfTransportType, primaryErr error) ([]string, error) {
+func attemptTCPFallback(spdkClient *spdkclient.Client, controllerName, ip, port string, ctrlrLossTimeout, reconnectDelay, fastIOFailTimeoutSec int, originalTransport NvmfTransportType, primaryErr error) ([]string, error) {
 	primaryPort, parseErr := strconv.Atoi(port)
 	if parseErr != nil {
 		return nil, primaryErr
@@ -220,7 +229,7 @@ func attemptTCPFallback(spdkClient *spdkclient.Client, controllerName, ip, port 
 		spdktypes.NvmeTransportTypeTCP,
 		spdktypes.NvmeAddressFamilyIPv4,
 		int32(ctrlrLossTimeout),
-		int32(replicaReconnectDelaySec),
+		int32(reconnectDelay),
 		int32(fastIOFailTimeoutSec),
 		replicaMultipath,
 	)
