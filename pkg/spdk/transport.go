@@ -72,10 +72,10 @@ var (
 		MaxIoSize:           131072,
 		IoUnitSize:          8192, // SPDK-defined RDMA minimum; larger is chained by SPDK anyway
 		MaxAqDepth:          128,
-		NumSharedBuffers:    4095,
+		NumSharedBuffers:    2047,
 		BufCacheSize:        64,
 		Zcopy:               boolPtr(true),
-		DataWrPoolSize:      4095,
+		DataWrPoolSize:      2047,
 		AcceptorPollRate:    10000,
 	}
 	nvmfTcpOpts = spdktypes.NvmfCreateTransportRequest{
@@ -86,7 +86,7 @@ var (
 		MaxIoSize:           131072,
 		IoUnitSize:          131072,
 		MaxAqDepth:          128,
-		NumSharedBuffers:    4095,
+		NumSharedBuffers:    2047,
 		BufCacheSize:        64,
 		Zcopy:               boolPtr(true),
 		AcceptorPollRate:    10000,
