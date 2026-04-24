@@ -93,6 +93,16 @@ func NewServer(ctx context.Context, portStart, portEnd int32) (*Server, error) {
 		return nil, errors.Wrap(err, "failed to set NVMe options")
 	}
 
+	// Grow the iobuf pools before any transport is created. Our tuned nvmf
+	// transport opts (num_shared_buffers=4095, buf_cache_size=64) need
+	// considerably more buffers than the SPDK default pools (large=1024,
+	// small=8192) — accel and the bdev channels otherwise fail with -ENOMEM.
+	if _, err = cli.IobufSetOptions(iobufSmallPoolCount, iobufLargePoolCount, 0, 0); err != nil {
+		logrus.WithError(err).Warn("Failed to grow iobuf pools; transport create may fail with ENOMEM")
+	} else {
+		logrus.Infof("Grew iobuf pools to small=%d large=%d before transport create", iobufSmallPoolCount, iobufLargePoolCount)
+	}
+
 	nodeTransport := NegotiateNodeTransport(cli)
 	StartTransportReprobe(ctx, cli, nodeTransport)
 

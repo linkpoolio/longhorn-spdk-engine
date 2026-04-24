@@ -1206,6 +1206,36 @@ func (c *Client) NvmfCreateTransportWithOpts(req spdktypes.NvmfCreateTransportRe
 	return created, json.Unmarshal(cmdOutput, &created)
 }
 
+// IobufSetOptions configures the global SPDK iobuf pool used by all subsystems
+// (accel, bdev, nvmf, etc). Must be called before any iobuf consumer
+// initialises its channels; otherwise returns "option not permitted" or
+// leaves consumers with empty caches.
+//
+// Default SPDK sizes (large_pool_count=1024, small_pool_count=8192) are not
+// enough once nvmf transport opts are tuned — a single nvmf transport with
+// num_shared_buffers=4095 + buf_cache_size=64 per poll group exceeds the
+// large pool and accel fails to create its channel with -ENOMEM.
+func (c *Client) IobufSetOptions(smallPoolCount, largePoolCount uint64, smallBufsizeKB, largeBufsizeKB uint32) (result bool, err error) {
+	req := map[string]interface{}{}
+	if smallPoolCount > 0 {
+		req["small_pool_count"] = smallPoolCount
+	}
+	if largePoolCount > 0 {
+		req["large_pool_count"] = largePoolCount
+	}
+	if smallBufsizeKB > 0 {
+		req["small_bufsize"] = smallBufsizeKB * 1024
+	}
+	if largeBufsizeKB > 0 {
+		req["large_bufsize"] = largeBufsizeKB * 1024
+	}
+	cmdOutput, err := c.jsonCli.SendCommand("iobuf_set_options", req)
+	if err != nil {
+		return false, err
+	}
+	return result, json.Unmarshal(cmdOutput, &result)
+}
+
 // NvmfGetTransports lists all transports if no parameters specified.
 //
 //	"trtype": Optional. Transport type, "tcp" or "rdma"
