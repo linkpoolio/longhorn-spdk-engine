@@ -2580,8 +2580,8 @@ func (r *Replica) SnapshotCloneSrcStart(spdkClient *spdkclient.Client, snapshotN
 	}
 
 	dstCloningLvolName := GetReplicaCloningLvolName(dstReplicaName)
-	dstCloningBdevName, err := connectNVMfBdevWithTransport(spdkClient, dstCloningLvolName, dstCloningLvolAddress, r.transport(),
-		rebuildCtrlrLossTimeoutSec, rebuildFastIOFailTimeoutSec, maxRetries, retryInterval)
+	dstCloningBdevName, err := connectNVMfBdevWithReconnect(spdkClient, dstCloningLvolName, dstCloningLvolAddress, r.transport(),
+		rebuildCtrlrLossTimeoutSec, rebuildReconnectDelaySec, rebuildFastIOFailTimeoutSec, maxRetries, retryInterval)
 	if err != nil {
 		return err
 	}
@@ -2798,7 +2798,7 @@ func (r *Replica) rebuildingSrcAttachNoLock(spdkClient *spdkclient.Client, dstRe
 		return nil
 	}
 
-	r.rebuildingSrcCache.dstRebuildingBdevName, err = connectNVMfBdevWithTransport(spdkClient, dstRebuildingLvolName, dstRebuildingLvolAddress, r.transport(), rebuildCtrlrLossTimeoutSec, rebuildFastIOFailTimeoutSec, maxRetries, retryInterval)
+	r.rebuildingSrcCache.dstRebuildingBdevName, err = connectNVMfBdevWithReconnect(spdkClient, dstRebuildingLvolName, dstRebuildingLvolAddress, r.transport(), rebuildCtrlrLossTimeoutSec, rebuildReconnectDelaySec, rebuildFastIOFailTimeoutSec, maxRetries, retryInterval)
 	if err != nil {
 		return errors.Wrapf(err, "failed to connect rebuilding lvol %s with address %s as a NVMe bdev for replica %s rebuilding src attach", dstRebuildingLvolName, dstRebuildingLvolAddress, r.Name)
 	}
@@ -3226,8 +3226,8 @@ func (r *Replica) RebuildingDstStart(spdkClient *spdkclient.Client, srcReplicaNa
 	}
 
 	externalSnapshotLvolName := GetReplicaSnapshotLvolName(srcReplicaName, externalSnapshotName)
-	externalSnapshotBdevName, err := connectNVMfBdevWithTransport(spdkClient, externalSnapshotLvolName, externalSnapshotAddress, r.transport(),
-		rebuildCtrlrLossTimeoutSec, rebuildFastIOFailTimeoutSec, maxRetries, retryInterval)
+	externalSnapshotBdevName, err := connectNVMfBdevWithReconnect(spdkClient, externalSnapshotLvolName, externalSnapshotAddress, r.transport(),
+		rebuildCtrlrLossTimeoutSec, rebuildReconnectDelaySec, rebuildFastIOFailTimeoutSec, maxRetries, retryInterval)
 	if err != nil {
 		return "", errors.Wrapf(err, "failed to connect the external src snapshot lvol %s with address %s as a NVMf bdev for dst replica %v rebuilding start", externalSnapshotLvolName, externalSnapshotAddress, r.Name)
 	}

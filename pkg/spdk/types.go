@@ -78,6 +78,12 @@ var (
 
 	rebuildCtrlrLossTimeoutSec  = 1
 	rebuildFastIOFailTimeoutSec = 1
+	// SPDK requires reconnect_delay_sec <= ctrlr_loss_timeout_sec; 0 disables
+	// reconnects entirely, which is what we want on a rebuild attach — if the
+	// src's snap-rebuild subsystem disappears mid-shallow_copy we fail fast
+	// and let the manager restart rebuilding rather than hammering the dead
+	// peer and starving the reactor.
+	rebuildReconnectDelaySec = 0
 
 	// defaultLvolClearMethod controls the clear_method passed to
 	// bdev_lvol_create_lvstore and bdev_lvol_create. Empty string means
@@ -117,6 +123,7 @@ func init() {
 	replicaKeepAliveTimeoutMs = envIntOrDefault("LONGHORN_V2_REPLICA_KEEP_ALIVE_TIMEOUT_MS", replicaKeepAliveTimeoutMs)
 	rebuildCtrlrLossTimeoutSec = envIntOrDefault("LONGHORN_V2_REBUILD_CTRLR_LOSS_TIMEOUT_SEC", rebuildCtrlrLossTimeoutSec)
 	rebuildFastIOFailTimeoutSec = envIntOrDefault("LONGHORN_V2_REBUILD_FAST_IO_FAIL_TIMEOUT_SEC", rebuildFastIOFailTimeoutSec)
+	rebuildReconnectDelaySec = envIntOrDefault("LONGHORN_V2_REBUILD_RECONNECT_DELAY_SEC", rebuildReconnectDelaySec)
 	if v, ok := os.LookupEnv("LONGHORN_V2_LVOL_CLEAR_METHOD"); ok {
 		defaultLvolClearMethod = strings.TrimSpace(v)
 	}
