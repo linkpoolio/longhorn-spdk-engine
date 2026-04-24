@@ -75,6 +75,13 @@ var (
 	replicaFastIOFailTimeoutSec = 10
 	replicaTransportAckTimeout  = 10
 	replicaKeepAliveTimeoutMs   = 10000
+	// replicaTransportTos tags outbound NVMe-oF packets with DSCP so the
+	// NIC places them in the correct traffic class. For our ma-production
+	// RoCEv2 fabric PFC is enabled on the lossless class identified by
+	// DSCP 26 (AF31 / class 3). Set to 0 on networks where PFC isn't
+	// configured — tagging into a class the switches don't honour can get
+	// packets dropped. Override via LONGHORN_V2_REPLICA_TRANSPORT_TOS.
+	replicaTransportTos = 26
 
 	// SPDK bdev_nvme invariants enforced by bdev_nvme_check_io_error_resiliency_params:
 	//   ctrlr_loss_timeout_sec == 0 requires reconnect_delay_sec == 0 (no retry)
@@ -128,6 +135,7 @@ func init() {
 	replicaFastIOFailTimeoutSec = envIntOrDefault("LONGHORN_V2_REPLICA_FAST_IO_FAIL_TIMEOUT_SEC", replicaFastIOFailTimeoutSec)
 	replicaTransportAckTimeout = envIntOrDefault("LONGHORN_V2_REPLICA_TRANSPORT_ACK_TIMEOUT", replicaTransportAckTimeout)
 	replicaKeepAliveTimeoutMs = envIntOrDefault("LONGHORN_V2_REPLICA_KEEP_ALIVE_TIMEOUT_MS", replicaKeepAliveTimeoutMs)
+	replicaTransportTos = envIntOrDefault("LONGHORN_V2_REPLICA_TRANSPORT_TOS", replicaTransportTos)
 	rebuildCtrlrLossTimeoutSec = envIntOrDefault("LONGHORN_V2_REBUILD_CTRLR_LOSS_TIMEOUT_SEC", rebuildCtrlrLossTimeoutSec)
 	rebuildFastIOFailTimeoutSec = envIntOrDefault("LONGHORN_V2_REBUILD_FAST_IO_FAIL_TIMEOUT_SEC", rebuildFastIOFailTimeoutSec)
 	rebuildReconnectDelaySec = envIntOrDefault("LONGHORN_V2_REBUILD_RECONNECT_DELAY_SEC", rebuildReconnectDelaySec)

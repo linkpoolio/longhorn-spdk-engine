@@ -83,12 +83,13 @@ func NewServer(ctx context.Context, portStart, portEnd int32) (*Server, error) {
 		return nil, err
 	}
 
-	if _, err = cli.BdevNvmeSetOptions(
+	if _, err = cli.BdevNvmeSetOptionsWithTos(
 		int32(replicaCtrlrLossTimeoutSec),
 		int32(replicaReconnectDelaySec),
 		int32(replicaFastIOFailTimeoutSec),
 		int32(replicaTransportAckTimeout),
-		int32(replicaKeepAliveTimeoutMs)); err != nil {
+		int32(replicaKeepAliveTimeoutMs),
+		int32(replicaTransportTos)); err != nil {
 		return nil, errors.Wrap(err, "failed to set NVMe options")
 	}
 
