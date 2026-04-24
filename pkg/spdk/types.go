@@ -76,14 +76,21 @@ var (
 	replicaTransportAckTimeout  = 10
 	replicaKeepAliveTimeoutMs   = 10000
 
-	rebuildCtrlrLossTimeoutSec  = 1
-	rebuildFastIOFailTimeoutSec = 1
-	// SPDK requires reconnect_delay_sec <= ctrlr_loss_timeout_sec; 0 disables
-	// reconnects entirely, which is what we want on a rebuild attach — if the
-	// src's snap-rebuild subsystem disappears mid-shallow_copy we fail fast
-	// and let the manager restart rebuilding rather than hammering the dead
-	// peer and starving the reactor.
-	rebuildReconnectDelaySec = 0
+	// SPDK bdev_nvme invariants enforced by bdev_nvme_check_io_error_resiliency_params:
+	//   ctrlr_loss_timeout_sec == 0 requires reconnect_delay_sec == 0 (no retry)
+	//   ctrlr_loss_timeout_sec  > 0 requires 0 < reconnect_delay_sec <= ctrlr_loss_timeout_sec
+	//   fast_io_fail_timeout_sec (when > 0) must be <= ctrlr_loss_timeout_sec
+	//
+	// (2, 1, 2) gives the rebuild path a 2 s hard ceiling on retry exposure
+	// (one reconnect attempt after 1 s, in-flight IOs fail after 2 s). That is
+	// ~7x tighter than the upstream (15, 2, 10) default which at 15 s let a
+	// dying peer spam bdev_nvme_failover_ctrlr_unsafe fast enough to saturate
+	// the reactor poller and crash spdk_tgt with a broken /var/tmp/spdk.sock.
+	// Rebuild is restartable, so a 2 s tolerance for transient RDMA blips is
+	// fine and the manager restarts from scratch on harder failures.
+	rebuildCtrlrLossTimeoutSec  = 2
+	rebuildReconnectDelaySec    = 1
+	rebuildFastIOFailTimeoutSec = 2
 
 	// defaultLvolClearMethod controls the clear_method passed to
 	// bdev_lvol_create_lvstore and bdev_lvol_create. Empty string means
