@@ -972,7 +972,7 @@ func (r *Replica) prepareHead(spdkClient *spdkclient.Client, backingImage *Backi
 			}
 			r.log.Infof("Replica cloned a new head lvol from the parent lvol %s", headParentLvol.Name)
 		} else {
-			if _, err := spdkClient.BdevLvolCreate("", r.LvsUUID, r.Name, util.BytesToMiB(r.SpecSize), spdktypes.BdevLvolClearMethod(defaultLvolClearMethod), true); err != nil {
+			if _, err := spdkClient.BdevLvolCreate("", r.LvsUUID, r.Name, util.BytesToMiB(r.SpecSize), spdktypes.BdevLvolClearMethod(defaultLvolClearMethod), defaultThinProvision); err != nil {
 				return err
 			}
 			r.log.Info("Replica created a new head lvol")
@@ -2169,7 +2169,7 @@ func (r *Replica) SnapshotCloneDstStart(spdkClient *spdkclient.Client, snapshotN
 	// Create cloning lvol and expose it
 	cloningLvolName := GetReplicaCloningLvolName(r.Name)
 	if _, err = spdkClient.BdevLvolCreate("", r.LvsUUID, cloningLvolName, util.BytesToMiB(r.SpecSize),
-		spdktypes.BdevLvolClearMethod(defaultLvolClearMethod), true); err != nil {
+		spdktypes.BdevLvolClearMethod(defaultLvolClearMethod), defaultThinProvision); err != nil {
 		return err
 	}
 	cloningLvolAlias := spdktypes.GetLvolAlias(r.LvsName, cloningLvolName)
@@ -3671,7 +3671,7 @@ func (r *Replica) rebuildingDstShallowCopyPrepare(spdkClient *spdkclient.Client,
 				return "", false, err
 			}
 		} else {
-			if _, err = spdkClient.BdevLvolCreate("", r.LvsUUID, rebuildingLvolName, util.BytesToMiB(r.SpecSize), spdktypes.BdevLvolClearMethod(defaultLvolClearMethod), true); err != nil {
+			if _, err = spdkClient.BdevLvolCreate("", r.LvsUUID, rebuildingLvolName, util.BytesToMiB(r.SpecSize), spdktypes.BdevLvolClearMethod(defaultLvolClearMethod), defaultThinProvision); err != nil {
 				return "", false, err
 			}
 		}
