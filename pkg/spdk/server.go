@@ -83,6 +83,17 @@ func NewServer(ctx context.Context, portStart, portEnd int32) (*Server, error) {
 		return nil, err
 	}
 
+	// spdk_tgt is started with --wait-for-rpc by the IM entrypoint so that
+	// these tunables land BEFORE the iobuf/nvmf subsystems initialise:
+	//   iobuf_set_options → growing pools post-init is a no-op
+	//   bdev_nvme_set_options → ditto, the initiator defaults are frozen on init
+	// Then framework_start_init drives subsystem init with the tuned opts.
+	if _, err = cli.IobufSetOptions(iobufSmallPoolCount, iobufLargePoolCount, 0, 0); err != nil {
+		logrus.WithError(err).Warn("Failed to grow iobuf pools before init; transport create may fail with ENOMEM")
+	} else {
+		logrus.Infof("Grew iobuf pools to small=%d large=%d before subsystem init", iobufSmallPoolCount, iobufLargePoolCount)
+	}
+
 	if _, err = cli.BdevNvmeSetOptionsWithTos(
 		int32(replicaCtrlrLossTimeoutSec),
 		int32(replicaReconnectDelaySec),
@@ -93,15 +104,13 @@ func NewServer(ctx context.Context, portStart, portEnd int32) (*Server, error) {
 		return nil, errors.Wrap(err, "failed to set NVMe options")
 	}
 
-	// Grow the iobuf pools before any transport is created. Our tuned nvmf
-	// transport opts (num_shared_buffers=4095, buf_cache_size=64) need
-	// considerably more buffers than the SPDK default pools (large=1024,
-	// small=8192) — accel and the bdev channels otherwise fail with -ENOMEM.
-	if _, err = cli.IobufSetOptions(iobufSmallPoolCount, iobufLargePoolCount, 0, 0); err != nil {
-		logrus.WithError(err).Warn("Failed to grow iobuf pools; transport create may fail with ENOMEM")
-	} else {
-		logrus.Infof("Grew iobuf pools to small=%d large=%d before transport create", iobufSmallPoolCount, iobufLargePoolCount)
+	if _, err = cli.FrameworkStartInit(); err != nil {
+		return nil, errors.Wrap(err, "failed to start SPDK subsystem init")
 	}
+	if _, err = cli.FrameworkWaitInit(); err != nil {
+		return nil, errors.Wrap(err, "failed to wait for SPDK subsystem init")
+	}
+	logrus.Info("SPDK subsystem init complete")
 
 	nodeTransport := NegotiateNodeTransport(cli)
 	StartTransportReprobe(ctx, cli, nodeTransport)
