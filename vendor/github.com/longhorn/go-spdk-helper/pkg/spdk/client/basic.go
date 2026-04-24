@@ -1206,6 +1206,36 @@ func (c *Client) NvmfCreateTransportWithOpts(req spdktypes.NvmfCreateTransportRe
 	return created, json.Unmarshal(cmdOutput, &created)
 }
 
+// FrameworkStartInit tells spdk_tgt (started with --wait-for-rpc) to proceed
+// with subsystem initialisation. The paired pattern is:
+//
+//  1. spdk_tgt --wait-for-rpc starts and exposes the RPC socket but doesn't
+//     init subsystems
+//  2. caller sends iobuf_set_options / bdev_nvme_set_options / ... to tune
+//     anything that must be configured before init
+//  3. caller sends framework_start_init — spdk_tgt initialises subsystems
+//     with the tuned opts
+//
+// Without --wait-for-rpc this RPC is a no-op (subsystems are already up).
+func (c *Client) FrameworkStartInit() (result bool, err error) {
+	cmdOutput, err := c.jsonCli.SendCommand("framework_start_init", nil)
+	if err != nil {
+		return false, err
+	}
+	return result, json.Unmarshal(cmdOutput, &result)
+}
+
+// FrameworkWaitInit blocks until SPDK reports subsystem init is complete.
+// Useful after FrameworkStartInit so callers don't race disk/bdev creation
+// against subsystem init.
+func (c *Client) FrameworkWaitInit() (result bool, err error) {
+	cmdOutput, err := c.jsonCli.SendCommand("framework_wait_init", nil)
+	if err != nil {
+		return false, err
+	}
+	return result, json.Unmarshal(cmdOutput, &result)
+}
+
 // IobufSetOptions configures the global SPDK iobuf pool used by all subsystems
 // (accel, bdev, nvmf, etc). Must be called before any iobuf consumer
 // initialises its channels; otherwise returns "option not permitted" or
