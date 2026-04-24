@@ -222,9 +222,22 @@ func (e *Engine) resolveCntlidRange() (uint16, uint16) {
 }
 
 type EngineReplicaStatus struct {
-	Address  string
-	BdevName string
-	Mode     types.Mode
+	// Address is the canonical NVMe-oF address for this replica as supplied
+	// by the manager in spec.replicaAddressMap (the replica's primary
+	// listener). This is what we report back to the manager so its
+	// reconciler can match replicas by address. For the address the engine
+	// actually dialed — which may differ when we pick the TCP fallback
+	// listener because our node transport doesn't match the replica's
+	// primary — see DialedAddress.
+	Address string
+	// DialedAddress is the NVMe-oF address the engine's bdev_nvme
+	// controller is actually attached to. Equal to Address when the engine
+	// and replica transports match; equal to the replica's tcpAddress (on
+	// port+1) when the engine fell back to TCP against an RDMA-primary
+	// replica listener. Reconnect/attach paths must dial this, not Address.
+	DialedAddress string
+	BdevName      string
+	Mode          types.Mode
 	// Transport records the NVMe-oF transport the engine picked for this
 	// replica at Create time, so that reconnect paths (snapshot revert,
 	// expand, salvage) can dial the right transport instead of defaulting
@@ -243,6 +256,21 @@ func (s *EngineReplicaStatus) transportOrDefault(def NvmfTransportType) NvmfTran
 		return def
 	}
 	return s.Transport
+}
+
+// dialAddress returns the address to use when re-attaching the NVMe-oF
+// controller for this replica: the actually-dialed fallback address when the
+// engine picked it at Create time, otherwise the canonical primary address.
+// Records persisted before DialedAddress was added keep working because
+// Address held the dialed value in that era.
+func (s *EngineReplicaStatus) dialAddress() string {
+	if s == nil {
+		return ""
+	}
+	if s.DialedAddress != "" {
+		return s.DialedAddress
+	}
+	return s.Address
 }
 
 func NewEngine(engineName, volumeName, frontend string, specSize uint64, replicaTransport NvmfTransportType, engineUpdateCh chan interface{}) *Engine {
@@ -508,13 +536,14 @@ func (e *Engine) connectReplicas(spdkClient *spdkclient.Client, replicaAddressMa
 	for replicaName, replicaAddr := range replicaAddressMap {
 		addr, transport := e.pickReplicaAddress(replicaName, replicaAddr, replicaTransportAddressMap)
 		e.ReplicaStatusMap[replicaName] = &EngineReplicaStatus{
-			Address:   addr,
-			Transport: transport,
+			Address:       replicaAddr,
+			DialedAddress: addr,
+			Transport:     transport,
 		}
 
 		bdevName, err := connectNVMfBdevWithTransport(spdkClient, replicaName, addr, transport, e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
 		if err != nil {
-			e.log.WithError(err).Warnf("Failed to get bdev from replica %s with address %s (transport=%s) during engine creation, will mark the mode to ERR and continue", replicaName, addr, transport)
+			e.log.WithError(err).Warnf("Failed to get bdev from replica %s with canonical address %s dialed at %s (transport=%s) during engine creation, will mark the mode to ERR and continue", replicaName, replicaAddr, addr, transport)
 			e.ReplicaStatusMap[replicaName].Mode = types.ModeERR
 		} else {
 			// TODO: Check if a replica is really a RW replica rather than a rebuilding failed replica
@@ -2011,7 +2040,7 @@ func (e *Engine) replicaSnapshotOperation(spdkClient *spdkclient.Client, replica
 		if err := replicaClient.ReplicaSnapshotRevert(replicaName, snapshotName); err != nil {
 			return err
 		}
-		bdevName, err := connectNVMfBdevWithTransport(spdkClient, replicaName, replicaStatus.Address, replicaStatus.transportOrDefault(e.replicaTransport()), e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
+		bdevName, err := connectNVMfBdevWithTransport(spdkClient, replicaName, replicaStatus.dialAddress(), replicaStatus.transportOrDefault(e.replicaTransport()), e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
 		if err != nil {
 			return err
 		}
@@ -2849,7 +2878,7 @@ func (e *Engine) expandSingleReplica(spdkClient *spdkclient.Client, replicaName 
 		return err
 	}
 
-	_, err = connectNVMfBdevWithTransport(spdkClient, replicaName, replicaStatus.Address, replicaStatus.transportOrDefault(e.replicaTransport()), e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
+	_, err = connectNVMfBdevWithTransport(spdkClient, replicaName, replicaStatus.dialAddress(), replicaStatus.transportOrDefault(e.replicaTransport()), e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
 	return err
 }
 
