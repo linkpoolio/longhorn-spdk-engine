@@ -104,6 +104,19 @@ func NewServer(ctx context.Context, portStart, portEnd int32) (*Server, error) {
 		return nil, errors.Wrap(err, "failed to set NVMe options")
 	}
 
+	// Register accel_mlx5 only on RDMA-capable nodes. SPDK is built with
+	// --with-rdma=mlx5_dv so the module is present in the binary, but we
+	// only scan/register it where Mellanox hardware is actually expected.
+	// On TCP-only workers DetectTransport() returns RDMA=false; sw_accel
+	// remains assigned to all ops (correct fallback).
+	if DetectTransport().RDMA {
+		if _, err = cli.Mlx5ScanAccelModule(); err != nil {
+			logrus.WithError(err).Warn("Failed to register accel_mlx5 driver; falling back to sw_accel for RDMA UMR registration (per-op CPU memcpy)")
+		} else {
+			logrus.Info("Registered accel_mlx5 driver for RDMA UMR per-IO acceleration")
+		}
+	}
+
 	if _, err = cli.FrameworkStartInit(); err != nil {
 		return nil, errors.Wrap(err, "failed to start SPDK subsystem init")
 	}
