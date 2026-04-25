@@ -1266,6 +1266,23 @@ func (c *Client) IobufSetOptions(smallPoolCount, largePoolCount uint64, smallBuf
 	return result, json.Unmarshal(cmdOutput, &result)
 }
 
+// Mlx5ScanAccelModule registers the accel_mlx5 driver and assigns ops (copy,
+// crc32c, etc) to it instead of the software fallback. Must be called during
+// the --wait-for-rpc window (before framework_start_init); SPDK rejects it
+// later with "Method may only be called before framework is initialized".
+//
+// Without this, NVMe-RDMA's UMR-per-IO path (cec5ba284) that "expects accel
+// to register UMR for the data buffer" falls through to sw_accel CPU memcpy,
+// which serializes on the reactor and adds significant per-op latency over
+// RDMA. With it, accel_mlx5 registers UMRs via libmlx5 direct verbs.
+func (c *Client) Mlx5ScanAccelModule() (result bool, err error) {
+	cmdOutput, err := c.jsonCli.SendCommand("mlx5_scan_accel_module", struct{}{})
+	if err != nil {
+		return false, err
+	}
+	return result, json.Unmarshal(cmdOutput, &result)
+}
+
 // NvmfGetTransports lists all transports if no parameters specified.
 //
 //	"trtype": Optional. Transport type, "tcp" or "rdma"
