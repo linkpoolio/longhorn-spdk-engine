@@ -58,33 +58,36 @@ func DetectTransport() TransportCapability {
 	return TransportCapability{}
 }
 
-// Tunables for nvmf_create_transport. Values follow Mayastor's proven set
-// for RDMA on RoCEv2/PFC fabrics with SPDK upstream defaults as the floor
-// elsewhere. data_wr_pool_size is the critical one: SPDK's default of 0
-// forces per-qpair RDMA WR allocation on every submission and caps
-// throughput at hundreds of KB/s.
+// Tunables for nvmf_create_transport. Values match Mayastor's RDMA defaults
+// (openebs/mayastor io-engine src/subsys/config/opts.rs).
 //
-// MaxQueueDepth=512 (vs SPDK default 128) sizes the per-QP NVMe queue and
-// transitively the RDMA recv WR ring. Default 128 matched the kernel
-// initiator's ~120-inflight NVMe queue so bursts of small commands
-// (e.g. mkfs.xfs WRITE_ZEROES on the XFS log + AGs of a 50 TiB volume)
-// saturated the recv ring on every flurry. The NIC ECN-marked the
-// buildup, target sent CNPs, DCQCN throttled the initiator, per-op
-// latency hit ~4 sec while the target lvol still completed in 0.21ms.
-// 4× the recv ring should keep DCQCN out of the per-op path.
+// MaxQueueDepth=32 caps per-QP NVMe SQ/CQ size — the propagated NVMe
+// MaxQueueEntriesSupported the bdev_nvme client picks up when attaching.
+// SPDK upstream default 128 lets the kernel initiator burst ~120 inflight
+// commands per QP; mkfs.xfs WRITE_ZEROES flurries on a 50 TiB volume
+// saturated the RDMA recv ring on the remote replica's target, NIC
+// ECN-marked the buildup, DCQCN throttled the sender, per-op latency
+// hit ~4 sec while target lvol completed in 0.21 ms. Mayastor on the
+// same fabric does NOT show this — the only material transport diff
+// was their MaxQueueDepth=32, which prevents the burst saturation.
+//
+// data_wr_pool_size=4095 (vs SPDK default 0) is critical: default 0
+// forces per-qpair RDMA WR allocation on every submission and caps
+// throughput at hundreds of KB/s. Mayastor uses 4095 (we previously
+// used 2047 — bumping to match).
 var (
 	nvmfRdmaOpts = spdktypes.NvmfCreateTransportRequest{
 		Trtype:              spdktypes.NvmeTransportTypeRDMA,
-		MaxQueueDepth:       512,
-		MaxIoQpairsPerCtrlr: 127,
+		MaxQueueDepth:       32,
+		MaxIoQpairsPerCtrlr: 32,
 		InCapsuleDataSize:   4096,
 		MaxIoSize:           131072,
 		IoUnitSize:          8192, // SPDK-defined RDMA minimum; larger is chained by SPDK anyway
-		MaxAqDepth:          128,
-		NumSharedBuffers:    8192,
+		MaxAqDepth:          32,
+		NumSharedBuffers:    2047,
 		BufCacheSize:        64,
 		Zcopy:               boolPtr(true),
-		DataWrPoolSize:      8192,
+		DataWrPoolSize:      4095,
 		AcceptorPollRate:    10000,
 	}
 	nvmfTcpOpts = spdktypes.NvmfCreateTransportRequest{
