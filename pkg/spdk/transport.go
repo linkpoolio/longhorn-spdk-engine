@@ -58,37 +58,37 @@ func DetectTransport() TransportCapability {
 	return TransportCapability{}
 }
 
-// Tunables for nvmf_create_transport. Values match Mayastor's RDMA defaults
-// (openebs/mayastor io-engine src/subsys/config/opts.rs).
+// Tunables for nvmf_create_transport, all overridable via env. Defaults are:
 //
-// MaxQueueDepth=32 caps per-QP NVMe SQ/CQ size — the propagated NVMe
-// MaxQueueEntriesSupported the bdev_nvme client picks up when attaching.
-// SPDK upstream default 128 lets the kernel initiator burst ~120 inflight
-// commands per QP; mkfs.xfs WRITE_ZEROES flurries on a 50 TiB volume
-// saturated the RDMA recv ring on the remote replica's target, NIC
-// ECN-marked the buildup, DCQCN throttled the sender, per-op latency
-// hit ~4 sec while target lvol completed in 0.21 ms. Mayastor on the
-// same fabric does NOT show this — the only material transport diff
-// was their MaxQueueDepth=32, which prevents the burst saturation.
+//   MaxQueueDepth=128   — SPDK upstream default. Lower values (e.g. 32) were
+//   previously used to mitigate burst saturation that turned out to be caused
+//   by NIC adaptive interrupt coalescing + sw_accel data-buffer copy on the
+//   reactor; with adaptive coalescing off + accel_mlx5 registered for HW UMR,
+//   128 is safe and gives the headroom needed for high-IOPS workloads
+//   (16 cores × 128 = 2048 inflight commands per controller, vs only 512 at
+//   depth=32). Tune via LONGHORN_V2_NVMF_RDMA_MAX_QUEUE_DEPTH if needed.
 //
-// data_wr_pool_size=4095 (vs SPDK default 0) is critical: default 0
-// forces per-qpair RDMA WR allocation on every submission and caps
-// throughput at hundreds of KB/s. Mayastor uses 4095 (we previously
-// used 2047 — bumping to match).
+//   data_wr_pool_size=4095 — critical. SPDK default of 0 forces per-qpair
+//   RDMA WR allocation on every submission and caps throughput at hundreds
+//   of KB/s. Mayastor uses 4095. Override with
+//   LONGHORN_V2_NVMF_RDMA_DATA_WR_POOL_SIZE.
+//
+// IoUnitSize=8192 is the SPDK-defined RDMA minimum; SPDK chains larger I/Os.
+// MaxIoSize=131072 matches kernel's max_hw_sectors_kb.
 var (
 	nvmfRdmaOpts = spdktypes.NvmfCreateTransportRequest{
 		Trtype:              spdktypes.NvmeTransportTypeRDMA,
-		MaxQueueDepth:       32,
-		MaxIoQpairsPerCtrlr: 32,
-		InCapsuleDataSize:   4096,
-		MaxIoSize:           131072,
-		IoUnitSize:          8192, // SPDK-defined RDMA minimum; larger is chained by SPDK anyway
-		MaxAqDepth:          32,
-		NumSharedBuffers:    2047,
-		BufCacheSize:        64,
+		MaxQueueDepth:       uint32(envIntOrDefault("LONGHORN_V2_NVMF_RDMA_MAX_QUEUE_DEPTH", 128)),
+		MaxIoQpairsPerCtrlr: uint32(envIntOrDefault("LONGHORN_V2_NVMF_RDMA_MAX_IO_QPAIRS_PER_CTRLR", 127)),
+		InCapsuleDataSize:   uint32(envIntOrDefault("LONGHORN_V2_NVMF_RDMA_IN_CAPSULE_DATA_SIZE", 4096)),
+		MaxIoSize:           uint32(envIntOrDefault("LONGHORN_V2_NVMF_RDMA_MAX_IO_SIZE", 131072)),
+		IoUnitSize:          uint32(envIntOrDefault("LONGHORN_V2_NVMF_RDMA_IO_UNIT_SIZE", 8192)),
+		MaxAqDepth:          uint32(envIntOrDefault("LONGHORN_V2_NVMF_RDMA_MAX_AQ_DEPTH", 128)),
+		NumSharedBuffers:    uint32(envIntOrDefault("LONGHORN_V2_NVMF_RDMA_NUM_SHARED_BUFFERS", 4095)),
+		BufCacheSize:        uint32(envIntOrDefault("LONGHORN_V2_NVMF_RDMA_BUF_CACHE_SIZE", 64)),
 		Zcopy:               boolPtr(true),
-		DataWrPoolSize:      4095,
-		AcceptorPollRate:    10000,
+		DataWrPoolSize:      uint32(envIntOrDefault("LONGHORN_V2_NVMF_RDMA_DATA_WR_POOL_SIZE", 4095)),
+		AcceptorPollRate:    uint32(envIntOrDefault("LONGHORN_V2_NVMF_RDMA_ACCEPTOR_POLL_RATE", 10000)),
 	}
 	nvmfTcpOpts = spdktypes.NvmfCreateTransportRequest{
 		Trtype:              spdktypes.NvmeTransportTypeTCP,
