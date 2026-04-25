@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -95,6 +96,19 @@ var (
 	iobufLargePoolCount uint64 = 4096
 	iobufSmallPoolCount uint64 = 8192
 
+	// accelMlx5MkeysPerCore is the per-core scaling factor for accel_mlx5's
+	// mkey pool. SPDK enforces a minimum of ACCEL_MLX5_MAX_MKEYS_IN_TASK(16)
+	// mkeys per core. SPDK upstream default is 2047 total (≈127/core on a
+	// 16-core node) which triggers ENOMEM during signature-mkey alloc on
+	// ConnectX-6 Dx fw 22.43.2566 (NIC advertises crc32c capability but
+	// firmware can't back 2047 PSVs).
+	//
+	// 64/core (= 1024 on a 16-core node) is a middle ground: 4× the SPDK
+	// floor so each core can have ~4 in-flight tasks using max mkeys, and
+	// half the failing default so we stay clear of the NIC's PSV ceiling.
+	// Override with LONGHORN_V2_ACCEL_MLX5_NUM_REQUESTS for tuning.
+	accelMlx5MkeysPerCore uint32 = 64
+
 	// SPDK bdev_nvme invariants enforced by bdev_nvme_check_io_error_resiliency_params:
 	//   ctrlr_loss_timeout_sec == 0 requires reconnect_delay_sec == 0 (no retry)
 	//   ctrlr_loss_timeout_sec  > 0 requires 0 < reconnect_delay_sec <= ctrlr_loss_timeout_sec
@@ -140,6 +154,58 @@ var (
 	// savings and only contributes latency.
 	defaultThinProvision = true
 )
+
+// accelMlx5NumRequests sizes the per-device mkey pool for the accel_mlx5
+// scan. SPDK enforces num_requests/cores >= ACCEL_MLX5_MAX_MKEYS_IN_TASK(16),
+// where "cores" is spdk_env_get_core_count() — the SPDK cpumask's bit count,
+// NOT runtime.NumCPU() (which sees the pod cgroup's view, which may differ
+// from the SPDK cpumask especially with hostNetwork+privileged pods).
+//
+// The IM wrapper script exports LONGHORN_V2_SPDK_CPUMASK from the --spdk-cpumask
+// flag passed to spdk_tgt; we count bits in it for the right answer. Falls
+// back to runtime.NumCPU() if the env var is unset (older wrapper).
+//
+// Override with LONGHORN_V2_ACCEL_MLX5_NUM_REQUESTS for tuning.
+func accelMlx5NumRequests() uint32 {
+	cores := spdkCoreCount()
+	n := uint32(cores) * accelMlx5MkeysPerCore
+	if v := envIntOrDefault("LONGHORN_V2_ACCEL_MLX5_NUM_REQUESTS", int(n)); v > 0 {
+		n = uint32(v)
+	}
+	return n
+}
+
+// spdkCoreCount counts bits in LONGHORN_V2_SPDK_CPUMASK (set by the IM wrapper
+// from --spdk-cpumask), which matches what spdk_env_get_core_count() reports
+// inside spdk_tgt. Mask is hex, optionally 0x-prefixed (e.g. "0xFFFF" or "FFFF"
+// → 16 cores). Falls back to runtime.NumCPU() when unset.
+func spdkCoreCount() int {
+	mask := strings.TrimSpace(os.Getenv("LONGHORN_V2_SPDK_CPUMASK"))
+	if mask == "" {
+		c := runtime.NumCPU()
+		if c < 1 {
+			c = 1
+		}
+		return c
+	}
+	mask = strings.TrimPrefix(strings.TrimPrefix(mask, "0x"), "0X")
+	v, err := strconv.ParseUint(mask, 16, 64)
+	if err != nil || v == 0 {
+		c := runtime.NumCPU()
+		if c < 1 {
+			c = 1
+		}
+		return c
+	}
+	// popcount for 64-bit (mask wider than 64 bits not supported here)
+	count := 0
+	for ; v != 0; v >>= 1 {
+		if v&1 == 1 {
+			count++
+		}
+	}
+	return count
+}
 
 func init() {
 	replicaCtrlrLossTimeoutSec = envIntOrDefault("LONGHORN_V2_REPLICA_CTRLR_LOSS_TIMEOUT_SEC", replicaCtrlrLossTimeoutSec)
