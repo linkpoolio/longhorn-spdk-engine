@@ -62,20 +62,29 @@ func DetectTransport() TransportCapability {
 // for RDMA on RoCEv2/PFC fabrics with SPDK upstream defaults as the floor
 // elsewhere. data_wr_pool_size is the critical one: SPDK's default of 0
 // forces per-qpair RDMA WR allocation on every submission and caps
-// throughput at hundreds of KB/s; 4095 matches num_shared_buffers.
+// throughput at hundreds of KB/s.
+//
+// MaxQueueDepth=512 (vs SPDK default 128) sizes the per-QP NVMe queue and
+// transitively the RDMA recv WR ring. Default 128 matched the kernel
+// initiator's ~120-inflight NVMe queue so bursts of small commands
+// (e.g. mkfs.xfs WRITE_ZEROES on the XFS log + AGs of a 50 TiB volume)
+// saturated the recv ring on every flurry. The NIC ECN-marked the
+// buildup, target sent CNPs, DCQCN throttled the initiator, per-op
+// latency hit ~4 sec while the target lvol still completed in 0.21ms.
+// 4× the recv ring should keep DCQCN out of the per-op path.
 var (
 	nvmfRdmaOpts = spdktypes.NvmfCreateTransportRequest{
 		Trtype:              spdktypes.NvmeTransportTypeRDMA,
-		MaxQueueDepth:       128,
+		MaxQueueDepth:       512,
 		MaxIoQpairsPerCtrlr: 127,
 		InCapsuleDataSize:   4096,
 		MaxIoSize:           131072,
 		IoUnitSize:          8192, // SPDK-defined RDMA minimum; larger is chained by SPDK anyway
 		MaxAqDepth:          128,
-		NumSharedBuffers:    2047,
+		NumSharedBuffers:    8192,
 		BufCacheSize:        64,
 		Zcopy:               boolPtr(true),
-		DataWrPoolSize:      2047,
+		DataWrPoolSize:      8192,
 		AcceptorPollRate:    10000,
 	}
 	nvmfTcpOpts = spdktypes.NvmfCreateTransportRequest{
