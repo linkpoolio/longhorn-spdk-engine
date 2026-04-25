@@ -97,14 +97,17 @@ var (
 	iobufSmallPoolCount uint64 = 8192
 
 	// accelMlx5MkeysPerCore is the per-core scaling factor for accel_mlx5's
-	// mkey pool. SPDK requires num_requests/cores >= ACCEL_MLX5_MAX_MKEYS_IN_TASK(16),
-	// so this is the floor. Sized at runtime via accelMlx5NumRequests().
+	// mkey pool. SPDK enforces a minimum of ACCEL_MLX5_MAX_MKEYS_IN_TASK(16)
+	// mkeys per core. SPDK upstream default is 2047 total (≈127/core on a
+	// 16-core node) which triggers ENOMEM during signature-mkey alloc on
+	// ConnectX-6 Dx fw 22.43.2566 (NIC advertises crc32c capability but
+	// firmware can't back 2047 PSVs).
 	//
-	// SPDK default is 2047 (whole pool) which triggers ENOMEM during
-	// signature-mkey alloc on ConnectX-6 Dx fw 22.43.2566 (NIC advertises
-	// crc32c capability but firmware can't back 2047 PSVs). cores × 16 is
-	// the safe floor and scales with the dataEngineCPUMask.
-	accelMlx5MkeysPerCore uint32 = 16
+	// 64/core (= 1024 on a 16-core node) is a middle ground: 4× the SPDK
+	// floor so each core can have ~4 in-flight tasks using max mkeys, and
+	// half the failing default so we stay clear of the NIC's PSV ceiling.
+	// Override with LONGHORN_V2_ACCEL_MLX5_NUM_REQUESTS for tuning.
+	accelMlx5MkeysPerCore uint32 = 64
 
 	// SPDK bdev_nvme invariants enforced by bdev_nvme_check_io_error_resiliency_params:
 	//   ctrlr_loss_timeout_sec == 0 requires reconnect_delay_sec == 0 (no retry)
