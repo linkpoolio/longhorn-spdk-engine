@@ -1275,8 +1275,17 @@ func (c *Client) IobufSetOptions(smallPoolCount, largePoolCount uint64, smallBuf
 // to register UMR for the data buffer" falls through to sw_accel CPU memcpy,
 // which serializes on the reactor and adds significant per-op latency over
 // RDMA. With it, accel_mlx5 registers UMRs via libmlx5 direct verbs.
-func (c *Client) Mlx5ScanAccelModule() (result bool, err error) {
-	cmdOutput, err := c.jsonCli.SendCommand("mlx5_scan_accel_module", struct{}{})
+//
+// numRequests sizes the per-device mkey pool. Default in SPDK is 2047 which
+// can fail with ENOMEM during signature-mkey alloc on some firmware. Pass
+// a smaller value (e.g. 256, must be >= cores * 16) when the default fails.
+// 0 means "use SPDK default".
+func (c *Client) Mlx5ScanAccelModule(numRequests uint32) (result bool, err error) {
+	req := map[string]interface{}{}
+	if numRequests > 0 {
+		req["num_requests"] = numRequests
+	}
+	cmdOutput, err := c.jsonCli.SendCommand("mlx5_scan_accel_module", req)
 	if err != nil {
 		return false, err
 	}
