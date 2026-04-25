@@ -157,18 +157,54 @@ var (
 
 // accelMlx5NumRequests sizes the per-device mkey pool for the accel_mlx5
 // scan. SPDK enforces num_requests/cores >= ACCEL_MLX5_MAX_MKEYS_IN_TASK(16),
-// so this returns runtime.NumCPU() (which honors the cgroup cpuset, i.e. the
-// dataEngineCPUMask) × accelMlx5MkeysPerCore. Allows env override.
+// where "cores" is spdk_env_get_core_count() — the SPDK cpumask's bit count,
+// NOT runtime.NumCPU() (which sees the pod cgroup's view, which may differ
+// from the SPDK cpumask especially with hostNetwork+privileged pods).
+//
+// The IM wrapper script exports LONGHORN_V2_SPDK_CPUMASK from the --spdk-cpumask
+// flag passed to spdk_tgt; we count bits in it for the right answer. Falls
+// back to runtime.NumCPU() if the env var is unset (older wrapper).
+//
+// Override with LONGHORN_V2_ACCEL_MLX5_NUM_REQUESTS for tuning.
 func accelMlx5NumRequests() uint32 {
-	cores := runtime.NumCPU()
-	if cores < 1 {
-		cores = 1
-	}
+	cores := spdkCoreCount()
 	n := uint32(cores) * accelMlx5MkeysPerCore
 	if v := envIntOrDefault("LONGHORN_V2_ACCEL_MLX5_NUM_REQUESTS", int(n)); v > 0 {
 		n = uint32(v)
 	}
 	return n
+}
+
+// spdkCoreCount counts bits in LONGHORN_V2_SPDK_CPUMASK (set by the IM wrapper
+// from --spdk-cpumask), which matches what spdk_env_get_core_count() reports
+// inside spdk_tgt. Mask is hex, optionally 0x-prefixed (e.g. "0xFFFF" or "FFFF"
+// → 16 cores). Falls back to runtime.NumCPU() when unset.
+func spdkCoreCount() int {
+	mask := strings.TrimSpace(os.Getenv("LONGHORN_V2_SPDK_CPUMASK"))
+	if mask == "" {
+		c := runtime.NumCPU()
+		if c < 1 {
+			c = 1
+		}
+		return c
+	}
+	mask = strings.TrimPrefix(strings.TrimPrefix(mask, "0x"), "0X")
+	v, err := strconv.ParseUint(mask, 16, 64)
+	if err != nil || v == 0 {
+		c := runtime.NumCPU()
+		if c < 1 {
+			c = 1
+		}
+		return c
+	}
+	// popcount for 64-bit (mask wider than 64 bits not supported here)
+	count := 0
+	for ; v != 0; v >>= 1 {
+		if v&1 == 1 {
+			count++
+		}
+	}
+	return count
 }
 
 func init() {
