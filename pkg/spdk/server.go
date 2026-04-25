@@ -109,8 +109,14 @@ func NewServer(ctx context.Context, portStart, portEnd int32) (*Server, error) {
 	// only scan/register it where Mellanox hardware is actually expected.
 	// On TCP-only workers DetectTransport() returns RDMA=false; sw_accel
 	// remains assigned to all ops (correct fallback).
+	//
+	// num_requests sized at runtime (cores × 16) instead of SPDK default
+	// 2047. The default tries to allocate 2047 signature mkeys per device
+	// which returned ENOMEM on ConnectX-6 Dx fw 22.43.2566 (NIC reports
+	// crc32c capability but firmware can't back 2047 PSVs). cores × 16
+	// is SPDK's enforced minimum (ACCEL_MLX5_MAX_MKEYS_IN_TASK).
 	if DetectTransport().RDMA {
-		if _, err = cli.Mlx5ScanAccelModule(); err != nil {
+		if _, err = cli.Mlx5ScanAccelModule(accelMlx5NumRequests()); err != nil {
 			logrus.WithError(err).Warn("Failed to register accel_mlx5 driver; falling back to sw_accel for RDMA UMR registration (per-op CPU memcpy)")
 		} else {
 			logrus.Info("Registered accel_mlx5 driver for RDMA UMR per-IO acceleration")

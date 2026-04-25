@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -95,6 +96,16 @@ var (
 	iobufLargePoolCount uint64 = 4096
 	iobufSmallPoolCount uint64 = 8192
 
+	// accelMlx5MkeysPerCore is the per-core scaling factor for accel_mlx5's
+	// mkey pool. SPDK requires num_requests/cores >= ACCEL_MLX5_MAX_MKEYS_IN_TASK(16),
+	// so this is the floor. Sized at runtime via accelMlx5NumRequests().
+	//
+	// SPDK default is 2047 (whole pool) which triggers ENOMEM during
+	// signature-mkey alloc on ConnectX-6 Dx fw 22.43.2566 (NIC advertises
+	// crc32c capability but firmware can't back 2047 PSVs). cores × 16 is
+	// the safe floor and scales with the dataEngineCPUMask.
+	accelMlx5MkeysPerCore uint32 = 16
+
 	// SPDK bdev_nvme invariants enforced by bdev_nvme_check_io_error_resiliency_params:
 	//   ctrlr_loss_timeout_sec == 0 requires reconnect_delay_sec == 0 (no retry)
 	//   ctrlr_loss_timeout_sec  > 0 requires 0 < reconnect_delay_sec <= ctrlr_loss_timeout_sec
@@ -140,6 +151,22 @@ var (
 	// savings and only contributes latency.
 	defaultThinProvision = true
 )
+
+// accelMlx5NumRequests sizes the per-device mkey pool for the accel_mlx5
+// scan. SPDK enforces num_requests/cores >= ACCEL_MLX5_MAX_MKEYS_IN_TASK(16),
+// so this returns runtime.NumCPU() (which honors the cgroup cpuset, i.e. the
+// dataEngineCPUMask) × accelMlx5MkeysPerCore. Allows env override.
+func accelMlx5NumRequests() uint32 {
+	cores := runtime.NumCPU()
+	if cores < 1 {
+		cores = 1
+	}
+	n := uint32(cores) * accelMlx5MkeysPerCore
+	if v := envIntOrDefault("LONGHORN_V2_ACCEL_MLX5_NUM_REQUESTS", int(n)); v > 0 {
+		n = uint32(v)
+	}
+	return n
+}
 
 func init() {
 	replicaCtrlrLossTimeoutSec = envIntOrDefault("LONGHORN_V2_REPLICA_CTRLR_LOSS_TIMEOUT_SEC", replicaCtrlrLossTimeoutSec)
