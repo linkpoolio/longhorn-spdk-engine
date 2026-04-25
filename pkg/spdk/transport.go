@@ -78,8 +78,8 @@ func DetectTransport() TransportCapability {
 var (
 	nvmfRdmaOpts = spdktypes.NvmfCreateTransportRequest{
 		Trtype:              spdktypes.NvmeTransportTypeRDMA,
-		MaxQueueDepth:       uint16(envIntOrDefault("LONGHORN_V2_NVMF_RDMA_MAX_QUEUE_DEPTH", 128)),
-		MaxIoQpairsPerCtrlr: uint16(envIntOrDefault("LONGHORN_V2_NVMF_RDMA_MAX_IO_QPAIRS_PER_CTRLR", 127)),
+		MaxQueueDepth:       uint32(envIntOrDefault("LONGHORN_V2_NVMF_RDMA_MAX_QUEUE_DEPTH", 128)),
+		MaxIoQpairsPerCtrlr: uint32(envIntOrDefault("LONGHORN_V2_NVMF_RDMA_MAX_IO_QPAIRS_PER_CTRLR", 127)),
 		InCapsuleDataSize:   uint32(envIntOrDefault("LONGHORN_V2_NVMF_RDMA_IN_CAPSULE_DATA_SIZE", 4096)),
 		MaxIoSize:           uint32(envIntOrDefault("LONGHORN_V2_NVMF_RDMA_MAX_IO_SIZE", 131072)),
 		IoUnitSize:          uint32(envIntOrDefault("LONGHORN_V2_NVMF_RDMA_IO_UNIT_SIZE", 8192)),
