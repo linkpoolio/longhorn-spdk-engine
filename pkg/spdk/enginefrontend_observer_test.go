@@ -69,14 +69,10 @@ func (s *TestSuite) TestDeriveLiveStateBlockdevAllAbsentIsStopped(c *C) {
 func (s *TestSuite) TestDeriveLiveStateBlockdevControllerTransientStaysRunning(c *C) {
 	// All four layers present but kernel controller is in connecting/
 	// resetting (kernel-internal recovery from a keep-alive blip). The
-	// kernel itself returns the ctrlr to `live` within ctrlr_loss_timeout
-	// (15s) — heal would race that recovery and break any consumer that
-	// has the device mounted. So we report Running here and stash the
-	// state in ErrorMsg as a debugging breadcrumb only.
-	//
-	// 2026-04-26 regression: previously this returned Error and triggered
-	// heal, which destroyed rustfs's XFS mount on /data twice in one day
-	// when transient flaps appeared.
+	// kernel returns the ctrlr to `live` within ctrlr_loss_timeout — heal
+	// would race that recovery and could destroy filesystems mounted on
+	// the device. Report Running and stash the state in ErrorMsg as a
+	// debugging breadcrumb only.
 	rec := &EngineFrontendRecord{Name: "ef-1", Frontend: types.FrontendSPDKTCPBlockdev}
 	raw := &EngineFrontendObservedRaw{
 		SubsystemPresent:        true,
@@ -128,7 +124,7 @@ func (s *TestSuite) TestDeriveLiveStateBlockdevPartialDmMissing(c *C) {
 func (s *TestSuite) TestDeriveLiveStateBlockdevPartialKernelMissing(c *C) {
 	// SPDK + dm present but kernel session vanished (NVMe controller got
 	// removed, perhaps by a stray disconnect). dm-linear now points at a
-	// dead device. Recorded windrose-flavoured failure mode.
+	// dead device.
 	rec := &EngineFrontendRecord{Name: "ef-1", Frontend: types.FrontendSPDKTCPBlockdev}
 	raw := &EngineFrontendObservedRaw{
 		SubsystemPresent:        true,
