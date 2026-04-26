@@ -78,12 +78,14 @@ var (
 	replicaTransportAckTimeout  = 10
 	replicaKeepAliveTimeoutMs   = 10000
 	// replicaTransportTos tags outbound NVMe-oF packets with DSCP so the
-	// NIC places them in the correct traffic class. RoCEv2 deployments
-	// with PFC typically use DSCP 26 (AF31 / class 3) for the lossless
-	// class; set to 0 on networks where PFC isn't configured — tagging
-	// into a class the switches don't honour can get packets dropped.
+	// NIC places them in the correct traffic class. SPDK passes this byte
+	// straight to rdma_set_option(RDMA_OPTION_ID_TOS), which expects the
+	// raw 8-bit IPv4 TOS value (DSCP occupies the upper 6 bits). For the
+	// PFC-protected lossless class (DSCP 26 = AF31), TOS = 26 << 2 = 104.
+	// Set to 0 on networks where PFC isn't configured — tagging into a
+	// class the switches don't honour can get packets dropped.
 	// Override via LONGHORN_V2_REPLICA_TRANSPORT_TOS.
-	replicaTransportTos = 26
+	replicaTransportTos = 104
 
 	// iobuf pool sizes. SPDK defaults (large=1024, small=8192) are too small
 	// once nvmf transports are created with num_shared_buffers tuned above
