@@ -218,22 +218,19 @@ func NewServer(ctx context.Context, portStart, portEnd int32) (*Server, error) {
 	// in mutating handlers.
 	go s.monitoring()
 
-	// EngineFrontend self-heal reconciler (docs/longhorn-v2-derived-state-refactor.md).
-	// Every 30s, observes each persisted EngineFrontend's host-side state,
-	// and when the host has desynced from the record's intent (partial
-	// dm/nvme/SPDK state — the windrose-class bug) tears down + recreates
-	// from the record. Replaces the manual scale-0/1 recovery. On by
-	// default; LONGHORN_V2_RECONCILE_ENGINE_FRONTENDS=0 is a kill switch
-	// only if a specific incident calls for halting it.
+	// EngineFrontend self-heal reconciler. Every 30s, observes each
+	// persisted EngineFrontend's host-side state, and when the host has
+	// desynced from the record's intent (partial dm/nvme/SPDK state) tears
+	// down and recreates from the record. Replaces the operator-driven
+	// manual recovery cycle. LONGHORN_V2_RECONCILE_ENGINE_FRONTENDS=0
+	// disables for emergency operator intervention.
 	go s.reconcileEngineFrontends()
 
-	// Replica self-heal reconciler — same pattern, smaller scope.
-	// Replicas have a simpler host surface (pure SPDK target — no kernel
+	// Replica self-heal reconciler — same pattern as EngineFrontend, smaller
+	// scope. Replicas have a pure SPDK target host surface (no kernel
 	// dm/nvme), so the reconciler only handles the listener-missing case:
-	// head lvol present on disk but NVMe-oF subsystem / listener gone →
-	// re-run StartExposeBdev from the persisted record. Step 1 of the
-	// replica half of docs/longhorn-v2-derived-state-refactor.md;
-	// killing s.replicaMap and the server.go:193 TODO is steps 5b-5e.
+	// head lvol present on disk but NVMe-oF subsystem / listener gone, in
+	// which case StartExposeBdev is re-run from the persisted record.
 	go s.reconcileReplicas()
 
 	return s, nil

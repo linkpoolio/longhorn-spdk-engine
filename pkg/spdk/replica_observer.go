@@ -244,16 +244,14 @@ func (s *Server) reconcileReplicasOnce() {
 }
 
 // BuildReplicaFromRecord constructs a transient *Replica populated from a
-// fresh SPDK observation + the persisted record. Used by ReplicaGet /
+// fresh SPDK observation plus the persisted record. Used by ReplicaGet /
 // ReplicaList / ReplicaWatch to serve reads without consulting
-// s.replicaMap — closes the TODO at server.go:193 (the cache is no longer
-// load-bearing for read paths).
+// s.replicaMap, so the cache is not load-bearing for read paths.
 //
-// The returned struct is suitable for ServiceReplicaToProtoReplica. It does
-// NOT carry workflow state (isRebuilding, isSnapshotCloning, etc.) — those
-// stay on the cached *Replica owned by mutating handlers. Build-from-SPDK
-// is the read-side equivalent; mutating handlers continue to use the cache
-// for per-replica mutex serialisation.
+// The returned struct is suitable for ServiceReplicaToProtoReplica. It
+// does not carry workflow state (isRebuilding, isSnapshotCloning, etc.);
+// those stay on the cached *Replica owned by mutating handlers. The
+// cache continues to provide per-replica mutex serialisation for writes.
 //
 // On any SPDK probe failure, returns a *Replica with State=InstanceStateError
 // and an explanatory ErrorMsg so the gRPC client gets a coherent answer
