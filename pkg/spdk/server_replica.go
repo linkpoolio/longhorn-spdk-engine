@@ -85,15 +85,31 @@ func (s *Server) ReplicaDelete(ctx context.Context, req *spdkrpc.ReplicaDeleteRe
 
 // ReplicaGet returns a specific replica
 func (s *Server) ReplicaGet(ctx context.Context, req *spdkrpc.ReplicaGetRequest) (ret *spdkrpc.Replica, err error) {
-	s.RLock()
-	r := s.replicaMap[req.Name]
-	s.RUnlock()
-
-	if r == nil {
+	// Read path goes through the observer — no s.replicaMap lookup. The
+	// persisted record is the source of identity; SPDK is the source of
+	// runtime state. The cached *Replica in s.replicaMap is owned by
+	// mutating handlers for per-replica mutex serialisation only.
+	if s.metadataDir == "" {
+		return nil, grpcstatus.Errorf(grpccodes.FailedPrecondition, "ReplicaGet: persistence disabled")
+	}
+	record, err := loadReplicaRecord(s.metadataDir, req.Name)
+	if err != nil {
+		return nil, grpcstatus.Errorf(grpccodes.Internal, "ReplicaGet: load record: %v", err)
+	}
+	if record == nil {
 		return nil, grpcstatus.Errorf(grpccodes.NotFound, "cannot find replica %v", req.Name)
 	}
 
-	return r.Get(), nil
+	s.RLock()
+	spdkClient := s.spdkClient
+	nodeTransport := s.nodeTransport
+	s.RUnlock()
+
+	r, err := BuildReplicaFromRecord(spdkClient, record, nodeTransport)
+	if err != nil {
+		return nil, grpcstatus.Errorf(grpccodes.Internal, "ReplicaGet: build from SPDK: %v", err)
+	}
+	return ServiceReplicaToProtoReplica(r), nil
 }
 
 // ReplicaExpand expands a replica
@@ -114,19 +130,31 @@ func (s *Server) ReplicaExpand(ctx context.Context, req *spdkrpc.ReplicaExpandRe
 	return &emptypb.Empty{}, nil
 }
 
-// ReplicaList returns all replicas
+// ReplicaList returns all replicas. Iterates persisted records and derives
+// each replica's runtime state from SPDK — does not consult s.replicaMap.
 func (s *Server) ReplicaList(ctx context.Context, req *emptypb.Empty) (*spdkrpc.ReplicaListResponse, error) {
-	replicaMap := map[string]*Replica{}
 	res := map[string]*spdkrpc.Replica{}
 
-	s.RLock()
-	for k, v := range s.replicaMap {
-		replicaMap[k] = v
+	if s.metadataDir == "" {
+		return &spdkrpc.ReplicaListResponse{Replicas: res}, nil
 	}
+	records, err := loadReplicaRecords(s.metadataDir)
+	if err != nil {
+		return nil, grpcstatus.Errorf(grpccodes.Internal, "ReplicaList: load records: %v", err)
+	}
+
+	s.RLock()
+	spdkClient := s.spdkClient
+	nodeTransport := s.nodeTransport
 	s.RUnlock()
 
-	for replicaName, r := range replicaMap {
-		res[replicaName] = r.Get()
+	for name, record := range records {
+		r, err := BuildReplicaFromRecord(spdkClient, record, nodeTransport)
+		if err != nil {
+			logrus.WithError(err).Warnf("ReplicaList: failed to derive %s; skipping", name)
+			continue
+		}
+		res[name] = ServiceReplicaToProtoReplica(r)
 	}
 
 	return &spdkrpc.ReplicaListResponse{Replicas: res}, nil
@@ -596,8 +624,8 @@ func (s *Server) ReplicaRebuildingDstStart(ctx context.Context, req *spdkrpc.Rep
 		return nil, err
 	}
 	return &spdkrpc.ReplicaRebuildingDstStartResponse{
-		DstHeadLvolAddress:              address,
-		DstHeadLvolTransportAddresses:   r.headLvolTransportAddresses(),
+		DstHeadLvolAddress:            address,
+		DstHeadLvolTransportAddresses: r.headLvolTransportAddresses(),
 	}, nil
 }
 

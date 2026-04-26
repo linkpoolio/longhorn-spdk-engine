@@ -153,3 +153,26 @@ func loadReplicaRecords(metadataDir string) (map[string]*ReplicaRecord, error) {
 	}
 	return out, nil
 }
+
+// loadReplicaRecord reads the persisted record for a single replica by name.
+// Returns nil (not an error) if the record file does not exist — letting
+// callers map "not found" to a NotFound gRPC error without depending on
+// fs.ErrNotExist matching.
+func loadReplicaRecord(metadataDir, replicaName string) (*ReplicaRecord, error) {
+	if metadataDir == "" {
+		return nil, nil
+	}
+	path := replicaRecordPath(metadataDir, replicaName)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var rec ReplicaRecord
+	if err := json.Unmarshal(data, &rec); err != nil {
+		return nil, fmt.Errorf("loadReplicaRecord: unmarshal %s: %w", path, err)
+	}
+	return &rec, nil
+}

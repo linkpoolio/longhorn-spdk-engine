@@ -190,8 +190,32 @@ func NewServer(ctx context.Context, portStart, portEnd int32) (*Server, error) {
 	s.recoverEngines()
 	s.recoverEngineFrontends()
 
-	// TODO: There is no need to maintain the replica map in cache when we can use one SPDK JSON API call to fetch the Lvol tree/chain info
+	// monitoring() runs verify() every 3s to sync the in-memory replicaMap
+	// with SPDK + drive engine metrics + sync verified objects. Read-path
+	// gRPC handlers (ReplicaGet/List) no longer depend on the cache —
+	// they call BuildReplicaFromRecord which derives state directly from
+	// SPDK + the persisted record (one BdevGetBdevs call). The map is
+	// retained as a per-replica mutex holder for write-side serialisation
+	// in mutating handlers.
 	go s.monitoring()
+
+	// EngineFrontend self-heal reconciler (docs/longhorn-v2-derived-state-refactor.md).
+	// Every 30s, observes each persisted EngineFrontend's host-side state,
+	// and when the host has desynced from the record's intent (partial
+	// dm/nvme/SPDK state — the windrose-class bug) tears down + recreates
+	// from the record. Replaces the manual scale-0/1 recovery. On by
+	// default; LONGHORN_V2_RECONCILE_ENGINE_FRONTENDS=0 is a kill switch
+	// only if a specific incident calls for halting it.
+	go s.reconcileEngineFrontends()
+
+	// Replica self-heal reconciler — same pattern, smaller scope.
+	// Replicas have a simpler host surface (pure SPDK target — no kernel
+	// dm/nvme), so the reconciler only handles the listener-missing case:
+	// head lvol present on disk but NVMe-oF subsystem / listener gone →
+	// re-run StartExposeBdev from the persisted record. Step 1 of the
+	// replica half of docs/longhorn-v2-derived-state-refactor.md;
+	// killing s.replicaMap and the server.go:193 TODO is steps 5b-5e.
+	go s.reconcileReplicas()
 
 	return s, nil
 }
