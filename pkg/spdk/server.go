@@ -65,6 +65,14 @@ type Server struct {
 	metadataDir string
 
 	nodeTransport NvmfTransportType
+
+	// engineFrontendDesyncCounts tracks consecutive Error observations per
+	// EngineFrontend record name. Reset on any non-Error observation. The
+	// reconciler only fires heal once a record's count reaches
+	// EngineFrontendHealConsecutiveFailures, filtering out transient
+	// kernel-side recovery flaps from genuine stuck desyncs. Guarded by the
+	// Server's own RWMutex.
+	engineFrontendDesyncCounts map[string]int
 }
 
 func NewServer(ctx context.Context, portStart, portEnd int32) (*Server, error) {
@@ -153,9 +161,10 @@ func NewServer(ctx context.Context, portStart, portEnd int32) (*Server, error) {
 
 		diskMap: map[string]*Disk{},
 
-		replicaMap:        map[string]*Replica{},
-		engineMap:         map[string]*Engine{},
-		engineFrontendMap: map[string]*EngineFrontend{},
+		replicaMap:                 map[string]*Replica{},
+		engineMap:                  map[string]*Engine{},
+		engineFrontendMap:          map[string]*EngineFrontend{},
+		engineFrontendDesyncCounts: map[string]int{},
 
 		backupMap: map[string]*Backup{},
 
