@@ -284,7 +284,7 @@ func BuildReplicaFromRecord(spdkClient *spdkclient.Client, record *ReplicaRecord
 	// Derive expose state from nvmf subsystem.
 	nqn := r.Nqn
 	subsystems, err := spdkClient.NvmfGetSubsystems(nqn, "")
-	if err != nil {
+	if err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
 		r.State = types.InstanceStateError
 		r.ErrorMsg = "BuildReplicaFromRecord: NvmfGetSubsystems: " + err.Error()
 		return r, nil
@@ -299,16 +299,23 @@ func BuildReplicaFromRecord(spdkClient *spdkclient.Client, record *ReplicaRecord
 		break
 	}
 
+	// BuildReplicaFromRecord runs only when the IM has no in-memory record for
+	// this replica (post-restart, post-stop, or pre-create). In that path,
+	// "head lvol present + no NVMe-oF listener" is the legitimate Stopped
+	// state — the replica was previously cleanly stopped (record was kept on
+	// disk because cleanupRequired=false) and the subsystem was correctly
+	// deleted at stop. Marking Error here would loop the manager in
+	// "all replicas failed → salvageRequested" forever because the salvage
+	// flow gates on Status.CurrentState=Stopped, blocking detach.
+	//
+	// Desync detection for actively-running replicas (IM has in-memory record
+	// but listener got dropped) is the responsibility of the periodic
+	// reconciler driven by the in-memory map, not this derive-from-record
+	// function.
 	if r.IsExposed {
 		r.State = types.InstanceStateRunning
 	} else {
-		// Head lvol present on disk but no NVMe-oF listener exposed —
-		// recoverable desync. The reconciler maps this to Heal which
-		// re-runs StartExposeBdev from the record. (If the head lvol
-		// were absent we'd have returned Stopped above before reaching
-		// this branch.)
-		r.State = types.InstanceStateError
-		r.ErrorMsg = "Replica desync: head lvol present but no NVMe-oF listener exposed"
+		r.State = types.InstanceStateStopped
 	}
 	return r, nil
 }
@@ -318,7 +325,7 @@ func BuildReplicaFromRecord(spdkClient *spdkclient.Client, record *ReplicaRecord
 // of replica lvols all start with the replica name (head is exact, snapshots
 // are <name>-snap-<id>).
 func isReplicaBdev(bdev *spdktypes.BdevInfo, replicaName, lvsUUID string) bool {
-	if bdev == nil || bdev.DriverSpecific == nil {
+	if bdev == nil || bdev.DriverSpecific == nil || bdev.DriverSpecific.Lvol == nil {
 		return false
 	}
 	if len(bdev.Aliases) == 0 {
