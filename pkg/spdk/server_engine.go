@@ -43,10 +43,51 @@ func (s *Server) EngineCreate(ctx context.Context, req *spdkrpc.EngineCreateRequ
 		e.metadataDir = s.metadataDir
 	}
 
+	if req.QosLimits != nil {
+		e.QosLimits = QosLimits{
+			RwIOsPerSec: req.QosLimits.RwIosPerSec,
+			RwMBPerSec:  req.QosLimits.RwMbPerSec,
+			RMBPerSec:   req.QosLimits.RMbPerSec,
+			WMBPerSec:   req.QosLimits.WMbPerSec,
+		}
+	}
+
 	spdkClient := s.spdkClient
 	s.Unlock()
 
 	return e.Create(spdkClient, req.ReplicaAddressMap, req.ReplicaTransportAddressMap, req.PortCount, s.portAllocator, req.SalvageRequested)
+}
+
+// EngineSetQosLimit applies new QoS limits to a running engine's raid bdev
+// at runtime. Used by longhorn-manager to push StorageClass-derived QoS
+// changes onto attached volumes without re-creating them.
+func (s *Server) EngineSetQosLimit(ctx context.Context, req *spdkrpc.EngineSetQosLimitRequest) (*emptypb.Empty, error) {
+	if req.Name == "" {
+		return nil, grpcstatus.Error(grpccodes.InvalidArgument, "engine name is required")
+	}
+	if req.QosLimits == nil {
+		return nil, grpcstatus.Error(grpccodes.InvalidArgument, "qos_limits is required (use all-zero fields for unlimited)")
+	}
+
+	s.RLock()
+	e := s.engineMap[req.Name]
+	spdkClient := s.spdkClient
+	s.RUnlock()
+
+	if e == nil {
+		return nil, grpcstatus.Errorf(grpccodes.NotFound, "cannot find engine %v", req.Name)
+	}
+
+	limits := QosLimits{
+		RwIOsPerSec: req.QosLimits.RwIosPerSec,
+		RwMBPerSec:  req.QosLimits.RwMbPerSec,
+		RMBPerSec:   req.QosLimits.RMbPerSec,
+		WMBPerSec:   req.QosLimits.WMbPerSec,
+	}
+	if err := e.SetQosLimit(spdkClient, limits); err != nil {
+		return nil, grpcstatus.Errorf(grpccodes.Internal, "failed to set QoS for engine %v: %v", req.Name, err)
+	}
+	return &emptypb.Empty{}, nil
 }
 
 func (s *Server) EngineDelete(ctx context.Context, req *spdkrpc.EngineDeleteRequest) (ret *emptypb.Empty, err error) {
