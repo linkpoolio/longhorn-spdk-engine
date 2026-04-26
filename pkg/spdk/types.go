@@ -61,9 +61,10 @@ const (
 // replicaCtrlrLossTimeoutSec lowered from upstream 15s to 3s: when a remote
 // replica IM disappears mid-rebuild, every RDMA_CM_EVENT_REJECTED from the
 // dying peer triggers bdev_nvme_failover_ctrlr reactively (no cooldown),
-// starving the local reactor until ctrlr_loss fires and the ctrlr is reaped.
-// At 15s we saw spdk_tgt crash with broken-pipe on /var/tmp/spdk.sock. 3s
-// trims the spam window below the liveness threshold.
+// starving the local reactor until ctrlr_loss fires and the controller is
+// reaped. The longer the timeout, the more sustained the failover spam;
+// at upstream 15s the SPDK reactor can saturate enough to break its own
+// JSONRPC socket. 3s trims the spam window below the liveness threshold.
 //
 // rebuildCtrlrLossTimeoutSec / rebuildFastIOFailTimeoutSec apply only to the
 // three rebuild-path bdev_nvme attachments in replica.go (clone src->dst,
@@ -77,11 +78,11 @@ var (
 	replicaTransportAckTimeout  = 10
 	replicaKeepAliveTimeoutMs   = 10000
 	// replicaTransportTos tags outbound NVMe-oF packets with DSCP so the
-	// NIC places them in the correct traffic class. For our ma-production
-	// RoCEv2 fabric PFC is enabled on the lossless class identified by
-	// DSCP 26 (AF31 / class 3). Set to 0 on networks where PFC isn't
-	// configured — tagging into a class the switches don't honour can get
-	// packets dropped. Override via LONGHORN_V2_REPLICA_TRANSPORT_TOS.
+	// NIC places them in the correct traffic class. RoCEv2 deployments
+	// with PFC typically use DSCP 26 (AF31 / class 3) for the lossless
+	// class; set to 0 on networks where PFC isn't configured — tagging
+	// into a class the switches don't honour can get packets dropped.
+	// Override via LONGHORN_V2_REPLICA_TRANSPORT_TOS.
 	replicaTransportTos = 26
 
 	// iobuf pool sizes. SPDK defaults (large=1024, small=8192) are too small
@@ -98,15 +99,12 @@ var (
 
 	// accelMlx5MkeysPerCore is the per-core scaling factor for accel_mlx5's
 	// mkey pool. SPDK enforces a minimum of ACCEL_MLX5_MAX_MKEYS_IN_TASK(16)
-	// mkeys per core. SPDK upstream default is 2047 total (≈127/core on a
-	// 16-core node) which triggers ENOMEM during signature-mkey alloc on
-	// ConnectX-6 Dx fw 22.43.2566 (NIC advertises crc32c capability but
-	// firmware can't back 2047 PSVs).
-	//
-	// 64/core (= 1024 on a 16-core node) is a middle ground: 4× the SPDK
-	// floor so each core can have ~4 in-flight tasks using max mkeys, and
-	// half the failing default so we stay clear of the NIC's PSV ceiling.
-	// Override with LONGHORN_V2_ACCEL_MLX5_NUM_REQUESTS for tuning.
+	// mkeys per core. The upstream default of 2047 total (~127/core on a
+	// 16-core node) can trigger ENOMEM during signature-mkey alloc on some
+	// ConnectX hardware where the NIC advertises crc32c capability but the
+	// firmware can't back that many PSVs. 64/core scales linearly with the
+	// pinned core count and stays clear of the firmware ceiling. Override
+	// with LONGHORN_V2_ACCEL_MLX5_NUM_REQUESTS for tuning.
 	accelMlx5MkeysPerCore uint32 = 64
 
 	// SPDK bdev_nvme invariants enforced by bdev_nvme_check_io_error_resiliency_params:
@@ -114,13 +112,13 @@ var (
 	//   ctrlr_loss_timeout_sec  > 0 requires 0 < reconnect_delay_sec <= ctrlr_loss_timeout_sec
 	//   fast_io_fail_timeout_sec (when > 0) must be <= ctrlr_loss_timeout_sec
 	//
-	// (2, 1, 2) gives the rebuild path a 2 s hard ceiling on retry exposure
-	// (one reconnect attempt after 1 s, in-flight IOs fail after 2 s). That is
-	// ~7x tighter than the upstream (15, 2, 10) default which at 15 s let a
-	// dying peer spam bdev_nvme_failover_ctrlr_unsafe fast enough to saturate
-	// the reactor poller and crash spdk_tgt with a broken /var/tmp/spdk.sock.
-	// Rebuild is restartable, so a 2 s tolerance for transient RDMA blips is
-	// fine and the manager restarts from scratch on harder failures.
+	// (2, 1, 2) gives the rebuild path a 2s hard ceiling on retry exposure
+	// (one reconnect attempt after 1s, in-flight IOs fail after 2s). At
+	// the upstream (15, 2, 10) defaults a dying peer can spam
+	// bdev_nvme_failover_ctrlr_unsafe fast enough to saturate the reactor
+	// and break its JSONRPC socket. Rebuild is restartable, so a 2s
+	// tolerance for transient RDMA blips is acceptable and the manager
+	// restarts from scratch on harder failures.
 	rebuildCtrlrLossTimeoutSec  = 2
 	rebuildReconnectDelaySec    = 1
 	rebuildFastIOFailTimeoutSec = 2

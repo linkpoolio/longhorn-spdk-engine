@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -23,47 +24,84 @@ import (
 // goroutine runs during step 1 of the derived-state migration.
 const EngineFrontendObserveInterval = 30 * time.Second
 
-// EngineFrontendObservedRaw is the inputs to the state-derivation function.
-// It holds primitive booleans + identity values gathered from SPDK + the host
-// kernel; it is intentionally trivial to construct in tests so deriveLiveState
-// can be exercised exhaustively without mocking the entire SPDK + sysfs stack.
+// EngineFrontendHealConsecutiveFailures is the number of consecutive Error
+// observations required before the reconciler will trigger a destructive
+// heal. The intent is to filter out transient kernel-side recovery states
+// (NVMe-oF controller in `connecting` / `resetting` after a keep-alive blip
+// — kernel itself returns it to `live` within a few seconds) from genuine
+// stuck desyncs that warrant tearing down host state.
 //
-// The observer entry point ObserveEngineFrontend (TODO: next commit) will
-// populate this struct from real probes:
-//   - SubsystemPresent: nvmf_get_subsystems contains record.VolumeNQN
-//   - KernelControllerPresent: /sys/class/nvme/nvme*/subsysnqn matches record
-//   - KernelControllerLive: that controller's `state` is "live" (not "connecting", "resetting", etc.)
-//   - DMDevicePresent: dmsetup ls / os.Stat for the expected device file succeeded
-//   - ActivePath, NvmeTCPPaths: derived from kernel ANA state
+// 3 ticks * 30s = 90s — comfortably longer than ctrlr_loss_timeout (15s),
+// so any "kernel is doing its job recovering" window is allowed to resolve.
+const EngineFrontendHealConsecutiveFailures = 3
+
+// KernelControllerState is the tri-state classification of a kernel
+// NVMe-oF controller's state attribute (from /sys/class/nvme/nvmeX/state
+// surfaced via `nvme list-subsys`). The kernel uses many specific strings
+// — `live`, `connecting`, `resetting`, `new`, `deleting`, `deleting (no IO)`,
+// `dead` — and we collapse them into three buckets that drive the
+// reconciler's decision: `live` is healthy, `transient` is a kernel
+// internal recovery the kernel itself will resolve (do nothing), `dead`
+// is a permanent failure where heal is the right response.
+type KernelControllerState string
+
+const (
+	KernelControllerStateAbsent    KernelControllerState = "absent"
+	KernelControllerStateLive      KernelControllerState = "live"
+	KernelControllerStateTransient KernelControllerState = "transient"
+	KernelControllerStateDead      KernelControllerState = "dead"
+)
+
+// classifyKernelControllerState maps the raw kernel state string to our
+// tri-state. Anything we don't explicitly recognize is treated as transient
+// to bias toward "wait and recheck" over destructive heal.
+func classifyKernelControllerState(raw string) KernelControllerState {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "live":
+		return KernelControllerStateLive
+	case "dead", "deleting", "deleting (no io)":
+		return KernelControllerStateDead
+	case "":
+		return KernelControllerStateAbsent
+	default:
+		return KernelControllerStateTransient
+	}
+}
+
+// EngineFrontendObservedRaw holds primitive booleans + identity values
+// gathered from SPDK and the host kernel by ObserveEngineFrontend, fed
+// into deriveLiveState to compute the canonical Live view. Trivial to
+// construct in tests so deriveLiveState can be exercised without mocking
+// the entire SPDK + sysfs stack.
 type EngineFrontendObservedRaw struct {
 	// SPDK side
 	SubsystemPresent bool
 	SubsystemNQN     string
 
-	// Kernel-initiator side (only meaningful for FrontendSPDKTCPBlockdev)
+	// Kernel-initiator side (only meaningful for FrontendSPDKTCPBlockdev).
+	// KernelControllerState classifies the kernel's state attribute into
+	// live / transient / dead — the reconciler ONLY treats `dead` as a
+	// real desync. `transient` (connecting/resetting) is the kernel
+	// recovering on its own and must not trigger heal.
 	KernelControllerPresent bool
-	KernelControllerLive    bool
+	KernelControllerState   KernelControllerState
 
 	// dm-linear / device-file side (only meaningful for FrontendSPDKTCPBlockdev)
 	DMDevicePresent  bool
 	DevicePathExists bool
 	DevicePath       string
 
-	// Multipath state (FrontendSPDKTCPBlockdev with multiple paths)
-	ActivePath   string
-	NvmeTCPPaths map[string]*NvmeTCPPath
-
-	// FrontendSPDKTCPNvmf side: just the listener address. The "state" of
-	// an Nvmf-frontend EF is purely whether the SPDK subsystem listener is
-	// up — there's no local initiator or dm device.
+	// FrontendSPDKTCPNvmf side: the listener address. State for an Nvmf
+	// frontend is purely whether the SPDK subsystem listener is up — no
+	// local initiator or dm device.
 	NvmfTargetIP   string
 	NvmfTargetPort int32
 }
 
-// EngineFrontendLive is the derived runtime view of an EngineFrontend at one
-// point in time. It is computed from the persisted record + observed raw
-// inputs by deriveLiveState. It is throw-away — never stored as authoritative
-// state; built on demand by gRPC handlers and the reconciler.
+// EngineFrontendLive is the derived runtime view of an EngineFrontend at
+// one point in time, computed from the persisted record + raw observation
+// by deriveLiveState. Throw-away — built on demand by gRPC handlers and
+// the reconciler, never stored as authoritative state.
 type EngineFrontendLive struct {
 	Record *EngineFrontendRecord
 
@@ -73,9 +111,6 @@ type EngineFrontendLive struct {
 	// Endpoint is what gRPC clients see. For blockdev: /dev/longhorn/<vol>.
 	// For nvmf: the nqn-style URL.
 	Endpoint string
-
-	ActivePath   string
-	NvmeTCPPaths map[string]*NvmeTCPPath
 }
 
 // deriveLiveState combines a persisted record with raw observations into the
@@ -94,9 +129,7 @@ type EngineFrontendLive struct {
 // record's intent and a corrective Create should be re-run".
 func deriveLiveState(record *EngineFrontendRecord, raw *EngineFrontendObservedRaw) *EngineFrontendLive {
 	live := &EngineFrontendLive{
-		Record:       record,
-		ActivePath:   raw.ActivePath,
-		NvmeTCPPaths: raw.NvmeTCPPaths,
+		Record: record,
 	}
 
 	switch record.Frontend {
@@ -125,20 +158,33 @@ func deriveLiveState(record *EngineFrontendRecord, raw *EngineFrontendObservedRa
 		case 0b0000:
 			live.State = types.InstanceStateStopped
 		case 0b1111:
-			if raw.KernelControllerLive {
+			switch raw.KernelControllerState {
+			case KernelControllerStateLive:
 				live.State = types.InstanceStateRunning
 				live.Endpoint = raw.DevicePath
-			} else {
-				// All layers exist but kernel controller is in
-				// connecting/resetting/failed — treat as Error so the
-				// reconciler tears down + recreates rather than reporting
-				// a "running" volume that won't actually serve I/O.
+			case KernelControllerStateTransient:
+				// Kernel controller is in connecting / resetting / new — the
+				// kernel state machine is mid-recovery and will either return
+				// to `live` within ctrlr_loss_timeout or transition to `dead`
+				// if it gives up. In-flight I/O is queued by the kernel until
+				// then. Tearing down dm-linear and /dev/longhorn/X here would
+				// race the kernel's recovery and corrupt any filesystem
+				// mounted on the device. Report Running and stash the
+				// transient state in ErrorMsg as a debugging breadcrumb only.
+				live.State = types.InstanceStateRunning
+				live.Endpoint = raw.DevicePath
+				live.ErrorMsg = "kernel NVMe-oF controller is in transient recovery state (no heal)"
+			case KernelControllerStateDead, KernelControllerStateAbsent:
+				// Kernel has given up reconnecting (or the controller is
+				// being deleted out from under us). This is a real desync
+				// — the device on this host will not serve I/O until heal
+				// runs.
 				live.State = types.InstanceStateError
-				live.ErrorMsg = "kernel NVMe-oF controller is not in live state"
+				live.ErrorMsg = "kernel NVMe-oF controller is dead/absent"
 			}
 		default:
 			// Any partial combination — record says we should be running
-			// but the host has a torn state. Reconciler will fix.
+			// but the host has a torn stack. Reconciler will fix.
 			live.State = types.InstanceStateError
 			live.ErrorMsg = describePartialState(raw)
 		}
@@ -181,7 +227,6 @@ func ObserveEngineFrontend(ctx context.Context, spdkClient *spdkclient.Client, r
 		return nil, errors.New("ObserveEngineFrontend: nil record")
 	}
 	raw := &EngineFrontendObservedRaw{
-		SubsystemNQN:   record.VolumeNQN,
 		NvmfTargetIP:   record.TargetIP,
 		NvmfTargetPort: record.TargetPort,
 	}
@@ -241,12 +286,30 @@ func ObserveEngineFrontend(ctx context.Context, spdkClient *spdkclient.Client, r
 			continue
 		}
 		raw.KernelControllerPresent = true
+		// Pick the strongest path-state across all paths for this subsystem.
+		// `live` wins outright; otherwise prefer `transient` over `dead` so a
+		// single failed path doesn't trip heal while another path is still
+		// alive or recovering. Defaults to absent if Paths is empty.
+		best := KernelControllerStateAbsent
 		for _, p := range sys.Paths {
-			if strings.EqualFold(p.State, "live") {
-				raw.KernelControllerLive = true
+			cur := classifyKernelControllerState(p.State)
+			switch cur {
+			case KernelControllerStateLive:
+				best = KernelControllerStateLive
+			case KernelControllerStateTransient:
+				if best != KernelControllerStateLive {
+					best = KernelControllerStateTransient
+				}
+			case KernelControllerStateDead:
+				if best != KernelControllerStateLive && best != KernelControllerStateTransient {
+					best = KernelControllerStateDead
+				}
+			}
+			if best == KernelControllerStateLive {
 				break
 			}
 		}
+		raw.KernelControllerState = best
 		break
 	}
 
@@ -276,16 +339,14 @@ func ObserveEngineFrontend(ctx context.Context, spdkClient *spdkclient.Client, r
 }
 
 // reconcileEngineFrontends is the self-heal loop for EngineFrontend desync.
-// Every tick: load all persisted records, observe each one's host-side state,
-// and if the observer reports Error (partial host state — record says we
-// should be running but host has a torn stack) run takeCorrective to drive
-// reality back to the record's intent.
-//
-// On by default. The whole point of this work is to remove the manual
-// scale-0/1 step that windrose needed today. Disable with
-// LONGHORN_V2_RECONCILE_ENGINE_FRONTENDS=0 if a specific incident calls for
-// halting the loop while debugging — the gate is a kill switch, not an
-// opt-in.
+// Every tick: load all persisted records, observe each one's host-side
+// state, and if the observer reports Error (partial host state — record
+// says we should be running but host has a torn stack) drive reality
+// back to the record's intent. Removes the operator-driven manual
+// recovery cycle (scale workload to 0, wait for detach, scale back to 1)
+// that was previously the only way to repair a stale host-side stack
+// after IM crash recovery. LONGHORN_V2_RECONCILE_ENGINE_FRONTENDS=0
+// disables the loop for emergency operator intervention.
 func (s *Server) reconcileEngineFrontends() {
 	if os.Getenv("LONGHORN_V2_RECONCILE_ENGINE_FRONTENDS") == "0" {
 		logrus.Warn("EngineFrontend reconciler disabled via LONGHORN_V2_RECONCILE_ENGINE_FRONTENDS=0")
@@ -316,7 +377,15 @@ func (s *Server) reconcileOnce() {
 		logrus.WithError(err).Warn("EngineFrontend reconciler: failed to load records")
 		return
 	}
+
+	// Track which records still exist this tick so we can drop counters for
+	// records that have been deleted out from under us (avoids unbounded
+	// growth when EFs come and go).
+	seen := map[string]struct{}{}
+
 	for _, record := range records {
+		seen[record.Name] = struct{}{}
+
 		s.RLock()
 		ef := s.engineFrontendMap[record.Name]
 		spdkClient := s.spdkClient
@@ -328,32 +397,157 @@ func (s *Server) reconcileOnce() {
 			continue
 		}
 
-		// Only act on Error (partial host state vs record intent). Stopped
-		// is "nothing in place yet" and is the legitimate state for an EF
-		// whose Create RPC hasn't run yet — leave it alone. Running needs
-		// no action.
+		// Only Error advances the consecutive-failure counter. Running
+		// (including the Running-with-transient-kernel-state breadcrumb)
+		// resets it; Stopped is the legitimate pre-create state and is
+		// also non-Error.
 		if live.State != types.InstanceStateError {
+			s.Lock()
+			if s.engineFrontendDesyncCounts[record.Name] > 0 {
+				logrus.Infof("EngineFrontend reconciler: %s recovered after %d transient probe failures",
+					record.Name, s.engineFrontendDesyncCounts[record.Name])
+				delete(s.engineFrontendDesyncCounts, record.Name)
+			}
+			s.Unlock()
 			continue
 		}
 		if ef == nil {
 			// Record exists but no in-memory controller — IM probably
 			// just restarted and recoverEngineFrontends hasn't caught up.
-			// Skip; next tick will find it.
+			// Skip; next tick will find it. Don't bump the counter — this
+			// is a transient bookkeeping race, not a real desync.
 			continue
+		}
+
+		s.Lock()
+		s.engineFrontendDesyncCounts[record.Name]++
+		count := s.engineFrontendDesyncCounts[record.Name]
+		s.Unlock()
+
+		// Below the threshold: log the desync but don't tear anything down.
+		// The kernel may still be recovering, the manager may be in the
+		// middle of an RPC that we'd race, or this could be a one-off
+		// flap. We give it EngineFrontendHealConsecutiveFailures probes
+		// (~90s) before considering it stuck enough to act on.
+		if count < EngineFrontendHealConsecutiveFailures {
+			logrus.WithFields(logrus.Fields{
+				"name":   record.Name,
+				"reason": live.ErrorMsg,
+				"count":  count,
+				"thresh": EngineFrontendHealConsecutiveFailures,
+			}).Warn("EngineFrontend reconciler: desync observed, below heal threshold")
+			continue
+		}
+
+		// Threshold met. Before tearing host state down, check whether a
+		// userspace consumer has /dev/longhorn/<vol> open or mounted.
+		// Heal recreates dm-linear and the device file, swapping the
+		// underlying NVMe namespace; any filesystem mounted on top sees
+		// its block device disappear and goes into shutdown. Skip heal
+		// while a consumer is using the device — the consumer's
+		// continuing I/O is the strongest evidence the probe is over-
+		// eager. If the consumer is genuinely broken it will surface
+		// errors and eventually release the device, at which point a
+		// later tick finds no consumer and heal runs safely.
+		if record.Frontend == types.FrontendSPDKTCPBlockdev && live.Endpoint != "" {
+			inUse, why, checkErr := devicePathInUse(live.Endpoint)
+			if checkErr != nil {
+				logrus.WithError(checkErr).Warnf(
+					"EngineFrontend reconciler: failed to check consumer for %s; deferring heal",
+					record.Name)
+				continue
+			}
+			if inUse {
+				logrus.WithFields(logrus.Fields{
+					"name":     record.Name,
+					"endpoint": live.Endpoint,
+					"reason":   live.ErrorMsg,
+					"consumer": why,
+				}).Warn("EngineFrontend reconciler: heal deferred — live consumer on device")
+				continue
+			}
 		}
 
 		logrus.WithFields(logrus.Fields{
 			"name":     record.Name,
 			"reason":   live.ErrorMsg,
 			"endpoint": live.Endpoint,
-		}).Warn("EngineFrontend reconciler: detected desync, attempting heal")
+			"count":    count,
+		}).Warn("EngineFrontend reconciler: detected sustained desync, attempting heal")
 
 		if healErr := ef.Heal(spdkClient, record); healErr != nil {
 			logrus.WithError(healErr).Errorf("EngineFrontend reconciler: heal failed for %s; will retry next tick", record.Name)
 			continue
 		}
+
+		// Heal succeeded — clear the counter so the next desync starts
+		// from zero rather than firing immediately.
+		s.Lock()
+		delete(s.engineFrontendDesyncCounts, record.Name)
+		s.Unlock()
 		logrus.Infof("EngineFrontend reconciler: healed %s", record.Name)
 	}
+
+	// Garbage-collect counters for records that no longer exist (e.g. EF
+	// was deleted between ticks). Without this the map would grow
+	// monotonically on a long-lived IM.
+	s.Lock()
+	for name := range s.engineFrontendDesyncCounts {
+		if _, present := seen[name]; !present {
+			delete(s.engineFrontendDesyncCounts, name)
+		}
+	}
+	s.Unlock()
+}
+
+// devicePathInUse returns true if any process on the host has the given
+// device path open or has a filesystem mounted with it as the source.
+// Errors from individual probes are not fatal — we OR all signals; any
+// positive evidence of use returns true. The IM container has /host
+// bind-mounted from the node, so /host/proc and /host/proc/*/mountinfo
+// reflect the host's process state.
+func devicePathInUse(devicePath string) (bool, string, error) {
+	// Mount check: scan /host/proc/*/mountinfo. A process whose mount
+	// namespace has devicePath as a mount source means the device is
+	// actively serving a filesystem.
+	procDir := "/host/proc"
+	entries, err := os.ReadDir(procDir)
+	if err != nil {
+		return false, "", errors.Wrap(err, "devicePathInUse: read /host/proc")
+	}
+	// Resolve the device to its canonical path before comparing — the
+	// probe path may be /dev/longhorn/<vol> (a dm-linear device) and
+	// mountinfo may report it as either /dev/longhorn/<vol> directly or
+	// as /dev/dm-N. Stat to follow the symlink if present, then we'll
+	// match on both forms.
+	canonical := devicePath
+	if resolved, resolveErr := filepath.EvalSymlinks(devicePath); resolveErr == nil {
+		canonical = resolved
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		// Skip non-numeric pid entries cheaply.
+		if _, convErr := strconv.Atoi(e.Name()); convErr != nil {
+			continue
+		}
+		miPath := procDir + "/" + e.Name() + "/mountinfo"
+		data, readErr := os.ReadFile(miPath)
+		if readErr != nil {
+			// /proc entries can race — process exited mid-scan. Ignore.
+			continue
+		}
+		// mountinfo line format includes the mount source as field 10
+		// (1-indexed). Cheap substring check is sufficient — false
+		// positives are tolerable here (we'd just defer heal once more
+		// and recheck next tick).
+		text := string(data)
+		if strings.Contains(text, " "+devicePath+" ") || strings.Contains(text, " "+canonical+" ") {
+			return true, "mounted in pid " + e.Name(), nil
+		}
+	}
+	return false, "", nil
 }
 
 // Heal drives an EngineFrontend whose host-side state has desynced from its

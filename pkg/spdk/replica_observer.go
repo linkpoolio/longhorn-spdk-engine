@@ -21,6 +21,17 @@ import (
 // replica records and heals desync. 30s matches the EngineFrontend cadence.
 const ReplicaReconcileInterval = 30 * time.Second
 
+// ReplicaHealConsecutiveFailures is the number of consecutive Error
+// observations required before the Replica reconciler will fire heal.
+// Same rationale as EngineFrontendHealConsecutiveFailures: filter out
+// transient SPDK probe blips (BdevGetBdevs / NvmfGetSubsystems hitting a
+// busy reactor for a tick) from genuine listener-missing desync. Replica
+// heal is much less destructive than EngineFrontend heal — there's no
+// userspace fs mount to break, just brief I/O pauses on peer engines
+// reconnecting — so this guard is mostly belt-and-braces, but the cost is
+// negligible.
+const ReplicaHealConsecutiveFailures = 3
+
 // Heal drives a Replica whose host-side state has desynced from its persisted
 // record back into agreement. For replicas, the recoverable failure mode is
 // "head lvol present but not exposed" — re-run the StartExposeBdev call from
@@ -136,7 +147,14 @@ func (s *Server) reconcileReplicasOnce() {
 		logrus.WithError(err).Warn("Replica reconciler: failed to load records")
 		return
 	}
+
+	// Track which records we observed so we can GC stale counters at the
+	// end of the tick (records deleted between ticks).
+	seen := map[string]struct{}{}
+
 	for name, record := range records {
+		seen[name] = struct{}{}
+
 		s.RLock()
 		r := s.replicaMap[name]
 		spdkClient := s.spdkClient
@@ -145,48 +163,95 @@ func (s *Server) reconcileReplicasOnce() {
 
 		// Single observation function — same one ReplicaGet/List use.
 		// A *Replica back with State=Error means "head lvol on disk but
-		// no listener" → heal target. Other states (Running, Stopped)
-		// require no action from the reconciler.
+		// no listener exposed AND something probe-side is wrong" →
+		// candidate for heal. Other states (Running, Stopped) require no
+		// action from the reconciler.
 		derived, err := BuildReplicaFromRecord(spdkClient, record, nodeTransport)
 		if err != nil {
 			logrus.WithError(err).Warnf("Replica reconciler: probe failed for %s", record.Name)
 			continue
 		}
+
+		// Non-Error states reset the counter. Stopped is "the replica is
+		// legitimately not exposed right now" — usually fine, the manager
+		// will drive Create when it wants this exposed; not our job to
+		// heal toward Running.
 		if derived.State != types.InstanceStateError {
+			s.Lock()
+			if s.replicaDesyncCounts[record.Name] > 0 {
+				logrus.Infof("Replica reconciler: %s recovered after %d transient probe failures",
+					record.Name, s.replicaDesyncCounts[record.Name])
+				delete(s.replicaDesyncCounts, record.Name)
+			}
+			s.Unlock()
 			continue
 		}
 		if r == nil {
 			// No cached *Replica yet — verify() hasn't reconciled the
-			// cache after a recent IM restart. Skip; next tick will catch
-			// it once the cache is rebuilt and the per-replica mutex is
-			// available for Heal.
+			// cache after a recent IM restart. Skip; next tick will
+			// catch it. Don't bump the counter for this bookkeeping
+			// window.
+			continue
+		}
+
+		s.Lock()
+		s.replicaDesyncCounts[record.Name]++
+		count := s.replicaDesyncCounts[record.Name]
+		s.Unlock()
+
+		// Below threshold: log the desync and wait. Most "Error" probe
+		// outcomes for replicas are transient SPDK busy windows; only a
+		// sustained Error across multiple ticks justifies firing the
+		// re-expose flow.
+		if count < ReplicaHealConsecutiveFailures {
+			logrus.WithFields(logrus.Fields{
+				"name":   record.Name,
+				"reason": derived.ErrorMsg,
+				"count":  count,
+				"thresh": ReplicaHealConsecutiveFailures,
+			}).Warn("Replica reconciler: desync observed, below heal threshold")
 			continue
 		}
 
 		logrus.WithFields(logrus.Fields{
 			"name":   record.Name,
 			"reason": derived.ErrorMsg,
-		}).Warn("Replica reconciler: detected desync, attempting heal")
+			"count":  count,
+		}).Warn("Replica reconciler: detected sustained desync, attempting heal")
 
 		if healErr := r.Heal(spdkClient, record); healErr != nil {
 			logrus.WithError(healErr).Errorf("Replica reconciler: heal failed for %s; will retry next tick", record.Name)
 			continue
 		}
+
+		// Heal succeeded — reset counter so the next desync starts fresh.
+		s.Lock()
+		delete(s.replicaDesyncCounts, record.Name)
+		s.Unlock()
 		logrus.Infof("Replica reconciler: healed %s", record.Name)
 	}
+
+	// GC counters for records that no longer exist (e.g. replica deleted
+	// between ticks). Without this the map would grow monotonically on a
+	// long-lived IM with replicas churning.
+	s.Lock()
+	for name := range s.replicaDesyncCounts {
+		if _, present := seen[name]; !present {
+			delete(s.replicaDesyncCounts, name)
+		}
+	}
+	s.Unlock()
 }
 
 // BuildReplicaFromRecord constructs a transient *Replica populated from a
-// fresh SPDK observation + the persisted record. Used by ReplicaGet /
+// fresh SPDK observation plus the persisted record. Used by ReplicaGet /
 // ReplicaList / ReplicaWatch to serve reads without consulting
-// s.replicaMap — closes the TODO at server.go:193 (the cache is no longer
-// load-bearing for read paths).
+// s.replicaMap, so the cache is not load-bearing for read paths.
 //
-// The returned struct is suitable for ServiceReplicaToProtoReplica. It does
-// NOT carry workflow state (isRebuilding, isSnapshotCloning, etc.) — those
-// stay on the cached *Replica owned by mutating handlers. Build-from-SPDK
-// is the read-side equivalent; mutating handlers continue to use the cache
-// for per-replica mutex serialisation.
+// The returned struct is suitable for ServiceReplicaToProtoReplica. It
+// does not carry workflow state (isRebuilding, isSnapshotCloning, etc.);
+// those stay on the cached *Replica owned by mutating handlers. The
+// cache continues to provide per-replica mutex serialisation for writes.
 //
 // On any SPDK probe failure, returns a *Replica with State=InstanceStateError
 // and an explanatory ErrorMsg so the gRPC client gets a coherent answer

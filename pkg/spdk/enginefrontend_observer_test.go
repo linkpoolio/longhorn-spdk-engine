@@ -48,7 +48,7 @@ func (s *TestSuite) TestDeriveLiveStateBlockdevAllPresentAndLive(c *C) {
 	raw := &EngineFrontendObservedRaw{
 		SubsystemPresent:        true,
 		KernelControllerPresent: true,
-		KernelControllerLive:    true,
+		KernelControllerState:   KernelControllerStateLive,
 		DMDevicePresent:         true,
 		DevicePathExists:        true,
 		DevicePath:              "/dev/longhorn/pvc-58a5db03",
@@ -66,23 +66,42 @@ func (s *TestSuite) TestDeriveLiveStateBlockdevAllAbsentIsStopped(c *C) {
 	c.Check(live.Endpoint, Equals, "")
 }
 
-func (s *TestSuite) TestDeriveLiveStateBlockdevControllerNotLive(c *C) {
-	// All four layers present but kernel controller is in
-	// connecting/resetting/failed state. The bug behind this is what bit
-	// windrose 2026-04-25: dm exists, /dev/longhorn/<pvc> exists, ctrlr
-	// session exists but kernel reports it as not live → I/O fails. Map to
-	// Error so the reconciler tears down + recreates.
+func (s *TestSuite) TestDeriveLiveStateBlockdevControllerTransientStaysRunning(c *C) {
+	// All four layers present but kernel controller is in connecting/
+	// resetting (kernel-internal recovery from a keep-alive blip). The
+	// kernel returns the ctrlr to `live` within ctrlr_loss_timeout — heal
+	// would race that recovery and could destroy filesystems mounted on
+	// the device. Report Running and stash the state in ErrorMsg as a
+	// debugging breadcrumb only.
 	rec := &EngineFrontendRecord{Name: "ef-1", Frontend: types.FrontendSPDKTCPBlockdev}
 	raw := &EngineFrontendObservedRaw{
 		SubsystemPresent:        true,
 		KernelControllerPresent: true,
-		KernelControllerLive:    false,
+		KernelControllerState:   KernelControllerStateTransient,
+		DMDevicePresent:         true,
+		DevicePathExists:        true,
+		DevicePath:              "/dev/longhorn/pvc-x",
+	}
+	live := deriveLiveState(rec, raw)
+	c.Check(live.State, Equals, types.InstanceState(types.InstanceStateRunning))
+	c.Check(live.Endpoint, Equals, "/dev/longhorn/pvc-x")
+	c.Check(strings.Contains(live.ErrorMsg, "transient"), Equals, true)
+}
+
+func (s *TestSuite) TestDeriveLiveStateBlockdevControllerDead(c *C) {
+	// Kernel has given up on the controller — `dead` or `deleting`
+	// state — and will not recover on its own. Real desync; heal needed.
+	rec := &EngineFrontendRecord{Name: "ef-1", Frontend: types.FrontendSPDKTCPBlockdev}
+	raw := &EngineFrontendObservedRaw{
+		SubsystemPresent:        true,
+		KernelControllerPresent: true,
+		KernelControllerState:   KernelControllerStateDead,
 		DMDevicePresent:         true,
 		DevicePathExists:        true,
 	}
 	live := deriveLiveState(rec, raw)
 	c.Check(live.State, Equals, types.InstanceState(types.InstanceStateError))
-	c.Check(strings.Contains(live.ErrorMsg, "not in live state"), Equals, true)
+	c.Check(strings.Contains(live.ErrorMsg, "dead/absent"), Equals, true)
 }
 
 func (s *TestSuite) TestDeriveLiveStateBlockdevPartialDmMissing(c *C) {
@@ -93,7 +112,7 @@ func (s *TestSuite) TestDeriveLiveStateBlockdevPartialDmMissing(c *C) {
 	raw := &EngineFrontendObservedRaw{
 		SubsystemPresent:        true,
 		KernelControllerPresent: true,
-		KernelControllerLive:    true,
+		KernelControllerState:   KernelControllerStateLive,
 		DMDevicePresent:         false,
 		DevicePathExists:        false,
 	}
@@ -105,7 +124,7 @@ func (s *TestSuite) TestDeriveLiveStateBlockdevPartialDmMissing(c *C) {
 func (s *TestSuite) TestDeriveLiveStateBlockdevPartialKernelMissing(c *C) {
 	// SPDK + dm present but kernel session vanished (NVMe controller got
 	// removed, perhaps by a stray disconnect). dm-linear now points at a
-	// dead device. Recorded windrose-flavoured failure mode.
+	// dead device.
 	rec := &EngineFrontendRecord{Name: "ef-1", Frontend: types.FrontendSPDKTCPBlockdev}
 	raw := &EngineFrontendObservedRaw{
 		SubsystemPresent:        true,
@@ -127,13 +146,28 @@ func (s *TestSuite) TestDeriveLiveStateBlockdevPartialSubsystemMissing(c *C) {
 	raw := &EngineFrontendObservedRaw{
 		SubsystemPresent:        false,
 		KernelControllerPresent: true,
-		KernelControllerLive:    false,
+		KernelControllerState:   KernelControllerStateDead,
 		DMDevicePresent:         true,
 		DevicePathExists:        true,
 	}
 	live := deriveLiveState(rec, raw)
 	c.Check(live.State, Equals, types.InstanceState(types.InstanceStateError))
 	c.Check(strings.Contains(live.ErrorMsg, "spdk-subsystem"), Equals, true)
+}
+
+func (s *TestSuite) TestClassifyKernelControllerState(c *C) {
+	c.Check(classifyKernelControllerState("live"), Equals, KernelControllerStateLive)
+	c.Check(classifyKernelControllerState("LIVE"), Equals, KernelControllerStateLive)
+	c.Check(classifyKernelControllerState("dead"), Equals, KernelControllerStateDead)
+	c.Check(classifyKernelControllerState("deleting"), Equals, KernelControllerStateDead)
+	c.Check(classifyKernelControllerState("deleting (no IO)"), Equals, KernelControllerStateDead)
+	c.Check(classifyKernelControllerState(""), Equals, KernelControllerStateAbsent)
+	// Anything else (connecting, resetting, new, future kernel additions)
+	// — bias to transient so we never tear down on an unrecognised state.
+	c.Check(classifyKernelControllerState("connecting"), Equals, KernelControllerStateTransient)
+	c.Check(classifyKernelControllerState("resetting"), Equals, KernelControllerStateTransient)
+	c.Check(classifyKernelControllerState("new"), Equals, KernelControllerStateTransient)
+	c.Check(classifyKernelControllerState("some-future-state"), Equals, KernelControllerStateTransient)
 }
 
 func (s *TestSuite) TestDeriveLiveStateUnknownFrontendIsError(c *C) {
