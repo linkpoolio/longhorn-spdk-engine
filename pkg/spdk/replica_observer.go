@@ -318,7 +318,7 @@ func BuildReplicaFromRecord(spdkClient *spdkclient.Client, record *ReplicaRecord
 // of replica lvols all start with the replica name (head is exact, snapshots
 // are <name>-snap-<id>).
 func isReplicaBdev(bdev *spdktypes.BdevInfo, replicaName, lvsUUID string) bool {
-	if bdev == nil || bdev.DriverSpecific == nil {
+	if bdev == nil || bdev.DriverSpecific == nil || bdev.DriverSpecific.Lvol == nil {
 		return false
 	}
 	if len(bdev.Aliases) == 0 {
