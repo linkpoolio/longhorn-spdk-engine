@@ -37,6 +37,7 @@ type EngineRecord struct {
 	NvmeTcpTarget       *NvmeTcpTarget                  `json:"nvmeTcpTarget,omitempty"`
 	DeltaBitmapEnabled  bool                            `json:"deltaBitmapEnabled,omitempty"`
 	ReplicaDirtyBitmaps map[string]*ReplicaDirtyBitmap  `json:"replicaDirtyBitmaps,omitempty"`
+	QosLimits           QosLimits                       `json:"qosLimits,omitempty"`
 }
 
 func engineRecordDir(metadataDir, engineName string) string {
@@ -99,6 +100,7 @@ func saveEngineRecord(metadataDir string, e *Engine) error {
 		NvmeTcpTarget:       nvmeTarget,
 		DeltaBitmapEnabled:  e.deltaBitmapEnabled,
 		ReplicaDirtyBitmaps: bitmapsCopy,
+		QosLimits:           e.QosLimits,
 	}
 
 	dir := engineRecordDir(metadataDir, e.Name)
@@ -235,6 +237,7 @@ func (e *Engine) restoreFromRecord(rec *EngineRecord) {
 		e.NvmeTcpTarget = &t
 	}
 	e.deltaBitmapEnabled = rec.DeltaBitmapEnabled
+	e.QosLimits = rec.QosLimits
 	if len(rec.ReplicaDirtyBitmaps) > 0 {
 		e.ReplicaDirtyBitmaps = make(map[string]*ReplicaDirtyBitmap, len(rec.ReplicaDirtyBitmaps))
 		for name, bm := range rec.ReplicaDirtyBitmaps {

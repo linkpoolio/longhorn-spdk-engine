@@ -115,6 +115,26 @@ func (m *MockReplicaAdder) ReplicaAddFinish(srcReplicaServiceCli, dstReplicaServ
 	return m.Real.ReplicaAddFinish(srcReplicaServiceCli, dstReplicaServiceCli, srcReplicaName, srcReplicaAddress, dstReplicaName, dstReplicaAddress)
 }
 
+// QosLimits is a per-engine cap on aggregate raid bdev I/O. Applied via
+// SPDK's bdev_set_qos_limit on the raid bdev (engine-level, not per-replica),
+// so rebuild traffic — which goes engine→replica directly via NVMe-oF rather
+// than through the raid bdev — is not subject to the cap. Zero in any field
+// means "unlimited" (SPDK convention). All four fields can be set
+// independently; SPDK enforces them as separate token buckets.
+type QosLimits struct {
+	RwIOsPerSec int64 `json:"rwIOsPerSec,omitempty"`
+	RwMBPerSec  int64 `json:"rwMBPerSec,omitempty"`
+	RMBPerSec   int64 `json:"rMBPerSec,omitempty"`
+	WMBPerSec   int64 `json:"wMBPerSec,omitempty"`
+}
+
+// IsZero reports whether the QoS struct has any non-default value. Used to
+// skip the SPDK call entirely when no limits are configured (the default
+// no-op state — most volumes won't have QoS set).
+func (q QosLimits) IsZero() bool {
+	return q.RwIOsPerSec == 0 && q.RwMBPerSec == 0 && q.RMBPerSec == 0 && q.WMBPerSec == 0
+}
+
 type Engine struct {
 	sync.RWMutex
 
@@ -124,6 +144,11 @@ type Engine struct {
 	ActualSize uint64
 	Frontend   string
 	Endpoint   string
+
+	// QosLimits caps aggregate raid bdev I/O. Applied at Create time and
+	// re-applied on observer-driven reconstruct. Live updates go through
+	// the EngineSetQosLimit gRPC handler.
+	QosLimits QosLimits
 
 	ctrlrLossTimeout     int
 	fastIOFailTimeoutSec int
@@ -384,6 +409,22 @@ func (e *Engine) Create(spdkClient *spdkclient.Client, replicaAddressMap map[str
 	e.log.Infof("Connected all available replicas %+v, then launching raid during engine creation", e.ReplicaStatusMap)
 	if _, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, "", e.deltaBitmapEnabled); err != nil {
 		return nil, err
+	}
+
+	// Apply per-volume QoS to the raid bdev. SPDK enforces the four limits
+	// as separate token buckets; rebuild traffic bypasses this cap because
+	// it goes engine→replica directly via NVMe-oF rather than through the
+	// raid bdev.
+	if !e.QosLimits.IsZero() {
+		if err := spdkClient.BdevSetQosLimit(e.Name,
+			e.QosLimits.RwIOsPerSec,
+			e.QosLimits.RwMBPerSec,
+			e.QosLimits.RMBPerSec,
+			e.QosLimits.WMBPerSec); err != nil {
+			return nil, errors.Wrapf(err, "failed to apply QoS limits to raid bdev for engine %v", e.Name)
+		}
+		e.log.Infof("Applied QoS limits to raid bdev: rwIOPS=%d rwMBps=%d rMBps=%d wMBps=%d",
+			e.QosLimits.RwIOsPerSec, e.QosLimits.RwMBPerSec, e.QosLimits.RMBPerSec, e.QosLimits.WMBPerSec)
 	}
 
 	switch e.Frontend {
@@ -952,6 +993,38 @@ func releasePortIfExists(superiorPortAllocator *commonbitmap.Bitmap, ports map[i
 		delete(ports, port)
 	}
 
+	return nil
+}
+
+// SetQosLimit applies a new QoS configuration to the engine's raid bdev
+// at runtime. Used for changing the cap on an attached volume without
+// re-creating it. Persists the new limits to the engine record so a
+// subsequent IM restart re-applies them on raid reconstruction.
+//
+// limits.IsZero() is the legitimate "remove the cap" state — passes
+// zeros to SPDK which sets every bucket to unlimited.
+func (e *Engine) SetQosLimit(spdkClient *spdkclient.Client, limits QosLimits) error {
+	e.Lock()
+	defer e.Unlock()
+
+	if e.State != types.InstanceStateRunning {
+		return fmt.Errorf("engine %s state %s is not running, refusing to set QoS", e.Name, e.State)
+	}
+
+	if err := spdkClient.BdevSetQosLimit(e.Name,
+		limits.RwIOsPerSec,
+		limits.RwMBPerSec,
+		limits.RMBPerSec,
+		limits.WMBPerSec); err != nil {
+		return errors.Wrapf(err, "failed to set QoS limits on raid bdev for engine %v", e.Name)
+	}
+
+	e.QosLimits = limits
+	if saveErr := saveEngineRecord(e.metadataDir, e); saveErr != nil {
+		e.log.WithError(saveErr).Warn("Failed to persist engine record after QoS update; new limits in effect but won't survive restart")
+	}
+	e.log.Infof("Updated QoS limits: rwIOPS=%d rwMBps=%d rMBps=%d wMBps=%d",
+		limits.RwIOsPerSec, limits.RwMBPerSec, limits.RMBPerSec, limits.WMBPerSec)
 	return nil
 }
 
@@ -2943,6 +3016,19 @@ func (e *Engine) reconstructRaidBdev(spdkClient *spdkclient.Client, bdevRaidUUID
 
 	if _, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, bdevRaidUUID, e.deltaBitmapEnabled); err != nil {
 		return err
+	}
+
+	// Re-apply persisted QoS limits to the freshly reconstructed raid bdev.
+	// SPDK's bdev_set_qos_limit state lives on the bdev itself, so a new
+	// bdev (even with the same name + UUID) starts with no limits.
+	if !e.QosLimits.IsZero() {
+		if qosErr := spdkClient.BdevSetQosLimit(e.Name,
+			e.QosLimits.RwIOsPerSec,
+			e.QosLimits.RwMBPerSec,
+			e.QosLimits.RMBPerSec,
+			e.QosLimits.WMBPerSec); qosErr != nil {
+			e.log.WithError(qosErr).Warn("Failed to re-apply QoS limits after raid reconstruction; proceeding with unlimited")
+		}
 	}
 
 	// wait the raid bdev is created
