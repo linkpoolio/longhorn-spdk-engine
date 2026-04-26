@@ -19,7 +19,7 @@ import (
 // transport (RDMA when supported, TCP otherwise) for each replica. When nil or
 // empty, the engine falls back to replicaAddressMap with its own
 // replicaTransport for every replica.
-func (c *SPDKClient) EngineCreate(name, volumeName, frontend string, specSize uint64, replicaAddressMap map[string]string, replicaTransportAddressMap map[string]*spdkrpc.ReplicaTransportAddresses, portCount int32, salvageRequested bool) (*api.Engine, error) {
+func (c *SPDKClient) EngineCreate(name, volumeName, frontend string, specSize uint64, replicaAddressMap map[string]string, replicaTransportAddressMap map[string]*spdkrpc.ReplicaTransportAddresses, portCount int32, salvageRequested bool, qosLimits *spdkrpc.QosLimits) (*api.Engine, error) {
 	if name == "" {
 		return nil, fmt.Errorf("failed to start engine: missing required parameter name")
 	}
@@ -43,12 +43,36 @@ func (c *SPDKClient) EngineCreate(name, volumeName, frontend string, specSize ui
 		ReplicaTransportAddressMap: replicaTransportAddressMap,
 		PortCount:                  portCount,
 		SalvageRequested:           salvageRequested,
+		QosLimits:                  qosLimits,
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to start engine")
 	}
 
 	return api.ProtoEngineToEngine(resp), nil
+}
+
+// EngineSetQosLimit applies new QoS limits to a running engine's raid bdev.
+// Used by longhorn-manager to push StorageClass-derived QoS changes onto
+// attached volumes without re-creating them. Pass an all-zero QosLimits to
+// remove the cap.
+func (c *SPDKClient) EngineSetQosLimit(name string, qosLimits *spdkrpc.QosLimits) error {
+	if name == "" {
+		return fmt.Errorf("failed to set engine QoS: missing required parameter name")
+	}
+	if qosLimits == nil {
+		return fmt.Errorf("failed to set engine QoS: missing required parameter qosLimits (use all-zero fields for unlimited)")
+	}
+
+	client := c.getSPDKServiceClient()
+	ctx, cancel := context.WithTimeout(context.Background(), GRPCServiceTimeout)
+	defer cancel()
+
+	_, err := client.EngineSetQosLimit(ctx, &spdkrpc.EngineSetQosLimitRequest{
+		Name:      name,
+		QosLimits: qosLimits,
+	})
+	return errors.Wrapf(err, "failed to set QoS on engine %v", name)
 }
 
 // EngineDelete deletes an engine instance by name.
