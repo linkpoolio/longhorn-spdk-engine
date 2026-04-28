@@ -501,10 +501,11 @@ func (c *Client) BdevLvolResize(name string, sizeInMib uint64) (resized bool, er
 //	"srcLvolName": Required. UUID or alias of lvol to create a copy from.
 //
 //	"dstBdevName": Required. Name of the bdev that acts as destination for the copy.
-func (c *Client) BdevLvolStartShallowCopy(srcLvolName, dstBdevName string) (operationId uint32, err error) {
+func (c *Client) BdevLvolStartShallowCopy(srcLvolName, dstBdevName string, pipelineDepth uint32) (operationId uint32, err error) {
 	req := spdktypes.BdevLvolShallowCopyRequest{
-		SrcLvolName: srcLvolName,
-		DstBdevName: dstBdevName,
+		SrcLvolName:   srcLvolName,
+		DstBdevName:   dstBdevName,
+		PipelineDepth: pipelineDepth,
 	}
 
 	cmdOutput, err := c.jsonCli.SendCommand("bdev_lvol_start_shallow_copy", req)
@@ -531,11 +532,12 @@ func (c *Client) BdevLvolStartShallowCopy(srcLvolName, dstBdevName string) (oper
 //	"dstBdevName": Required. Name of the bdev that acts as destination for the copy.
 //
 //	"clusters": Required. Array of clusters indexes to be synchronized with copy or unmap.
-func (c *Client) BdevLvolStartRangeShallowCopy(srcLvolName, dstBdevName string, clusters []uint64) (operationId uint32, err error) {
+func (c *Client) BdevLvolStartRangeShallowCopy(srcLvolName, dstBdevName string, clusters []uint64, pipelineDepth uint32) (operationId uint32, err error) {
 	req := spdktypes.BdevLvolRangeShallowCopyRequest{
-		SrcLvolName: srcLvolName,
-		DstBdevName: dstBdevName,
-		Clusters:    clusters,
+		SrcLvolName:   srcLvolName,
+		DstBdevName:   dstBdevName,
+		Clusters:      clusters,
+		PipelineDepth: pipelineDepth,
 	}
 
 	cmdOutput, err := c.jsonCli.SendCommand("bdev_lvol_start_range_shallow_copy", req)

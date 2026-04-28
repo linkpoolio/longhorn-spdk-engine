@@ -2899,7 +2899,7 @@ func (r *Replica) RebuildingSrcShallowCopyStart(spdkClient *spdkclient.Client, s
 		return errors.Wrapf(err, "failed to stop snapshot %s(%s) checksum hashing before replica %s rebuilding src starts shallow copy from it", snapLvolName, snapshotName, r.Name)
 	}
 
-	if shallowCopyOpID, err = spdkClient.BdevLvolStartShallowCopy(snapLvol.UUID, r.rebuildingSrcCache.dstRebuildingBdevName); err != nil {
+	if shallowCopyOpID, err = spdkClient.BdevLvolStartShallowCopy(snapLvol.UUID, r.rebuildingSrcCache.dstRebuildingBdevName, defaultShallowCopyPipelineDepth); err != nil {
 		return err
 	}
 	r.rebuildingSrcCache.shallowCopySnapshotName = snapshotName
@@ -3004,7 +3004,7 @@ func (r *Replica) RebuildingSrcRangeShallowCopyStart(spdkClient *spdkclient.Clie
 				return
 			}
 
-			shallowCopyOpID, err := spdkClient.BdevLvolStartRangeShallowCopy(snapSvcLvolAlias, dstRebuildingBdevName, mismatchingClusterList[head:tail])
+			shallowCopyOpID, err := spdkClient.BdevLvolStartRangeShallowCopy(snapSvcLvolAlias, dstRebuildingBdevName, mismatchingClusterList[head:tail], defaultShallowCopyPipelineDepth)
 			if err != nil {
 				r.Unlock()
 				cpErr = errors.Wrapf(err, "failed to start range shallow copy in cluster range [%d, %d] to dst replica %s rebuilding bdev %s for rebuilding src replica %s range shallow copy snapshot %s(%s)(%s)", mismatchingClusterList[head], mismatchingClusterList[tail-1], dstReplicaName, dstRebuildingBdevName, r.Name, snapshotName, snapSvcLvolAlias, snapSvcLvolUUID)

@@ -80,6 +80,6 @@ require (
 	k8s.io/utils v0.0.0-20251002143259-bc988d571ff4 // indirect
 )
 
-replace github.com/longhorn/go-spdk-helper => github.com/linkpoolio/go-spdk-helper v0.6.1-0.20260425092232-6e8595453dd6
+replace github.com/longhorn/go-spdk-helper => github.com/linkpoolio/go-spdk-helper v0.6.1-0.20260428164441-6eb8d4bfec38
 
 replace github.com/longhorn/types => github.com/linkpoolio/types v0.0.0-20260426093344-f10eaa212bd4

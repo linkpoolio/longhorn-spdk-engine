@@ -157,14 +157,16 @@ type BdevLvolResizeRequest struct {
 }
 
 type BdevLvolShallowCopyRequest struct {
-	SrcLvolName string `json:"src_lvol_name"`
-	DstBdevName string `json:"dst_bdev_name"`
+	SrcLvolName    string `json:"src_lvol_name"`
+	DstBdevName    string `json:"dst_bdev_name"`
+	PipelineDepth  uint32 `json:"pipeline_depth,omitempty"`
 }
 
 type BdevLvolRangeShallowCopyRequest struct {
-	SrcLvolName string   `json:"src_lvol_name"`
-	DstBdevName string   `json:"dst_bdev_name"`
-	Clusters    []uint64 `json:"clusters"`
+	SrcLvolName    string   `json:"src_lvol_name"`
+	DstBdevName    string   `json:"dst_bdev_name"`
+	Clusters       []uint64 `json:"clusters"`
+	PipelineDepth  uint32   `json:"pipeline_depth,omitempty"`
 }
 
 type BdevLvolDeepCopyRequest struct {

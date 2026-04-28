@@ -42,8 +42,14 @@ const (
 	disconnectMaxRetries    = 5
 	disconnectRetryInterval = 1 * time.Second
 
-	MaxShallowCopyWaitTime   = 72 * time.Hour
-	ShallowCopyCheckInterval = 3 * time.Second
+	MaxShallowCopyWaitTime = 72 * time.Hour
+	// ShallowCopyCheckInterval gates how often the rebuild loop polls
+	// bdev_lvol_check_shallow_copy. SPDK reports per-batch progress; with
+	// shallow_copy QD>1 each batch finishes 4-8x faster, so a 3s poll cadence
+	// dominates total rebuild time on multi-batch (256 clusters per RPC) jobs
+	// — at 200ms × ~800 batches for a 50 TiB volume the inter-batch gap is
+	// ~minutes; at 3s it is ~tens of minutes.
+	ShallowCopyCheckInterval = 200 * time.Millisecond
 
 	MaxSnapshotCloneWaitTime         = 72 * time.Hour
 	SnapshotCloneStatusCheckInterval = 3 * time.Second
@@ -153,6 +159,15 @@ var (
 	// LVM LV) so the blobstore-level thin tracking adds no capacity
 	// savings and only contributes latency.
 	defaultThinProvision = true
+
+	// defaultShallowCopyPipelineDepth is the QD passed to
+	// bdev_lvol_start_(range_)shallow_copy. depth=1 keeps the upstream
+	// strict-serial walker (one cluster read+write in flight at a time);
+	// higher depths let the walker keep multiple cluster_sz DMA buffers in
+	// flight on the source side, removing the QD=1 ceiling on rebuild
+	// throughput. Peak source-side memory is depth*cluster_sz per active
+	// rebuild. Override with LONGHORN_V2_SHALLOW_COPY_PIPELINE_DEPTH.
+	defaultShallowCopyPipelineDepth uint32 = 1
 )
 
 // accelMlx5NumRequests sizes the per-device mkey pool for the accel_mlx5
@@ -237,6 +252,11 @@ func init() {
 			defaultThinProvision = false
 		case "1", "true", "yes", "on":
 			defaultThinProvision = true
+		}
+	}
+	if v, ok := os.LookupEnv("LONGHORN_V2_SHALLOW_COPY_PIPELINE_DEPTH"); ok {
+		if parsed, err := strconv.ParseUint(strings.TrimSpace(v), 10, 32); err == nil {
+			defaultShallowCopyPipelineDepth = uint32(parsed)
 		}
 	}
 }
