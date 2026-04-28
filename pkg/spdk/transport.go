@@ -90,34 +90,23 @@ var (
 		DataWrPoolSize:      uint32(envIntOrDefault("LONGHORN_V2_NVMF_RDMA_DATA_WR_POOL_SIZE", 4095)),
 		AcceptorPollRate:    uint32(envIntOrDefault("LONGHORN_V2_NVMF_RDMA_ACCEPTOR_POLL_RATE", 10000)),
 	}
-	// TCP tunables. Defaults are tuned for high-concurrency NVMe-oF over
-	// 100 GbE on this fleet, where the SPDK upstream defaults left the
-	// engine buffer-pool starved (saw ~2 GB/s on 4 streams, ~16% NIC).
-	//
-	//   NumSharedBuffers=8192 — upstream default is 2047. TCP reuses the
-	//   same buffer for both kernel socket staging and SPDK request
-	//   dispatch; under concurrent streams the pool is the dominant
-	//   bottleneck. Doubled past RDMA's 4095 because TCP residency per
-	//   buffer is higher (kernel sk_buff + SPDK request).
-	//
-	//   InCapsuleDataSize=16384 — upstream default is 4096. For any write
-	//   ≤16K (filesystem metadata, journal, small object writes) the data
-	//   ships in the same TCP segment as the command, saving a round-trip
-	//   per I/O.
-	//
-	//   BufCacheSize=256 — upstream default is 64. Per-channel cache
-	//   reduces atomic contention on the shared buffer pool. Fits inside
-	//   NumSharedBuffers / num_channels with headroom.
+	// TCP transport opts. Defaults match SPDK upstream — bumping any of
+	// these eats DPDK heap that the accel_mlx5 signature/UMR mempools also
+	// pull from on RDMA nodes, and we hit ENOMEM during accel module init
+	// (subsystem init failed → IM exit) when NumSharedBuffers/BufCacheSize/
+	// InCapsuleDataSize were tuned up fleet-wide. Keep env knobs so
+	// individual TCP-only nodes can opt back into bigger pools without an
+	// IM rebuild — we just won't ship aggressive defaults again.
 	nvmfTcpOpts = spdktypes.NvmfCreateTransportRequest{
 		Trtype:              spdktypes.NvmeTransportTypeTCP,
 		MaxQueueDepth:       uint32(envIntOrDefault("LONGHORN_V2_NVMF_TCP_MAX_QUEUE_DEPTH", 128)),
 		MaxIoQpairsPerCtrlr: uint32(envIntOrDefault("LONGHORN_V2_NVMF_TCP_MAX_IO_QPAIRS_PER_CTRLR", 127)),
-		InCapsuleDataSize:   uint32(envIntOrDefault("LONGHORN_V2_NVMF_TCP_IN_CAPSULE_DATA_SIZE", 16384)),
+		InCapsuleDataSize:   uint32(envIntOrDefault("LONGHORN_V2_NVMF_TCP_IN_CAPSULE_DATA_SIZE", 4096)),
 		MaxIoSize:           uint32(envIntOrDefault("LONGHORN_V2_NVMF_TCP_MAX_IO_SIZE", 131072)),
 		IoUnitSize:          uint32(envIntOrDefault("LONGHORN_V2_NVMF_TCP_IO_UNIT_SIZE", 131072)),
 		MaxAqDepth:          uint32(envIntOrDefault("LONGHORN_V2_NVMF_TCP_MAX_AQ_DEPTH", 128)),
-		NumSharedBuffers:    uint32(envIntOrDefault("LONGHORN_V2_NVMF_TCP_NUM_SHARED_BUFFERS", 8192)),
-		BufCacheSize:        uint32(envIntOrDefault("LONGHORN_V2_NVMF_TCP_BUF_CACHE_SIZE", 256)),
+		NumSharedBuffers:    uint32(envIntOrDefault("LONGHORN_V2_NVMF_TCP_NUM_SHARED_BUFFERS", 2047)),
+		BufCacheSize:        uint32(envIntOrDefault("LONGHORN_V2_NVMF_TCP_BUF_CACHE_SIZE", 64)),
 		Zcopy:               boolPtr(true),
 		AcceptorPollRate:    uint32(envIntOrDefault("LONGHORN_V2_NVMF_TCP_ACCEPTOR_POLL_RATE", 10000)),
 	}

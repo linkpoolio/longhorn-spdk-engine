@@ -89,15 +89,13 @@ var (
 
 	// iobuf pool sizes. SPDK defaults (large=1024, small=8192) are too small
 	// once nvmf transports are created with num_shared_buffers tuned above
-	// the ancient default. Sized to RDMA's NumSharedBuffers=4095 + headroom.
-	// TCP NumSharedBuffers=8192 is a ceiling, not steady-state — if peak
-	// load exhausts the pool, bump LONGHORN_V2_IOBUF_LARGE_POOL_COUNT per-
-	// node (16 GiB storage workers can take 16384; 2 GiB engine-only
-	// consumers can't).
+	// the ancient default. Sized to accommodate nvmf num_shared_buffers=2047
+	// per transport (TCP large + RDMA small) plus headroom for accel/bdev
+	// channel caches.
 	//
 	// Memory cost: large (132 KiB × 4096) ≈ 528 MiB; small (8 KiB × 8192)
-	// ≈ 64 MiB. Fits the 2 GiB engine-only --mem-size and leaves plenty
-	// of room on the 16 GiB storage-node budget.
+	// ≈ 64 MiB. Fits comfortably in the 2 GiB engine-only --mem-size and
+	// leaves plenty of room on the 16 GiB storage-node budget.
 	iobufLargePoolCount uint64 = 4096
 	iobufSmallPoolCount uint64 = 8192
 
