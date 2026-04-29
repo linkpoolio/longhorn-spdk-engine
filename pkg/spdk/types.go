@@ -168,6 +168,18 @@ var (
 	// throughput. Peak source-side memory is depth*cluster_sz per active
 	// rebuild. Override with LONGHORN_V2_SHALLOW_COPY_PIPELINE_DEPTH.
 	defaultShallowCopyPipelineDepth uint32 = 1
+
+	// lvolWipeSuperBytes is the leading-region size we zero on a freshly-
+	// created thick lvol via bdev_write_zeroes. SPDK's bdev_lvol_create is
+	// metadata-only — clusters are reserved but their underlying bytes are
+	// whatever the bdev returns. On NVMe drives that don't honour DLFEAT
+	// bit 2 (deallocated-blocks-return-zero) a fresh thick lvol can expose
+	// a stale FS/partition signature from a previously-deleted lvol; CSI's
+	// blkid then sees "existing FS" and skips mkfs, and the subsequent
+	// mount fails. 8 MiB clobbers every common magic blkid scans for
+	// (XFS, ext{2,3,4}, btrfs, GPT, MBR, LVM2, mdraid, swap, etc.).
+	// Mirrors Mayastor's WIPE_SUPER_LEN.
+	lvolWipeSuperBytes uint64 = 8 * 1024 * 1024
 )
 
 // accelMlx5NumRequests sizes the per-device mkey pool for the accel_mlx5

@@ -1775,6 +1775,38 @@ func (c *Client) BdevGetIostat(name string, perChannel bool) (resp *spdktypes.Bd
 	return resp, nil
 }
 
+// BdevWriteZeroes issues a write-zeroes operation against a bdev. Used to
+// clobber stale FS/partition magic on a freshly-created thick lvol when the
+// underlying device doesn't honour zero-on-deallocate (NVMe DLFEAT bit 2
+// unset), so blkid sees a clean device on first attach instead of leaking a
+// previous tenant's superblock through.
+//
+//	"name":   Required. Bdev name.
+//	"offset": Offset in bytes from the start of the bdev.
+//	"length": Length in bytes to zero.
+func (c *Client) BdevWriteZeroes(bdevName string, offset, length uint64) error {
+	params := map[string]interface{}{
+		"name":   bdevName,
+		"offset": offset,
+		"length": length,
+	}
+
+	resp, err := c.jsonCli.SendCommand("bdev_write_zeroes", params)
+	if err != nil {
+		return errors.Wrap(err, "failed to send bdev_write_zeroes")
+	}
+
+	var result bool
+	if err := json.Unmarshal(resp, &result); err != nil {
+		return errors.Wrapf(err, "invalid response format: %s", string(resp))
+	}
+	if !result {
+		return fmt.Errorf("SPDK returned false for bdev_write_zeroes")
+	}
+
+	return nil
+}
+
 // BdevSetQosLimit sets the quality of service rate limits on a bdev.
 //
 //	"name": Required. Block device name to apply QoS settings to.

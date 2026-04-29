@@ -990,6 +990,16 @@ func (r *Replica) prepareHead(spdkClient *spdkclient.Client, backingImage *Backi
 			if _, err := spdkClient.BdevLvolCreate("", r.LvsUUID, r.Name, util.BytesToMiB(r.SpecSize), spdktypes.BdevLvolClearMethod(defaultLvolClearMethod), defaultThinProvision); err != nil {
 				return err
 			}
+			// On thick creates, wipe the leading region so any stale FS/partition
+			// magic left on the underlying NAND (DLFEAT-deficient drives don't
+			// zero on deallocate) doesn't leak through and trip CSI's blkid into
+			// skipping mkfs. Thin lvols read zeros for unallocated clusters by
+			// construction, so no wipe is needed.
+			if !defaultThinProvision {
+				if err := spdkClient.BdevWriteZeroes(r.Alias, 0, lvolWipeSuperBytes); err != nil {
+					return errors.Wrapf(err, "failed to wipe leading region of new head lvol %s", r.Alias)
+				}
+			}
 			r.log.Info("Replica created a new head lvol")
 		}
 	} else {
