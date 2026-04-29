@@ -898,6 +898,23 @@ func (e *Engine) Delete(spdkClient *spdkclient.Client, superiorPortAllocator *co
 
 	e.log.Info("Deleting engine")
 
+	// Order matters here. Deleting the raid bdev BEFORE stopping the
+	// nvmf-tcp exposure is what guarantees forward progress when one of
+	// the raid1 legs is wedged (e.g. dead replica with in-flight I/O that
+	// won't complete). The raid bdev's async unregister fires
+	// SPDK_BDEV_EVENT_REMOVE on every open descriptor, including the
+	// nvmf namespace's. That triggers a subsystem pause that force-fails
+	// every in-flight namespace I/O with -ENODEV, which in turn lets
+	// every ctrlr's qpair drain. Without that, the later
+	// nvmf_delete_subsystem inside StopExposeBdev hangs waiting for the
+	// subsystem to reach INACTIVE — and because StopExposeBdev has
+	// already removed the listener and the namespace by then, the volume
+	// becomes permanently unreachable until the IM is bounced. See the
+	// 2026-04-29 berachain-bepolia incident for the wedge in the wild.
+	if _, err := spdkClient.BdevRaidDelete(e.Name); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
+		return err
+	}
+
 	e.log.Infof("Stopping to expose RAID bdev for engine %s", e.Name)
 	switch e.Frontend {
 	case types.FrontendUBLK:
@@ -923,10 +940,6 @@ func (e *Engine) Delete(spdkClient *spdkclient.Client, superiorPortAllocator *co
 	}
 
 	requireUpdate = true
-
-	if _, err := spdkClient.BdevRaidDelete(e.Name); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
-		return err
-	}
 
 	requireUpdate, err = e.disconnectReplicas(spdkClient)
 	if err != nil {
@@ -2730,16 +2743,21 @@ func (e *Engine) Expand(spdkClient *spdkclient.Client, size uint64) (err error) 
 	}
 	defer e.closeReplicaClients(replicaClients)
 
-	e.log.Infof("Stopping to expose RAID bdev for engine %s", e.Name)
-	switch e.Frontend {
-	case types.FrontendUBLK:
+	// UBLK frontend can't expand on the v2 path; bail before touching state.
+	if e.Frontend == types.FrontendUBLK {
 		return fmt.Errorf("not support ublk frontend for expansion for engine %s", e.Name)
-	case types.FrontendSPDKTCPBlockdev, types.FrontendSPDKTCPNvmf:
-		if err := spdkClient.StopExposeBdev(e.NvmeTcpTarget.Nqn); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
-			return errors.Wrapf(err, "failed to stop exposing bdev for engine %s", e.Name)
-		}
 	}
 
+	// Tear down the RAID bdev BEFORE stopping the nvmf-tcp exposure. The
+	// raid bdev's async unregister fires SPDK_BDEV_EVENT_REMOVE on the
+	// nvmf namespace's open descriptor, which pauses the subsystem and
+	// fails every in-flight namespace I/O with -ENODEV — the only thing
+	// that lets ctrlrs whose qpairs are stuck on a wedged base bdev
+	// drain. Without that, StopExposeBdev's nvmf_delete_subsystem hangs
+	// waiting for INACTIVE while the listener is already gone, and the
+	// volume is permanently unreachable until the IM is bounced. Same
+	// reasoning as Engine.Delete; see the 2026-04-29 berachain-bepolia
+	// incident.
 	e.log.Infof("Tearing down RAID bdev for engine %s", e.Name)
 	raidBdevUUID, err := e.tearDownRaidBdev(spdkClient)
 	if err != nil {
@@ -2747,6 +2765,14 @@ func (e *Engine) Expand(spdkClient *spdkclient.Client, size uint64) (err error) 
 	}
 	if e.RaidBdevUUID == "" {
 		e.RaidBdevUUID = raidBdevUUID
+	}
+
+	e.log.Infof("Stopping to expose RAID bdev for engine %s", e.Name)
+	switch e.Frontend {
+	case types.FrontendSPDKTCPBlockdev, types.FrontendSPDKTCPNvmf:
+		if err := spdkClient.StopExposeBdev(e.NvmeTcpTarget.Nqn); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
+			return errors.Wrapf(err, "failed to stop exposing bdev for engine %s", e.Name)
+		}
 	}
 
 	// Perform expansion
