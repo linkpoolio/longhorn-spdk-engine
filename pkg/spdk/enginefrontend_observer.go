@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -317,16 +318,38 @@ func ObserveEngineFrontend(ctx context.Context, spdkClient *spdkclient.Client, r
 	// /host/dev over /dev (see package/instance-manager bind_dev), so the
 	// host-side longhorn device file is stat-able from inside the IM at
 	// the path returned by util.GetLonghornDevicePath.
+	//
+	// os.Stat alone is not sufficient: when `dmsetup remove` succeeds but
+	// the device-file mknod inode survives (or hasn't been re-cleaned by
+	// the IM), os.Stat keeps returning success on an orphaned file whose
+	// underlying dm-linear device has been torn down. The only clue from
+	// userland that the dm is actually dead is that opening the device
+	// returns ENXIO ("No such device or address"). We use a non-blocking
+	// open as the liveness probe — cheap, race-free, and matches what any
+	// real I/O consumer would observe. Without this check, deriveLiveState
+	// would report the four layers as present and `live.State == Running`
+	// for a volume whose host stack is in fact half-broken; ValidateAndUpdate's
+	// own validation would correctly flag Error but the reconciler's
+	// soft-sync would then clear it as "stale", papering over the real
+	// desync.
 	devPath := helperutil.GetLonghornDevicePath(record.VolumeName)
 	raw.DevicePath = devPath
-	if _, statErr := os.Stat(devPath); statErr == nil {
+	if statInfo, statErr := os.Stat(devPath); statErr == nil {
 		raw.DevicePathExists = true
-		// In our deployment, the longhorn device path /dev/longhorn/<vol>
-		// IS the dm-linear device. If the kernel ctrlr is also present,
-		// that confirms the dm stack is intact. Distinguishing a "dm
-		// exists but pointing at dead nvme" case is covered by the
-		// KernelControllerPresent=false branch in deriveLiveState.
-		raw.DMDevicePresent = true
+		// Only probe dm liveness if it's actually a block-device file —
+		// guards against confused state where a regular file ended up at
+		// the path.
+		if statInfo.Mode()&os.ModeDevice != 0 {
+			f, openErr := os.OpenFile(devPath, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+			if openErr == nil {
+				_ = f.Close()
+				raw.DMDevicePresent = true
+			}
+			// openErr (ENXIO when the dm-linear table is gone, or any
+			// other error) leaves DMDevicePresent=false so deriveLiveState
+			// classifies as a partial/Error state and the reconciler's
+			// destructive Heal can drive recovery.
+		}
 	} else if !os.IsNotExist(statErr) {
 		// Unexpected stat error (permission, EIO, etc.) — surface but
 		// don't bail; the partial Raw still produces a correct Error
