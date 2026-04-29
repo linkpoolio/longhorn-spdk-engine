@@ -409,6 +409,11 @@ func (s *Server) reconcileOnce() {
 				delete(s.engineFrontendDesyncCounts, record.Name)
 			}
 			s.Unlock()
+
+			if live.State == types.InstanceStateRunning && ef != nil {
+				ef.clearStaleErrorIfHealthy()
+			}
+
 			continue
 		}
 		if ef == nil {
@@ -631,4 +636,41 @@ func describePartialState(raw *EngineFrontendObservedRaw) string {
 		missing = append(missing, "/dev/longhorn-file")
 	}
 	return "EngineFrontend desync: missing layers: " + strings.Join(missing, ",")
+}
+
+// clearStaleErrorIfHealthy is the non-destructive sibling of Heal: when
+// the reconciler observes a Running data path but the in-memory ef.State
+// has drifted to Error, flip ef.State back to Running. Heal owns the case
+// where the host stack is also Error (tear down + recreate); this method
+// owns the case where ef.State is the only thing wrong (no teardown).
+//
+// Drift happens because four code paths set ef.State = Error
+// (Create-fail / snapshot-resume-fail / ValidateAndUpdate-fail / Recover
+// FromHost-fail) but none of the State→Running transitions run unprompted
+// — they fire only on explicit Create / Resume / Expand / RecoverFromHost.
+// Without this correction, AddReplica's "ef.State == Running" precondition
+// rejects rebuild forever; the volume stays degraded indefinitely.
+//
+// State isn't persisted in EngineFrontendRecord, so no record-write is
+// needed. UpdateCh is fired so longhorn-manager observes the recovery
+// on its next watch tick.
+func (ef *EngineFrontend) clearStaleErrorIfHealthy() {
+	ef.Lock()
+	if ef.State != types.InstanceStateError {
+		ef.Unlock()
+		return
+	}
+	if ef.isCreating || ef.isSwitchingOver || ef.isExpanding || ef.IsRestoring {
+		ef.Unlock()
+		return
+	}
+
+	previousErrorMsg := ef.ErrorMsg
+	ef.State = types.InstanceStateRunning
+	ef.ErrorMsg = ""
+	ef.Unlock()
+
+	ef.log.WithField("previousErrorMsg", previousErrorMsg).
+		Info("EngineFrontend reconciler: cleared stale Error ef.State (live data path is Running)")
+	ef.UpdateCh <- nil
 }
