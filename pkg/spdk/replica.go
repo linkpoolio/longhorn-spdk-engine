@@ -1380,11 +1380,22 @@ func (r *Replica) Delete(spdkClient *spdkclient.Client, cleanupRequired bool, su
 		return errors.Wrapf(err, "failed to stop all snapshot hashing before replica deletion with cleanupRequired %v", cleanupRequired)
 	}
 
+	// Blindly unexpose the main replica NQN. The in-memory r.IsExposed flag
+	// can drift out of sync with SPDK truth (e.g. after an interrupted
+	// rebuild/cloning teardown that resets r.IsExposed=false without
+	// actually deleting the subsystem). When that happens, gating on
+	// r.IsExposed leaves the main subsystem alive with active listeners,
+	// and BuildReplicaFromRecord — which derives state from SPDK presence,
+	// not from r.State — keeps reporting the replica as Running. The
+	// replica controller then loops calling Delete forever, never observing
+	// the desired Stopped state. StopExposeBdev is idempotent (returns
+	// NoSuchDevice when the subsystem is already gone), so always calling
+	// it is safe and ensures the main subsystem actually gets torn down.
+	r.log.Info("Unexposing bdev for replica deletion")
+	if err := spdkClient.StopExposeBdev(helpertypes.GetNQN(r.Name)); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
+		return err
+	}
 	if r.IsExposed {
-		r.log.Info("Unexposing bdev for replica deletion")
-		if err := spdkClient.StopExposeBdev(helpertypes.GetNQN(r.Name)); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
-			return err
-		}
 		r.IsExposed = false
 		updateRequired = true
 	}
