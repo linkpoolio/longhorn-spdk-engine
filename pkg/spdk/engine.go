@@ -235,15 +235,14 @@ func (e *Engine) targetTransport() NvmfTransportType {
 }
 
 // resolveCntlidRange returns the cntlid [min, max] range for this engine's
-// subsystem. Single-listener engines keep the legacy scheme (range size 1);
-// dual-listener RDMA engines draw from a disjoint, offset range so rolling
-// upgrades cannot collide legacy and dual-listener cntlids on the same NQN.
+// subsystem. Every engine generation gets a large, disjoint window so that
+// (a) initiator reconnect churn can never exhaust the subsystem's controller
+// slots, and (b) the two consecutive-ordinal targets that briefly share an NQN
+// during a live migration / engine upgrade never collide. RDMA engines expose
+// their RDMA and TCP-fallback listeners on the same subsystem, so a single
+// range covers both. See getEngineCntlidRange for the allocation scheme.
 func (e *Engine) resolveCntlidRange() (uint16, uint16) {
-	if e.targetTransport().IsRDMA() {
-		return getEngineDualCntlidRange(e.Name)
-	}
-	cntlid := getEngineCntlid(e.Name)
-	return cntlid, cntlid + 3
+	return getEngineCntlidRange(e.Name)
 }
 
 type EngineReplicaStatus struct {
@@ -905,8 +904,21 @@ func (e *Engine) Delete(spdkClient *spdkclient.Client, superiorPortAllocator *co
 			return errors.Wrapf(err, "failed to destroy UBLK target for engine %s", e.Name)
 		}
 	case types.FrontendSPDKTCPBlockdev, types.FrontendSPDKTCPNvmf:
+		// Best-effort teardown. A subsystem can wedge such that its
+		// per-subsystem RPCs (nvmf_subsystem_get_listeners,
+		// nvmf_delete_subsystem) hang and only return on the client timeout —
+		// e.g. after a failed replica rebuild leaves the subsystem in a stuck
+		// state. nvmf_get_subsystems still responds instantly, so the target as
+		// a whole is healthy; only operations on this one subsystem block, and
+		// no graceful SPDK call can clear it short of an instance-manager
+		// restart. If we treated that as fatal here, engine deletion would
+		// never complete: the volume stays pinned in `deleting` indefinitely
+		// and the initiator's reconnect loop floods the target with keep-alive
+		// timeouts. So proceed with deletion regardless — the orphaned
+		// subsystem is reclaimed when the instance-manager / spdk_tgt restarts.
+		// (Expand() intentionally keeps this fatal; only deletion is best-effort.)
 		if err := spdkClient.StopExposeBdev(e.NvmeTcpTarget.Nqn); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
-			return errors.Wrapf(err, "failed to stop exposing bdev for engine %s", e.Name)
+			e.log.WithError(err).Warnf("Failed to stop exposing bdev for engine %s during deletion; proceeding so the engine can be removed (subsystem %s may leak until the instance-manager restarts)", e.Name, e.NvmeTcpTarget.Nqn)
 		}
 	}
 
@@ -924,13 +936,22 @@ func (e *Engine) Delete(spdkClient *spdkclient.Client, superiorPortAllocator *co
 
 	requireUpdate = true
 
-	if _, err := spdkClient.BdevRaidDelete(e.Name); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
-		return err
+	// Best-effort (see the StopExposeBdev note above): if the subsystem teardown
+	// was skipped because it wedged, the RAID bdev may still be claimed by the
+	// leftover namespace and BdevRaidDelete can fail/hang. Don't let that pin
+	// the engine in `deleting` — proceed and let the instance-manager restart
+	// reclaim it.
+	if _, rdErr := spdkClient.BdevRaidDelete(e.Name); rdErr != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(rdErr) {
+		e.log.WithError(rdErr).Warnf("Failed to delete RAID bdev for engine %s during deletion; proceeding (will be reclaimed on instance-manager restart)", e.Name)
 	}
 
-	requireUpdate, err = e.disconnectReplicas(spdkClient)
-	if err != nil {
-		return err
+	// Best-effort: a failure to detach the engine's replica initiator
+	// connections must not block engine removal either. Replica lvol teardown
+	// happens independently when the replica CRs are deleted.
+	ru, drErr := e.disconnectReplicas(spdkClient)
+	requireUpdate = requireUpdate || ru
+	if drErr != nil {
+		e.log.WithError(drErr).Warnf("Failed to disconnect all replicas for engine %s during deletion; proceeding", e.Name)
 	}
 
 	if rmErr := removeEngineRecord(e.metadataDir, e.Name); rmErr != nil {
@@ -1269,8 +1290,8 @@ func (e *Engine) replicaAddStart(spdkClient *spdkclient.Client, replicaClients m
 		Timestamp: util.Now(),
 	}
 	addLog := e.log.WithFields(map[string]interface{}{
-		"dstReplica":     dstReplicaName,
-		"srcReplica":     srcReplicaName,
+		"dstReplica":      dstReplicaName,
+		"srcReplica":      srcReplicaName,
 		"rebuildSnapshot": snapshotName,
 	})
 
