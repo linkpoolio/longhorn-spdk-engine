@@ -44,9 +44,16 @@ type NvmeTcpTarget struct {
 	IP   string
 	Port int32
 
-	Nqn      string
-	Nguid    string
-	ANAState NvmeTCPANAState
+	Nqn       string
+	Nguid     string
+	ANAState  NvmeTCPANAState
+	Transport NvmfTransportType
+
+	// TCPFallbackPort is the secondary TCP listener port used on
+	// RDMA-capable nodes. The fallback listener stays pinned at
+	// NvmeTCPANAStateNonOptimized; ANA switchover only flips the primary.
+	// Zero means no fallback (primary is already TCP).
+	TCPFallbackPort int32
 }
 
 func toSPDKListenerANAState(anaState NvmeTCPANAState) (spdktypes.NvmfSubsystemListenerAnaState, error) {
@@ -225,6 +232,16 @@ type EngineReplicaStatus struct {
 	Transport NvmfTransportType
 }
 
+// transportOrDefault returns the per-replica Transport if set, otherwise the
+// supplied default (typically the engine's replicaTransport). Lets reconnect
+// paths handle older persisted records written before the field existed.
+func (s *EngineReplicaStatus) transportOrDefault(def NvmfTransportType) NvmfTransportType {
+	if s == nil || s.Transport == "" {
+		return def
+	}
+	return s.Transport
+}
+
 // QosLimits caps aggregate raid bdev I/O via SPDK bdev_set_qos_limit.
 type QosLimits struct {
 	RwIOsPerSec int64 `json:"rwIOsPerSec,omitempty"`
@@ -289,7 +306,7 @@ func NewEngine(engineName, volumeName, frontend string, specSize uint64, replica
 	return e
 }
 
-func (e *Engine) Create(spdkClient *spdkclient.Client, replicaAddressMap map[string]string, portCount int32, superiorPortAllocator *commonbitmap.Bitmap,
+func (e *Engine) Create(spdkClient *spdkclient.Client, replicaAddressMap map[string]string, replicaTransportAddressMap map[string]*spdkrpc.ReplicaTransportAddresses, portCount int32, superiorPortAllocator *commonbitmap.Bitmap,
 	salvageRequested bool) (ret *spdkrpc.Engine, err error) {
 	e.log.WithFields(logrus.Fields{
 		"portCount":         portCount,
@@ -346,7 +363,7 @@ func (e *Engine) Create(spdkClient *spdkclient.Client, replicaAddressMap map[str
 		}
 	}
 
-	replicaBdevList := e.connectReplicas(spdkClient, replicaAddressMap)
+	replicaBdevList := e.connectReplicas(spdkClient, replicaAddressMap, replicaTransportAddressMap)
 
 	e.log.UpdateLoggerWithWarnOnFailure(logrus.Fields{
 		"replicaStatusMap": e.ReplicaStatusMap,
@@ -436,16 +453,70 @@ func (e *Engine) createNVMeTCPTarget(spdkClient *spdkclient.Client, superiorPort
 
 // connectReplicas connects to each replica's NVMf bdev and populates
 // ReplicaStatusMap. It returns the list of successfully connected bdev names.
-func (e *Engine) connectReplicas(spdkClient *spdkclient.Client, replicaAddressMap map[string]string) []string {
+// replicaTransport is the NVMe-oF transport this engine dials replicas over,
+// falling back to the default when unset (older records / v1 paths).
+func (e *Engine) replicaTransport() NvmfTransportType {
+	if e.ReplicaTransport == "" {
+		return DefaultNvmfTransport
+	}
+	return e.ReplicaTransport
+}
+
+// targetTransport is the transport this engine's own NVMe-oF target exposes.
+func (e *Engine) targetTransport() NvmfTransportType {
+	if e.NvmeTcpTarget == nil || e.NvmeTcpTarget.Transport == "" {
+		return DefaultNvmfTransport
+	}
+	return e.NvmeTcpTarget.Transport
+}
+
+// pickReplicaAddress selects the address + transport to dial for a replica.
+// When the transport-aware map carries an entry for the replica it is used;
+// otherwise the legacy address is dialed with the engine's replicaTransport().
+func (e *Engine) pickReplicaAddress(replicaName, legacyAddress string, replicaTransportAddressMap map[string]*spdkrpc.ReplicaTransportAddresses) (string, NvmfTransportType) {
+	tAddrs, ok := replicaTransportAddressMap[replicaName]
+	if !ok || tAddrs == nil {
+		return legacyAddress, e.replicaTransport()
+	}
+	return e.pickFromTransportAddresses(legacyAddress, tAddrs)
+}
+
+// pickRebuildDstAddress applies the same selection rule to a rebuild
+// destination's transport addresses.
+func (e *Engine) pickRebuildDstAddress(legacyAddress string, tAddrs *spdkrpc.ReplicaTransportAddresses) (string, NvmfTransportType) {
+	return e.pickFromTransportAddresses(legacyAddress, tAddrs)
+}
+
+// pickFromTransportAddresses is the shared selection rule: prefer the RDMA
+// address when this engine is RDMA-capable and the replica advertises one;
+// otherwise fall back to the replica's TCP address; otherwise the legacy
+// address with the engine's default transport.
+func (e *Engine) pickFromTransportAddresses(legacyAddress string, tAddrs *spdkrpc.ReplicaTransportAddresses) (string, NvmfTransportType) {
+	if tAddrs == nil {
+		return legacyAddress, e.replicaTransport()
+	}
+	if e.replicaTransport().IsRDMA() && tAddrs.RdmaAddress != "" {
+		return tAddrs.RdmaAddress, NvmfTransportRDMA
+	}
+	if tAddrs.TcpAddress != "" {
+		return tAddrs.TcpAddress, NvmfTransportTCP
+	}
+	return legacyAddress, e.replicaTransport()
+}
+
+func (e *Engine) connectReplicas(spdkClient *spdkclient.Client, replicaAddressMap map[string]string, replicaTransportAddressMap map[string]*spdkrpc.ReplicaTransportAddresses) []string {
 	replicaBdevList := []string{}
 	for replicaName, replicaAddr := range replicaAddressMap {
+		addr, transport := e.pickReplicaAddress(replicaName, replicaAddr, replicaTransportAddressMap)
 		e.ReplicaStatusMap[replicaName] = &EngineReplicaStatus{
-			Address: replicaAddr,
+			Address:       replicaAddr,
+			DialedAddress: addr,
+			Transport:     transport,
 		}
 
-		bdevName, err := connectNVMfBdev(spdkClient, replicaName, replicaAddr, e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
+		bdevName, err := connectNVMfBdevWithTransport(spdkClient, replicaName, addr, transport, e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
 		if err != nil {
-			e.log.WithError(err).Warnf("Failed to get bdev from replica %s with address %s during engine creation, will mark the mode to ERR and continue", replicaName, replicaAddr)
+			e.log.WithError(err).Warnf("Failed to get bdev from replica %s with canonical address %s dialed at %s (transport=%s) during engine creation, will mark the mode to ERR and continue", replicaName, replicaAddr, addr, transport)
 			e.ReplicaStatusMap[replicaName].Mode = types.ModeERR
 		} else {
 			// TODO: Check if a replica is really a RW replica rather than a rebuilding failed replica
