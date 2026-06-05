@@ -409,6 +409,10 @@ func (s *Server) rebuildCachedLvolObjects(state *verifyState) error {
 	}
 	lvsUUIDNameMap := buildLvsUUIDNameMap(lvsList)
 
+	// Load persisted replica port records once so reconstructed replicas can
+	// reuse their original ports after an IM restart instead of reallocating.
+	replicaRecords, _ := loadReplicaRecords(s.metadataDir)
+
 	// Detect if the lvol bdev is an uncached replica or backing image.
 	for lvolName, bdevLvol := range bdevLvolMap {
 		if bdevLvol.DriverSpecific.Lvol.Snapshot && !types.IsBackingImageSnapLvolName(lvolName) {
@@ -468,8 +472,15 @@ func (s *Server) rebuildCachedLvolObjects(state *verifyState) error {
 			lvsUUID := bdevLvol.DriverSpecific.Lvol.LvolStoreUUID
 			specSize := bdevLvol.NumBlocks * uint64(bdevLvol.BlockSize)
 			actualSize := bdevLvol.DriverSpecific.Lvol.NumAllocatedClusters * uint64(defaultClusterSize)
-			state.replicaMap[lvolName] = NewReplica(s.ctx, lvolName, lvsUUIDNameMap[lvsUUID], lvsUUID, specSize, true, s.nodeTransport, s.updateChs[types.InstanceTypeReplica])
-			state.replicaMapForSync[lvolName] = state.replicaMap[lvolName]
+			r := NewReplica(s.ctx, lvolName, lvsUUIDNameMap[lvsUUID], lvsUUID, specSize, true, s.nodeTransport, s.updateChs[types.InstanceTypeReplica])
+			r.metadataDir = s.metadataDir
+			if rec, ok := replicaRecords[lvolName]; ok {
+				if err := r.restoreFromRecord(rec); err != nil {
+					logrus.WithError(err).Warnf("Failed to restore persisted state for replica %s; will use fresh port allocation", lvolName)
+				}
+			}
+			state.replicaMap[lvolName] = r
+			state.replicaMapForSync[lvolName] = r
 			logrus.Infof("Detected one possible existing replica %s(%s) with disk %s(%s), spec size %d, actual size %d", bdevLvol.Aliases[0], bdevLvol.UUID, lvsUUIDNameMap[lvsUUID], lvsUUID, specSize, actualSize)
 		}
 	}
@@ -643,7 +654,9 @@ func (s *Server) newReplica(req *spdkrpc.ReplicaCreateRequest) (*Replica, error)
 	if !exists {
 		return nil, fmt.Errorf("lvstore %v(%v) does not exist for replica %v creation", req.LvsName, req.LvsUuid, req.Name)
 	}
-	return NewReplica(s.ctx, req.Name, req.LvsName, req.LvsUuid, req.SpecSize, true, s.nodeTransport, s.updateChs[types.InstanceTypeReplica]), nil
+	r = NewReplica(s.ctx, req.Name, req.LvsName, req.LvsUuid, req.SpecSize, true, s.nodeTransport, s.updateChs[types.InstanceTypeReplica])
+	r.metadataDir = s.metadataDir
+	return r, nil
 }
 
 func (s *Server) getBackingImage(backingImageName, lvsUUID string) (backingImage *BackingImage, err error) {

@@ -333,6 +333,10 @@ func (r *Replica) prepareIPAndPorts(portCount int32, superiorPortAllocator *comm
 
 	r.log.Infof("Prepared IP %s and Ports [%d, %d] for replica", r.IP, r.PortStart, r.PortEnd)
 
+	if err := saveReplicaRecord(r.metadataDir, r); err != nil {
+		r.log.WithError(err).Warn("Failed to persist replica port record; reconnect-after-restart may reallocate ports")
+	}
+
 	return nil
 }
 
@@ -1310,6 +1314,10 @@ func (r *Replica) Delete(spdkClient *spdkclient.Client, cleanupRequired bool, su
 		r.portAllocator = nil
 		r.PortStart, r.PortEnd = 0, 0
 		updateRequired = true
+	}
+
+	if err := removeReplicaRecord(r.metadataDir, r.Name); err != nil {
+		r.log.WithError(err).Warn("Failed to remove persisted replica record during cleanup delete")
 	}
 
 	if !cleanupRequired {
@@ -4430,5 +4438,20 @@ func (r *Replica) addTCPFallbackListener(spdkClient *spdkclient.Client, nqn stri
 	); err != nil {
 		return errors.Wrapf(err, "failed to add TCP fallback listener on %s:%s for nqn %s", r.IP, fallbackPort, nqn)
 	}
+	return nil
+}
+func (r *Replica) restoreFromRecord(rec *ReplicaRecord) error {
+	if rec == nil {
+		return nil
+	}
+	bitmap, err := commonbitmap.NewBitmap(rec.PortStart+2, rec.PortEnd)
+	if err != nil {
+		return err
+	}
+	r.IP = rec.IP
+	r.PortStart = rec.PortStart
+	r.PortEnd = rec.PortEnd
+	r.portAllocator = bitmap
+	r.log.Infof("Restored replica port range [%d, %d] from persisted record", rec.PortStart, rec.PortEnd)
 	return nil
 }
