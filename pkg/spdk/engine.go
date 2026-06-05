@@ -124,6 +124,16 @@ type Engine struct {
 	ActualSize uint64
 	Frontend   string
 
+	// ReplicaTransport is this engine node's NVMe-oF transport (TCP or RDMA),
+	// derived from the IM's node transport. It selects which replica listener
+	// the engine dials and which transport its own target exposes.
+	ReplicaTransport NvmfTransportType
+
+	// QosLimits caps aggregate raid bdev I/O. Applied at Create time and
+	// re-applied on observer-driven reconstruct. Live updates go through
+	// the EngineSetQosLimit gRPC handler.
+	QosLimits QosLimits
+
 	ctrlrLossTimeout     int
 	fastIOFailTimeoutSec int
 	ReplicaStatusMap     map[string]*EngineReplicaStatus
@@ -131,6 +141,29 @@ type Engine struct {
 	RaidBdevUUID string
 
 	NvmeTcpTarget *NvmeTcpTarget
+
+	// metadataDir, when non-empty, enables on-disk persistence of engine state
+	// to <metadataDir>/engines/<name>/engine.json. Mirrors the pattern in
+	// replica.go and enginefrontend.go; the server wires this at engine
+	// construction time. Recovery uses loadEngineRecords + restoreFromRecord.
+	metadataDir string
+
+	// deltaBitmapEnabled toggles SPDK raid1's per-base-bdev dirty-region
+	// tracking. When true, a base bdev that disconnects retains its bitmap
+	// of dirty regions and on reconnect only those regions need re-copying
+	// instead of a full resync. Set at engine construction; callers that
+	// re-create the raid (snapshot revert, backup restore, reconstruct)
+	// must pass the same value to keep the flag stable across a volume's
+	// lifetime. Default true; can be forced off via LONGHORN_V2_RAID_DELTA_BITMAP=0
+	// if the base bdev layer doesn't report optimal_io_boundary.
+	deltaBitmapEnabled bool
+
+	// ReplicaDirtyBitmaps maps replica name → last-captured dirty bitmap
+	// from the moment the replica transitioned to ERR. Used on reconnect
+	// to drive incremental (shallow-copy-only-the-dirty-regions) rebuild
+	// instead of full resync. Entries are cleared once the replica
+	// returns to RW. Survives IM restart via EngineRecord.
+	ReplicaDirtyBitmaps map[string]*ReplicaDirtyBitmap
 
 	State    types.InstanceState
 	ErrorMsg string
@@ -171,12 +204,43 @@ type Engine struct {
 }
 
 type EngineReplicaStatus struct {
-	Address  string
-	BdevName string
-	Mode     types.Mode
+	// Address is the canonical NVMe-oF address for this replica as supplied
+	// by the manager in spec.replicaAddressMap (the replica's primary
+	// listener). This is what we report back to the manager so its
+	// reconciler can match replicas by address. For the address the engine
+	// actually dialed — which may differ when we pick the TCP fallback
+	// listener because our node transport doesn't match the replica's
+	// primary — see DialedAddress.
+	Address string
+	// DialedAddress is the NVMe-oF address the engine's bdev_nvme
+	// controller is actually attached to. Equal to Address when the engine
+	// and replica transports match; equal to the replica's tcpAddress (on
+	// port+1) when the engine fell back to TCP against an RDMA-primary
+	// replica listener. Reconnect/attach paths must dial this, not Address.
+	DialedAddress string
+	BdevName      string
+	Mode          types.Mode
+	// Transport is the NVMe-oF transport this replica's bdev_nvme controller
+	// was attached over (TCP or RDMA) — i.e. the transport of DialedAddress.
+	Transport NvmfTransportType
 }
 
-func NewEngine(engineName, volumeName, frontend string, specSize uint64, engineUpdateCh chan interface{}, snapshotMaxCount int32) *Engine {
+// QosLimits caps aggregate raid bdev I/O via SPDK bdev_set_qos_limit.
+type QosLimits struct {
+	RwIOsPerSec int64 `json:"rwIOsPerSec,omitempty"`
+	RwMBPerSec  int64 `json:"rwMBPerSec,omitempty"`
+	RMBPerSec   int64 `json:"rMBPerSec,omitempty"`
+	WMBPerSec   int64 `json:"wMBPerSec,omitempty"`
+}
+
+// IsZero reports whether the QoS struct has any non-default value. Used to
+// skip the SPDK call entirely when no limits are configured (the default
+// no-op state — most volumes won't have QoS set).
+func (q QosLimits) IsZero() bool {
+	return q.RwIOsPerSec == 0 && q.RwMBPerSec == 0 && q.RMBPerSec == 0 && q.WMBPerSec == 0
+}
+
+func NewEngine(engineName, volumeName, frontend string, specSize uint64, replicaTransport NvmfTransportType, engineUpdateCh chan interface{}, snapshotMaxCount int32) *Engine {
 	log := logrus.StandardLogger().WithFields(logrus.Fields{
 		"engineName": engineName,
 		"volumeName": volumeName,
@@ -198,6 +262,10 @@ func NewEngine(engineName, volumeName, frontend string, specSize uint64, engineU
 		VolumeName: volumeName,
 		Frontend:   frontend,
 		SpecSize:   specSize,
+
+		ReplicaTransport: replicaTransport,
+
+		deltaBitmapEnabled: defaultRaidDeltaBitmapEnabled(),
 
 		// TODO: support user-defined values
 		ctrlrLossTimeout:     replicaCtrlrLossTimeoutSec,
@@ -287,7 +355,7 @@ func (e *Engine) Create(spdkClient *spdkclient.Client, replicaAddressMap map[str
 	e.checkAndUpdateInfoFromReplicasNoLock()
 
 	e.log.Infof("Connected all available replicas %+v, then launching raid during engine creation", e.ReplicaStatusMap)
-	if _, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, ""); err != nil {
+	if _, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, "", e.deltaBitmapEnabled); err != nil {
 		return nil, err
 	}
 
@@ -1751,7 +1819,7 @@ func (e *Engine) snapshotOperationWithoutLock(spdkClient *spdkclient.Client, rep
 
 		engineErr = retrygo.Do(
 			func() error {
-				_, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, "")
+				_, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, "", e.deltaBitmapEnabled)
 				return err
 			},
 			retrygo.Attempts(uint(maxRetries)),
@@ -2883,7 +2951,7 @@ func (e *Engine) reconstructRaidBdev(spdkClient *spdkclient.Client, bdevRaidUUID
 		return fmt.Errorf("no healthy replica bdevs available for RAID creation")
 	}
 
-	if _, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, bdevRaidUUID); err != nil {
+	if _, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, bdevRaidUUID, e.deltaBitmapEnabled); err != nil {
 		return err
 	}
 
