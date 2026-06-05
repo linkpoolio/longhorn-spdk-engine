@@ -3284,7 +3284,11 @@ func (e *Engine) ValidateAndUpdate(spdkClient *spdkclient.Client) (err error) {
 		return err
 	}
 
+	previousModes := e.snapshotReplicaModesNoLock()
 	containValidReplica := e.validateReplicaStatusMapNoLock(bdevMap, &updateRequired)
+	// Capture the dirty bitmap of any replica that just transitioned to ERR,
+	// so a later reconnect can do an incremental (dirty-region-only) rebuild.
+	e.captureBitmapsForFaultedReplicasNoLock(spdkClient, previousModes)
 
 	e.log.UpdateLoggerWithWarnOnFailure(logrus.Fields{
 		"replicaStatusMap": e.ReplicaStatusMap,

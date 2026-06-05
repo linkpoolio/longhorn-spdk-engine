@@ -119,3 +119,17 @@ func (e *Engine) captureBitmapForReplicaNoLock(spdkClient *spdkclient.Client, re
 		replicaName, bdevName, resp.RegionSize)
 	return nil
 }
+
+// snapshotReplicaModesNoLock captures the current per-replica mode before a
+// validation pass, so captureBitmapsForFaultedReplicasNoLock can detect which
+// replicas transitioned RW->ERR during this tick. Caller must hold e.Lock.
+func (e *Engine) snapshotReplicaModesNoLock() map[string]types.Mode {
+	prev := make(map[string]types.Mode, len(e.ReplicaStatusMap))
+	for name, status := range e.ReplicaStatusMap {
+		if status == nil {
+			continue
+		}
+		prev[name] = status.Mode
+	}
+	return prev
+}
