@@ -74,6 +74,12 @@ type Replica struct {
 	PortStart int32
 	PortEnd   int32
 
+	// ListenerTransport is the NVMe-oF transport this replica's primary
+	// listener exposes (TCP or RDMA), derived from the IM node transport.
+	// On RDMA-capable nodes a secondary TCP fallback listener is also added
+	// at tcpFallbackPort() so TCP-only engines can still attach.
+	ListenerTransport NvmfTransportType
+
 	State    types.InstanceState
 	ErrorMsg string
 
@@ -110,6 +116,11 @@ type Replica struct {
 	portAllocator *commonbitmap.Bitmap
 	// UpdateCh should not be protected by the replica lock
 	UpdateCh chan interface{}
+
+	// metadataDir, when non-empty, enables on-disk persistence of replica port
+	// state to <metadataDir>/replicas/<name>/replica.json, so a reconnect after
+	// an IM restart reuses the same ports instead of reallocating.
+	metadataDir string
 
 	log *safelog.SafeLogger
 
@@ -207,6 +218,7 @@ type DeepCopyStatus struct {
 }
 
 func ServiceReplicaToProtoReplica(r *Replica) *spdkrpc.Replica {
+	tcpPort, rdmaPort := r.listenerPortsForTransport()
 	res := &spdkrpc.Replica{
 		Name:      r.Name,
 		LvsName:   r.LvsName,
@@ -216,6 +228,8 @@ func ServiceReplicaToProtoReplica(r *Replica) *spdkrpc.Replica {
 		Ip:        r.IP,
 		PortStart: r.PortStart,
 		PortEnd:   r.PortEnd,
+		TcpPort:   tcpPort,
+		RdmaPort:  rdmaPort,
 		State:     string(r.State),
 		ErrorMsg:  r.ErrorMsg,
 	}
@@ -240,7 +254,7 @@ func ServiceReplicaToProtoReplica(r *Replica) *spdkrpc.Replica {
 	return res
 }
 
-func NewReplica(ctx context.Context, replicaName, lvsName, lvsUUID string, specSize uint64, snapshotChecksumEnabled bool, updateCh chan interface{}) *Replica {
+func NewReplica(ctx context.Context, replicaName, lvsName, lvsUUID string, specSize uint64, snapshotChecksumEnabled bool, listenerTransport NvmfTransportType, updateCh chan interface{}) *Replica {
 	log := logrus.StandardLogger().WithFields(logrus.Fields{
 		"replicaName": replicaName,
 		"lvsName":     lvsName,
@@ -261,6 +275,8 @@ func NewReplica(ctx context.Context, replicaName, lvsName, lvsUUID string, specS
 		LvsName: lvsName,
 		LvsUUID: lvsUUID,
 		Nqn:     helpertypes.GetNQN(replicaName),
+
+		ListenerTransport: listenerTransport,
 
 		SpecSize: roundedSpecSize,
 		State:    types.InstanceStatePending,
@@ -1127,7 +1143,12 @@ func (r *Replica) Create(spdkClient *spdkclient.Client, portCount int32, superio
 		return nil, errors.Wrapf(err, "failed to stop exposing replica %v", r.Name)
 	}
 
-	if err := spdkClient.StartExposeBdev(r.Nqn, r.Head.UUID, generateNGUID(r.Name), r.IP, strconv.Itoa(int(r.PortStart))); err != nil {
+	if err := spdkClient.StartExposeBdevWithTransport(r.Nqn, r.Head.UUID, generateNGUID(r.Name), r.IP, strconv.Itoa(int(r.PortStart)), r.transport().ToSPDKTransportType()); err != nil {
+		return nil, err
+	}
+	// On RDMA-capable nodes also add a secondary TCP listener so TCP-only
+	// engines can still attach to this replica (no-op when primary is TCP).
+	if err := r.addTCPFallbackListener(spdkClient, r.Nqn, r.PortStart); err != nil {
 		return nil, err
 	}
 
@@ -4331,4 +4352,83 @@ func (r *Replica) SetTestErrorState(errMsg string) {
 		r.rebuildingDstCache.rebuildingError = errMsg
 		r.rebuildingDstCache.rebuildingState = types.ProgressStateError
 	}
+}
+
+func (r *Replica) transport() NvmfTransportType {
+	if r.ListenerTransport == "" {
+		return DefaultNvmfTransport
+	}
+	return r.ListenerTransport
+}
+
+func tcpFallbackPortFor(primaryPort int32) int32 {
+	return primaryPort + 1
+}
+
+func (r *Replica) tcpFallbackPort() int32 {
+	return tcpFallbackPortFor(r.PortStart)
+}
+
+func (r *Replica) listenerPortsForTransport() (tcpPort, rdmaPort int32) {
+	if r.PortStart == 0 {
+		return 0, 0
+	}
+	if r.transport().IsRDMA() {
+		return r.tcpFallbackPort(), r.PortStart
+	}
+	return r.PortStart, 0
+}
+
+func (r *Replica) headLvolTransportAddresses() *spdkrpc.ReplicaTransportAddresses {
+	tcpPort, rdmaPort := r.listenerPortsForTransport()
+	if tcpPort == 0 && rdmaPort == 0 {
+		return nil
+	}
+	addrs := &spdkrpc.ReplicaTransportAddresses{}
+	if tcpPort != 0 {
+		addrs.TcpAddress = net.JoinHostPort(r.IP, strconv.Itoa(int(tcpPort)))
+	}
+	if rdmaPort != 0 {
+		addrs.RdmaAddress = net.JoinHostPort(r.IP, strconv.Itoa(int(rdmaPort)))
+	}
+	return addrs
+}
+
+func getExposedPortForTransport(subsystem *spdktypes.NvmfSubsystem, trtype spdktypes.NvmeTransportType) (exposedPort int32, err error) {
+	if subsystem == nil || len(subsystem.ListenAddresses) == 0 {
+		return 0, fmt.Errorf("cannot find the NVMf subsystem")
+	}
+
+	for _, listenAddr := range subsystem.ListenAddresses {
+		if !strings.EqualFold(string(listenAddr.Adrfam), string(spdktypes.NvmeAddressFamilyIPv4)) ||
+			!strings.EqualFold(string(listenAddr.Trtype), string(trtype)) {
+			continue
+		}
+		port, err := strconv.Atoi(listenAddr.Trsvcid)
+		if err != nil {
+			return 0, err
+		}
+		return int32(port), nil
+	}
+
+	return 0, fmt.Errorf("cannot find a %s exposed port in the NVMf subsystem", trtype)
+}
+func (r *Replica) addTCPFallbackListener(spdkClient *spdkclient.Client, nqn string, primaryPort int32) error {
+	if r.transport() == NvmfTransportTCP {
+		return nil
+	}
+	if primaryPort == 0 {
+		return fmt.Errorf("cannot add TCP fallback listener for nqn %s: primary port is 0", nqn)
+	}
+	fallbackPort := strconv.Itoa(int(tcpFallbackPortFor(primaryPort)))
+	if err := spdkClient.EnsureNvmfTransport(spdktypes.NvmeTransportTypeTCP); err != nil {
+		return errors.Wrapf(err, "failed to ensure TCP transport before adding fallback listener on %s:%s for nqn %s", r.IP, fallbackPort, nqn)
+	}
+	if _, err := spdkClient.NvmfSubsystemAddListener(
+		nqn, r.IP, fallbackPort,
+		spdktypes.NvmeTransportTypeTCP, spdktypes.NvmeAddressFamilyIPv4,
+	); err != nil {
+		return errors.Wrapf(err, "failed to add TCP fallback listener on %s:%s for nqn %s", r.IP, fallbackPort, nqn)
+	}
+	return nil
 }
