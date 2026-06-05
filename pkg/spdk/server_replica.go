@@ -605,7 +605,10 @@ func (s *Server) ReplicaRebuildingDstStart(ctx context.Context, req *spdkrpc.Rep
 	if err != nil {
 		return nil, err
 	}
-	return &spdkrpc.ReplicaRebuildingDstStartResponse{DstHeadLvolAddress: address}, nil
+	return &spdkrpc.ReplicaRebuildingDstStartResponse{
+		DstHeadLvolAddress:            address,
+		DstHeadLvolTransportAddresses: r.headLvolTransportAddresses(),
+	}, nil
 }
 
 // ReplicaRebuildingDstFinish finishes a rebuilding for a replica
