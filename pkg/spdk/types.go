@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -409,4 +410,19 @@ func getEngineCntlid(engineName string) uint16 {
 		}
 	}
 	return 1 // fallback
+}
+
+// envIntOrDefault reads an integer tunable from the environment, falling back
+// to def when unset, empty, or unparseable. Used by the transport/SPDK opts
+// tuning so operators can override defaults per IM pod without a rebuild.
+func envIntOrDefault(name string, def int) int {
+	raw, ok := os.LookupEnv(name)
+	if !ok || raw == "" {
+		return def
+	}
+	v, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		return def
+	}
+	return v
 }
