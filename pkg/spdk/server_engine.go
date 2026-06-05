@@ -45,7 +45,7 @@ func (s *Server) EngineCreate(ctx context.Context, req *spdkrpc.EngineCreateRequ
 	spdkClient := s.spdkClient
 	s.Unlock()
 
-	return e.Create(spdkClient, req.ReplicaAddressMap, req.PortCount, s.portAllocator, req.SalvageRequested)
+	return e.Create(spdkClient, req.ReplicaAddressMap, req.ReplicaTransportAddressMap, req.PortCount, s.portAllocator, req.SalvageRequested)
 }
 
 func (s *Server) EngineSnapshotMaxCountSet(ctx context.Context, req *spdkrpc.EngineSnapshotMaxCountSetRequest) (ret *emptypb.Empty, err error) {

@@ -294,3 +294,124 @@ func ExtractBackingImageAndDiskUUID(lvolName string) (string, string, error) {
 
 	return backingImageName, diskUUID, nil
 }
+
+func connectNVMfBdevWithTransport(spdkClient *spdkclient.Client, controllerName, address string, transport NvmfTransportType, ctrlrLossTimeout, fastIOFailTimeoutSec int, maxRetries int, retryInterval time.Duration) (bdevName string, err error) {
+	return connectNVMfBdevWithReconnect(spdkClient, controllerName, address, transport, ctrlrLossTimeout, replicaReconnectDelaySec, fastIOFailTimeoutSec, maxRetries, retryInterval)
+}
+
+func connectNVMfBdevWithReconnect(spdkClient *spdkclient.Client, controllerName, address string, transport NvmfTransportType, ctrlrLossTimeout, reconnectDelay, fastIOFailTimeoutSec int, maxRetries int, retryInterval time.Duration) (bdevName string, err error) {
+	if controllerName == "" || address == "" {
+		return "", fmt.Errorf("controllerName or address is empty")
+	}
+
+	defer func() {
+		if err != nil {
+			if _, detachErr := spdkClient.BdevNvmeDetachController(controllerName); detachErr != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(detachErr) {
+				logrus.WithError(detachErr).Errorf("Failed to detach NVMe controller %s after failing at attaching it", controllerName)
+			}
+		}
+	}()
+
+	ip, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return "", err
+	}
+
+	// Blindly detach the controller in case of the previous replica connection is not cleaned up correctly
+	if _, err := spdkClient.BdevNvmeDetachController(controllerName); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
+		return "", err
+	}
+
+	nvmeBdevNameList := []string{}
+	spdkTransport := transport.ToSPDKTransportType()
+	err = retry.Do(
+		func() error {
+			var err error
+			nvmeBdevNameList, err = spdkClient.BdevNvmeAttachController(
+				controllerName,
+				helpertypes.GetNQN(controllerName),
+				ip,
+				port,
+				spdkTransport,
+				spdktypes.NvmeAddressFamilyIPv4,
+				int32(ctrlrLossTimeout),
+				int32(reconnectDelay),
+				int32(fastIOFailTimeoutSec),
+				replicaMultipath,
+			)
+			return err
+		},
+		retry.Attempts(uint(maxRetries)),
+		retry.Delay(retryInterval),
+		retry.DelayType(retry.FixedDelay),
+		retry.LastErrorOnly(true),
+		retry.OnRetry(func(n uint, err error) {
+			logrus.WithError(err).Warnf(
+				"Retrying NVMe bdev attach: controller=%s address=%s transport=%s attempt=%d/%d next_wait=%s",
+				controllerName, address, transport, n+1, maxRetries, retryInterval,
+			)
+		}),
+	)
+
+	if err != nil {
+		nvmeBdevNameList, err = attemptTCPFallback(spdkClient, controllerName, ip, port, ctrlrLossTimeout, reconnectDelay, fastIOFailTimeoutSec, transport, err)
+		if err != nil {
+			return "", fmt.Errorf("attach NVMe controller failed after %d attempts: %w", maxRetries, err)
+		}
+	}
+
+	if len(nvmeBdevNameList) != 1 {
+		return "", fmt.Errorf("got zero or multiple results when attaching lvol %s with address %s as a NVMe bdev: %+v", controllerName, address, nvmeBdevNameList)
+	}
+
+	return nvmeBdevNameList[0], nil
+}
+
+func attemptTCPFallback(spdkClient *spdkclient.Client, controllerName, ip, port string, ctrlrLossTimeout, reconnectDelay, fastIOFailTimeoutSec int, originalTransport NvmfTransportType, primaryErr error) ([]string, error) {
+	primaryPort, parseErr := strconv.Atoi(port)
+	if parseErr != nil {
+		return nil, primaryErr
+	}
+	fallbackPort := strconv.Itoa(primaryPort + 1)
+
+	if _, detachErr := spdkClient.BdevNvmeDetachController(controllerName); detachErr != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(detachErr) {
+		return nil, primaryErr
+	}
+
+	logrus.WithError(primaryErr).Warnf(
+		"Primary NVMe attach failed (controller=%s transport=%s address=%s:%s); trying TCP fallback on %s:%s",
+		controllerName, originalTransport, ip, port, ip, fallbackPort,
+	)
+
+	list, err := spdkClient.BdevNvmeAttachController(
+		controllerName,
+		helpertypes.GetNQN(controllerName),
+		ip,
+		fallbackPort,
+		spdktypes.NvmeTransportTypeTCP,
+		spdktypes.NvmeAddressFamilyIPv4,
+		int32(ctrlrLossTimeout),
+		int32(reconnectDelay),
+		int32(fastIOFailTimeoutSec),
+		replicaMultipath,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("primary attach failed (%v) and TCP fallback to %s:%s also failed: %w", primaryErr, ip, fallbackPort, err)
+	}
+	return list, nil
+}
+
+func isRPCConnectionTimedOut(err error) bool {
+	if err == nil {
+		return false
+	}
+	jsonRPCError, ok := err.(jsonrpc.JSONClientError)
+	if !ok {
+		return false
+	}
+	responseError, ok := jsonRPCError.ErrorDetail.(*jsonrpc.ResponseError)
+	if !ok {
+		return false
+	}
+	return responseError.Code == -110
+}
