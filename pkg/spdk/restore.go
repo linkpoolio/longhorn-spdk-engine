@@ -160,7 +160,7 @@ func (r *Restore) OpenVolumeDev(volDevName string) (fh *os.File, endpoint string
 	}
 
 	r.log.Info("Exposing snapshot lvol bdev for restore")
-	subsystemNQN, controllerName, err := restoreExposeSnapshotLvolBdev(r.spdkClient, r.replica.LvsName, lvolName, r.ip, r.port, r.executor)
+	subsystemNQN, controllerName, err := restoreExposeSnapshotLvolBdev(r.spdkClient, r.replica.LvsName, lvolName, r.ip, r.port, r.replica.transport(), r.executor)
 	if err != nil {
 		r.log.WithError(err).Errorf("Failed to expose lvol bdev")
 		return nil, "", err
