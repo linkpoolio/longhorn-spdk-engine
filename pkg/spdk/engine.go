@@ -446,13 +446,13 @@ func (e *Engine) createNVMeTCPTarget(spdkClient *spdkclient.Client, superiorPort
 		return errors.Wrapf(err, "failed to blindly stop exposing RAID bdev for engine target %v", e.Name)
 	}
 
-	cntlid := getEngineCntlid(e.Name)
+	minCntlid, maxCntlid := e.resolveCntlidRange()
 	nsUUID := getStableVolumeNsUUID(e.VolumeName)
 
-	e.log.Infof("Starting to expose RAID bdev for engine target %v on %v:%v with initial ANA state %v, cntlid %v, nsUUID %v",
-		e.Name, e.NvmeTcpTarget.IP, e.NvmeTcpTarget.Port, initialANAState, cntlid, nsUUID)
+	e.log.Infof("Starting to expose RAID bdev for engine target %v on %v:%v with initial ANA state %v, cntlid [%v,%v], nsUUID %v",
+		e.Name, e.NvmeTcpTarget.IP, e.NvmeTcpTarget.Port, initialANAState, minCntlid, maxCntlid, nsUUID)
 	if err := spdkClient.StartExposeBdevWithANAState(e.NvmeTcpTarget.Nqn, e.Name, e.NvmeTcpTarget.Nguid, nsUUID,
-		e.NvmeTcpTarget.IP, strconv.Itoa(int(e.NvmeTcpTarget.Port)), spdkANAState, cntlid, cntlid); err != nil {
+		e.NvmeTcpTarget.IP, strconv.Itoa(int(e.NvmeTcpTarget.Port)), spdkANAState, minCntlid, maxCntlid); err != nil {
 		// No need to release ports here. The engine will be marked as ERR by
 		// Create's deferred error handler, and Delete will release the ports
 		// when the user cleans up this engine.
@@ -481,6 +481,17 @@ func (e *Engine) targetTransport() NvmfTransportType {
 		return DefaultNvmfTransport
 	}
 	return e.NvmeTcpTarget.Transport
+}
+
+// resolveCntlidRange returns the cntlid [min, max] range for this engine's
+// subsystem. Every engine generation gets a large, disjoint window so that
+// (a) initiator reconnect churn can never exhaust the subsystem's controller
+// slots, and (b) the two consecutive-ordinal targets that briefly share an NQN
+// during a live migration / engine upgrade never collide. A single range
+// covers both an RDMA engine's RDMA and TCP-fallback listeners (same
+// subsystem). See getEngineCntlidRange for the allocation scheme.
+func (e *Engine) resolveCntlidRange() (uint16, uint16) {
+	return getEngineCntlidRange(e.Name)
 }
 
 // pickReplicaAddress selects the address + transport to dial for a replica.
@@ -793,8 +804,21 @@ func (e *Engine) Delete(spdkClient *spdkclient.Client, superiorPortAllocator *co
 			return errors.Wrapf(err, "failed to destroy UBLK target for engine %s", e.Name)
 		}
 	case types.FrontendSPDKTCPBlockdev, types.FrontendSPDKTCPNvmf:
+		// Best-effort teardown. A subsystem can wedge such that its
+		// per-subsystem RPCs (nvmf_subsystem_get_listeners,
+		// nvmf_delete_subsystem) hang and only return on the client timeout —
+		// e.g. after a failed replica rebuild leaves the subsystem in a stuck
+		// state. nvmf_get_subsystems still responds instantly, so the target as
+		// a whole is healthy; only operations on this one subsystem block, and
+		// no graceful SPDK call can clear it short of an instance-manager
+		// restart. If we treated that as fatal here, engine deletion would
+		// never complete: the volume stays pinned in `deleting` indefinitely
+		// and the initiator's reconnect loop floods the target with keep-alive
+		// timeouts. So proceed with deletion regardless — the orphaned
+		// subsystem is reclaimed when the instance-manager / spdk_tgt restarts.
+		// (Expand() intentionally keeps this fatal; only deletion is best-effort.)
 		if err := spdkClient.StopExposeBdev(e.NvmeTcpTarget.Nqn); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
-			return errors.Wrapf(err, "failed to stop exposing bdev for engine %s", e.Name)
+			e.log.WithError(err).Warnf("Failed to stop exposing bdev for engine %s during deletion; proceeding so the engine can be removed (subsystem %s may leak until the instance-manager restarts)", e.Name, e.NvmeTcpTarget.Nqn)
 		}
 	}
 
@@ -812,13 +836,22 @@ func (e *Engine) Delete(spdkClient *spdkclient.Client, superiorPortAllocator *co
 
 	requireUpdate = true
 
-	if _, err := spdkClient.BdevRaidDelete(e.Name); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
-		return err
+	// Best-effort (see the StopExposeBdev note above): if the subsystem teardown
+	// was skipped because it wedged, the RAID bdev may still be claimed by the
+	// leftover namespace and BdevRaidDelete can fail/hang. Don't let that pin
+	// the engine in `deleting` — proceed and let the instance-manager restart
+	// reclaim it.
+	if _, rdErr := spdkClient.BdevRaidDelete(e.Name); rdErr != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(rdErr) {
+		e.log.WithError(rdErr).Warnf("Failed to delete RAID bdev for engine %s during deletion; proceeding (will be reclaimed on instance-manager restart)", e.Name)
 	}
 
-	requireUpdate, err = e.disconnectReplicas(spdkClient)
-	if err != nil {
-		return err
+	// Best-effort: a failure to detach the engine's replica initiator
+	// connections must not block engine removal either. Replica lvol teardown
+	// happens independently when the replica CRs are deleted.
+	ru, drErr := e.disconnectReplicas(spdkClient)
+	requireUpdate = requireUpdate || ru
+	if drErr != nil {
+		e.log.WithError(drErr).Warnf("Failed to disconnect all replicas for engine %s during deletion; proceeding", e.Name)
 	}
 
 	if rmErr := removeEngineRecord(e.metadataDir, e.Name); rmErr != nil {
@@ -2836,7 +2869,7 @@ func (e *Engine) Expand(spdkClient *spdkclient.Client, size uint64) (err error) 
 
 	switch e.Frontend {
 	case types.FrontendSPDKTCPBlockdev, types.FrontendSPDKTCPNvmf:
-		cntlid := getEngineCntlid(e.Name)
+		minCntlid, maxCntlid := e.resolveCntlidRange()
 		nsUUID := getStableVolumeNsUUID(e.VolumeName)
 		// Preserve the current ANA state across the expand. If this engine
 		// was demoted to inaccessible during a switchover, re-exposing with
@@ -2849,11 +2882,11 @@ func (e *Engine) Expand(spdkClient *spdkclient.Client, size uint64) (err error) 
 		if err != nil {
 			return errors.Wrapf(err, "invalid ANA state %q for engine target %v during expand", currentANAState, e.Name)
 		}
-		e.log.Infof("Starting to expose RAID bdev for engine target %v on %v:%v with ANA state %v, cntlid %v, nsUUID %v",
-			e.Name, e.NvmeTcpTarget.IP, e.NvmeTcpTarget.Port, currentANAState, cntlid, nsUUID)
+		e.log.Infof("Starting to expose RAID bdev for engine target %v on %v:%v with ANA state %v, cntlid [%v,%v], nsUUID %v",
+			e.Name, e.NvmeTcpTarget.IP, e.NvmeTcpTarget.Port, currentANAState, minCntlid, maxCntlid, nsUUID)
 		if err := spdkClient.StartExposeBdevWithANAState(e.NvmeTcpTarget.Nqn, e.Name, e.NvmeTcpTarget.Nguid, nsUUID,
 			e.NvmeTcpTarget.IP, strconv.Itoa(int(e.NvmeTcpTarget.Port)),
-			spdkANAState, cntlid, cntlid); err != nil {
+			spdkANAState, minCntlid, maxCntlid); err != nil {
 			return errors.Wrapf(err, "failed to start exposing RAID bdev for engine target %v", e.Name)
 		}
 	case types.FrontendEmpty:
