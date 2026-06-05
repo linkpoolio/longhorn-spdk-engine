@@ -595,10 +595,11 @@ func (r *Replica) validateAndUpdate(bdevLvolMap map[string]*spdktypes.BdevInfo, 
 	}
 
 	nqn := helpertypes.GetNQN(r.Name)
-	exposedPort, exposedPortErr := getExposedPort(subsystemMap[nqn])
+	primaryTrtype := r.transport().ToSPDKTransportType()
+	exposedPort, exposedPortErr := getExposedPortForTransport(subsystemMap[nqn], primaryTrtype)
 	if r.IsExposed {
 		if exposedPortErr != nil {
-			return errors.Wrapf(exposedPortErr, "failed to find the actual port in subsystem NQN %s for replica %s, which should be exposed at %d", nqn, r.Name, r.PortStart)
+			return errors.Wrapf(exposedPortErr, "failed to find the actual %s listener port in subsystem NQN %s for replica %s, which should be exposed at %d", primaryTrtype, nqn, r.Name, r.PortStart)
 		}
 		if exposedPort != r.PortStart {
 			return fmt.Errorf("found mismatching between the actual exposed port %d and the recorded port %d for exposed replica %s", exposedPort, r.PortStart, r.Name)
