@@ -63,7 +63,12 @@ func discoverAndConnectNVMeTarget(srcIP string, srcPort int32, maxRetries int, r
 	return subsystemNQN, controllerName, nil
 }
 
-func exposeSnapshotLvolBdev(spdkClient *spdkclient.Client, lvsName, lvolName, ip string, port int32, executor *commonns.Executor) (subsystemNQN, controllerName string, err error) {
+func exposeSnapshotLvolBdev(spdkClient *spdkclient.Client, lvsName, lvolName, ip string, port int32, transport NvmfTransportType, executor *commonns.Executor) (subsystemNQN, controllerName string, err error) {
+	if transport == "" {
+		transport = DefaultNvmfTransport
+	}
+	spdkTransport := transport.ToSPDKTransportType()
+
 	bdevLvolList, err := spdkClient.BdevLvolGet(spdktypes.GetLvolAlias(lvsName, lvolName), 0)
 	if err != nil {
 		return "", "", err
@@ -73,20 +78,21 @@ func exposeSnapshotLvolBdev(spdkClient *spdkclient.Client, lvsName, lvolName, ip
 	}
 
 	portStr := strconv.Itoa(int(port))
-	err = spdkClient.StartExposeBdev(helpertypes.GetNQN(lvolName), bdevLvolList[0].UUID, generateNGUID(lvolName), ip, portStr)
+	err = spdkClient.StartExposeBdevWithTransport(helpertypes.GetNQN(lvolName), bdevLvolList[0].UUID, generateNGUID(lvolName), ip, portStr, spdkTransport)
 	if err != nil {
 		return "", "", errors.Wrapf(err, "failed to expose snapshot lvol bdev %v", lvolName)
 	}
 
+	transportStr := string(transport)
 	for r := 0; r < maxRetries; r++ {
-		subsystemNQN, err = initiator.DiscoverTarget(ip, portStr, executor)
+		subsystemNQN, err = initiator.DiscoverTargetWithTransport(transportStr, ip, portStr, executor)
 		if err != nil {
 			logrus.WithError(err).Errorf("Failed to discover target for snapshot lvol bdev %v", lvolName)
 			time.Sleep(retryInterval)
 			continue
 		}
 
-		controllerName, err = initiator.ConnectTarget(ip, portStr, subsystemNQN, executor)
+		controllerName, err = initiator.ConnectTargetWithTransport(transportStr, ip, portStr, subsystemNQN, executor)
 		if err != nil {
 			logrus.WithError(err).Errorf("Failed to connect target for snapshot lvol bdev %v", lvolName)
 			time.Sleep(retryInterval)
