@@ -216,6 +216,19 @@ func (s *EngineReplicaStatus) transportOrDefault(def NvmfTransportType) NvmfTran
 	return s.Transport
 }
 
+// dialAddress is the address reconnect/rebuild paths must dial: the address
+// actually attached (DialedAddress), falling back to the canonical Address for
+// records written before dual-listener (DialedAddress empty).
+func (s *EngineReplicaStatus) dialAddress() string {
+	if s == nil {
+		return ""
+	}
+	if s.DialedAddress != "" {
+		return s.DialedAddress
+	}
+	return s.Address
+}
+
 func NewEngine(engineName, volumeName, frontend string, specSize uint64, replicaTransport NvmfTransportType, engineUpdateCh chan interface{}, snapshotMaxCount int32, newServiceClient ServiceClientFactory) *Engine {
 	log := logrus.StandardLogger().WithFields(logrus.Fields{
 		"engineName": engineName,
@@ -1889,7 +1902,7 @@ func (e *Engine) replicaSnapshotOperation(spdkClient *spdkclient.Client, replica
 		if err := replicaClient.ReplicaSnapshotRevert(replicaName, snapshotName); err != nil {
 			return err
 		}
-		bdevName, err := connectNVMfBdev(spdkClient, replicaName, replicaStatus.Address, e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
+		bdevName, err := connectNVMfBdevWithTransport(spdkClient, replicaName, replicaStatus.dialAddress(), replicaStatus.transportOrDefault(e.replicaTransport()), e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
 		if err != nil {
 			return err
 		}
@@ -2922,7 +2935,7 @@ func (e *Engine) expandSingleReplica(spdkClient *spdkclient.Client, replicaName 
 		return err
 	}
 
-	_, err = connectNVMfBdev(spdkClient, replicaName, replicaStatus.Address, e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
+	_, err = connectNVMfBdevWithTransport(spdkClient, replicaName, replicaStatus.dialAddress(), replicaStatus.transportOrDefault(e.replicaTransport()), e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
 	return err
 }
 
