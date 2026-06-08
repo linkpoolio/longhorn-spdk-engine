@@ -486,8 +486,23 @@ func (s *Server) reconcileOnce() {
 		// eager. If the consumer is genuinely broken it will surface
 		// errors and eventually release the device, at which point a
 		// later tick finds no consumer and heal runs safely.
-		if record.Frontend == types.FrontendSPDKTCPBlockdev && live.Endpoint != "" {
-			inUse, why, checkErr := devicePathInUse(live.Endpoint)
+		//
+		// The consumer device path MUST be derived from the record, not
+		// from live.Endpoint: this block is only reached when live.State
+		// is Error, and deriveLiveState only ever populates Endpoint for
+		// Running states — every Error arm leaves it empty. Keying the
+		// guard on live.Endpoint (as the original code did) made it dead
+		// code: the condition was never true at heal time, so heal tore
+		// down dm-linear + /dev/longhorn/<vol> WITHOUT ever checking for a
+		// mounted filesystem — exactly the partial-state case (e.g. a
+		// transiently-misprobed kernel controller while the device is up
+		// and mounted) where an over-eager heal corrupts a live volume.
+		// GetLonghornDevicePath is the same path the observer stats, and
+		// devicePathInUse tolerates a missing path (a genuinely-gone
+		// device simply has no mounts and heal proceeds).
+		if record.Frontend == types.FrontendSPDKTCPBlockdev {
+			devicePath := helperutil.GetLonghornDevicePath(record.VolumeName)
+			inUse, why, checkErr := devicePathInUse(devicePath)
 			if checkErr != nil {
 				logrus.WithError(checkErr).Warnf(
 					"EngineFrontend reconciler: failed to check consumer for %s; deferring heal",
@@ -496,10 +511,10 @@ func (s *Server) reconcileOnce() {
 			}
 			if inUse {
 				logrus.WithFields(logrus.Fields{
-					"name":     record.Name,
-					"endpoint": live.Endpoint,
-					"reason":   live.ErrorMsg,
-					"consumer": why,
+					"name":       record.Name,
+					"devicePath": devicePath,
+					"reason":     live.ErrorMsg,
+					"consumer":   why,
 				}).Warn("EngineFrontend reconciler: heal deferred — live consumer on device")
 				continue
 			}

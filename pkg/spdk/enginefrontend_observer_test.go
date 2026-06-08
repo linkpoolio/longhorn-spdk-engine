@@ -219,6 +219,61 @@ func (s *TestSuite) TestDeriveLiveStateEmptyAndUnknown(c *C) {
 	c.Check(gotUnknown.ErrorMsg, Not(Equals), "")
 }
 
+// TestDeriveLiveStateErrorNeverHasEndpoint locks in the invariant that the
+// heal-deferral consumer guard in reconcileOnce depends on: deriveLiveState
+// only populates Endpoint for Running states, so every Error state — the only
+// kind that reaches the heal block — has an empty Endpoint.
+//
+// The original guard keyed on `live.Endpoint != ""`, which made it dead code:
+// it could never be true at heal time, so heal tore down dm-linear +
+// /dev/longhorn/<vol> WITHOUT checking for a mounted filesystem. This is the
+// over-eager-heal corruption path. The fix derives the device path from the
+// record instead; this test guarantees nobody reintroduces an Endpoint-keyed
+// guard by making the underlying assumption explicit and enforced.
+func (s *TestSuite) TestDeriveLiveStateErrorNeverHasEndpoint(c *C) {
+	fmt.Println("Testing the heal-guard invariant: every Error-derived state has an empty Endpoint")
+
+	record := &EngineFrontendRecord{
+		Name:       "ef-guard",
+		VolumeName: "vol-guard",
+		VolumeNQN:  "nqn.2014-08.org.nvmexpress:uuid:vol-guard",
+		Frontend:   lhtypes.FrontendSPDKTCPBlockdev,
+	}
+
+	// Enumerate every blockdev layer bitmap (0b0000..0b1111) crossed with
+	// every kernel controller state. Any combination that derives Error MUST
+	// have an empty Endpoint, otherwise the (now record-derived) guard could
+	// be tempted back onto live.Endpoint and silently break again.
+	kstates := []KernelControllerState{
+		KernelControllerStateAbsent,
+		KernelControllerStateLive,
+		KernelControllerStateTransient,
+		KernelControllerStateDead,
+	}
+	sawError := false
+	for bitmap := 0; bitmap < 16; bitmap++ {
+		for _, ks := range kstates {
+			raw := &EngineFrontendObservedRaw{
+				SubsystemPresent:        bitmap&0b1000 != 0,
+				KernelControllerPresent: bitmap&0b0100 != 0,
+				DMDevicePresent:         bitmap&0b0010 != 0,
+				DevicePathExists:        bitmap&0b0001 != 0,
+				KernelControllerState:   ks,
+				DevicePath:              "/dev/longhorn/vol-guard",
+			}
+			got := deriveLiveState(record, raw)
+			if got.State == lhtypes.InstanceStateError {
+				sawError = true
+				c.Check(got.Endpoint, Equals, "",
+					Commentf("bitmap=%04b kstate=%s derived Error but has a non-empty Endpoint", bitmap, ks))
+			}
+		}
+	}
+	// Sanity: the enumeration must actually exercise the Error branch, else
+	// the invariant above is vacuously true and protects nothing.
+	c.Assert(sawError, Equals, true)
+}
+
 func (s *TestSuite) TestBoolsToBitmap(c *C) {
 	fmt.Println("Testing boolsToBitmap ordering (MSB first) — underpins the blockdev layer switch")
 
