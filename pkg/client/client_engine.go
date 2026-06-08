@@ -149,6 +149,28 @@ func (c *SPDKClient) EngineSetTargetListenerANAState(name, anaState string) erro
 	return nil
 }
 
+// EngineRemoveTargetListener removes the NVMe-oF target listener for the given
+// transport from a (possibly remote) engine. Used during switchover to release
+// the old RDMA path's HCA queue pair, which an ANA state change alone does not free.
+func (c *SPDKClient) EngineRemoveTargetListener(name, transport string) error {
+	if name == "" {
+		return fmt.Errorf("failed to remove target listener for engine: missing required parameter name")
+	}
+
+	client := c.getSPDKServiceClient()
+	ctx, cancel := context.WithTimeout(context.Background(), GRPCServiceTimeout)
+	defer cancel()
+
+	_, err := client.EngineRemoveTargetListener(ctx, &spdkrpc.EngineRemoveTargetListenerRequest{
+		Name:      name,
+		Transport: transport,
+	})
+	if err != nil {
+		return errors.Wrapf(err, "failed to remove target listener for engine %v", name)
+	}
+	return nil
+}
+
 // EngineList returns all engines known to the SPDK service.
 func (c *SPDKClient) EngineList() (map[string]*api.Engine, error) {
 	client := c.getSPDKServiceClient()
