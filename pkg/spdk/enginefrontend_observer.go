@@ -222,7 +222,7 @@ func boolsToBitmap(bs ...bool) int {
 // partial raw observed so far + the error. The caller decides whether to
 // trust the partial Live view or skip this tick. The reconciler skips on
 // error; gRPC handlers may want to surface the error.
-func ObserveEngineFrontend(ctx context.Context, spdkClient *spdkclient.Client, record *EngineFrontendRecord) (*EngineFrontendLive, error) {
+func ObserveEngineFrontend(ctx context.Context, spdkClient *spdkclient.Client, record *EngineFrontendRecord) (live *EngineFrontendLive, err error) {
 	if record == nil {
 		return nil, errors.New("ObserveEngineFrontend: nil record")
 	}
@@ -230,6 +230,43 @@ func ObserveEngineFrontend(ctx context.Context, spdkClient *spdkclient.Client, r
 		NvmfTargetIP:   record.TargetIP,
 		NvmfTargetPort: record.TargetPort,
 	}
+
+	// Diagnostic breadcrumb for the derived-state migration. Logged at Debug
+	// so it is silent at the default (Notice/Info) log level and can be
+	// turned on per-incident by raising data-engine-log-level. This is the
+	// observability gap that hid the EngineFrontend status-sync regression:
+	// a blockdev whose layers all probe absent derives Stopped (0b0000),
+	// which reconcileOnce treats as non-Error and silently skips — so a
+	// frontend that is physically up but observed-down left no trace. The
+	// named return values let this fire on every exit path, capturing the
+	// exact layer bitmap the observer saw alongside the state it derived.
+	defer func() {
+		logFields := logrus.Fields{
+			"name":                    record.Name,
+			"volumeName":              record.VolumeName,
+			"frontend":                record.Frontend,
+			"volumeNQN":               record.VolumeNQN,
+			"subsystemPresent":        raw.SubsystemPresent,
+			"kernelControllerPresent": raw.KernelControllerPresent,
+			"kernelControllerState":   raw.KernelControllerState,
+			"dmDevicePresent":         raw.DMDevicePresent,
+			"devicePathExists":        raw.DevicePathExists,
+			"devicePath":              raw.DevicePath,
+			"nvmfTargetIP":            raw.NvmfTargetIP,
+			"nvmfTargetPort":          raw.NvmfTargetPort,
+		}
+		if live != nil {
+			logFields["derivedState"] = live.State
+			logFields["derivedEndpoint"] = live.Endpoint
+			if live.ErrorMsg != "" {
+				logFields["derivedErrorMsg"] = live.ErrorMsg
+			}
+		}
+		if err != nil {
+			logFields["probeErr"] = err.Error()
+		}
+		logrus.WithFields(logFields).Debug("EngineFrontend observer: observed raw + derived state")
+	}()
 
 	// Stage 1a: SPDK side. Empty-frontend records have no SPDK subsystem
 	// to look for, so the probe is skipped.
