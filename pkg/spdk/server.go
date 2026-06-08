@@ -3,6 +3,7 @@ package spdk
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -105,6 +106,15 @@ type Server struct {
 	replicaDesyncCounts map[string]int
 }
 
+// isFrameworkAlreadyInitialized reports whether err is SPDK's INVALID_STATE
+// response to framework_start_init when the framework is already up. That RPC is
+// STARTUP-only; once spdk_tgt has initialised subsystems (it was launched
+// without --wait-for-rpc) it returns "Method may only be called before framework
+// is initialized." We treat that as a benign already-initialized signal.
+func isFrameworkAlreadyInitialized(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "before framework is initialized")
+}
+
 func NewServer(ctx context.Context, portStart, portEnd int32) (*Server, error) {
 	cli, err := spdkclient.NewClient(ctx)
 	if err != nil {
@@ -157,12 +167,24 @@ func NewServer(ctx context.Context, portStart, portEnd int32) (*Server, error) {
 	}
 
 	if _, err = cli.FrameworkStartInit(); err != nil {
-		return nil, errors.Wrap(err, "failed to start SPDK subsystem init")
+		// framework_start_init is a STARTUP-only RPC. When spdk_tgt is launched
+		// without --wait-for-rpc (e.g. the integration test harness, or a
+		// misconfigured entrypoint) subsystems auto-initialise at boot and the
+		// framework reaches RUNTIME, where this RPC returns INVALID_STATE
+		// ("...before framework is initialized"). The tunables above already
+		// applied to the running target (bdev_nvme_set_options is RUNTIME-allowed;
+		// iobuf/mlx5 are best-effort), so treat that as success rather than
+		// failing engine startup.
+		if !isFrameworkAlreadyInitialized(err) {
+			return nil, errors.Wrap(err, "failed to start SPDK subsystem init")
+		}
+		logrus.Info("SPDK framework already initialized (spdk_tgt started without --wait-for-rpc); skipping framework_start_init")
+	} else {
+		if _, err = cli.FrameworkWaitInit(); err != nil {
+			return nil, errors.Wrap(err, "failed to wait for SPDK subsystem init")
+		}
+		logrus.Info("SPDK subsystem init complete")
 	}
-	if _, err = cli.FrameworkWaitInit(); err != nil {
-		return nil, errors.Wrap(err, "failed to wait for SPDK subsystem init")
-	}
-	logrus.Info("SPDK subsystem init complete")
 
 	nodeTransport := NegotiateNodeTransport(cli)
 	StartTransportReprobe(ctx, cli, nodeTransport)
