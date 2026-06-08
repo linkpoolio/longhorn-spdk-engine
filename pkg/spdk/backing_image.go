@@ -500,7 +500,7 @@ func (bi *BackingImage) prepareBackingImageSnapshot(spdkClient *spdkclient.Clien
 
 	// backingImageTempHeadName will be "bi-${biName}-disk-${lvsUUID}-temp-head"
 	backingImageTempHeadName := GetBackingImageTempHeadLvolName(bi.Name, bi.LvsUUID)
-	biTempHeadUUID, err = backingImageBdevLvolCreate(spdkClient, "", bi.LvsUUID, backingImageTempHeadName, util.BytesToMiB(bi.Size), "", true)
+	biTempHeadUUID, err = backingImageBdevLvolCreate(spdkClient, "", bi.LvsUUID, backingImageTempHeadName, util.BytesToMiB(bi.Size), spdktypes.BdevLvolClearMethod(defaultLvolClearMethod), defaultThinProvision)
 	if err != nil {
 		return err
 	}

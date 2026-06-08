@@ -162,7 +162,7 @@ func connectNVMfBdev(spdkClient *spdkclient.Client, controllerName, address stri
 				spdktypes.NvmeTransportTypeTCP,
 				adrfam,
 				int32(ctrlrLossTimeout),
-				replicaReconnectDelaySec,
+				int32(replicaReconnectDelaySec),
 				int32(fastIOFailTimeoutSec),
 				replicaMultipath,
 			)

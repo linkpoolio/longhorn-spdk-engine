@@ -443,7 +443,7 @@ func addBlockDevice(spdkClient *spdkclient.Client, diskName, diskUUID, originalD
 
 	if diskUUID == "" {
 		log.Infof("Creating a new lvstore %v", lvstoreName)
-		return spdkClient.BdevLvolCreateLvstore(bdev.Name, lvstoreName, defaultClusterSize)
+		return spdkClient.BdevLvolCreateLvstore(bdev.Name, lvstoreName, defaultLvstoreClusterSize)
 	}
 
 	// The lvstore should be created before, but it cannot be found now.
