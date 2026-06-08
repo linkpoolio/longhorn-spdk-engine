@@ -116,14 +116,53 @@ func NewServer(ctx context.Context, portStart, portEnd int32) (*Server, error) {
 		return nil, err
 	}
 
-	if _, err = cli.BdevNvmeSetOptions(
+	// spdk_tgt is started with --wait-for-rpc by the IM entrypoint so that
+	// these tunables land BEFORE the iobuf/nvmf subsystems initialise:
+	//   iobuf_set_options → growing pools post-init is a no-op
+	//   bdev_nvme_set_options → ditto, the initiator defaults are frozen on init
+	// Then framework_start_init drives subsystem init with the tuned opts.
+	if _, err = cli.IobufSetOptions(iobufSmallPoolCount, iobufLargePoolCount, 0, 0); err != nil {
+		logrus.WithError(err).Warn("Failed to grow iobuf pools before init; transport create may fail with ENOMEM")
+	} else {
+		logrus.Infof("Grew iobuf pools to small=%d large=%d before subsystem init", iobufSmallPoolCount, iobufLargePoolCount)
+	}
+
+	if _, err = cli.BdevNvmeSetOptionsWithTos(
 		int32(replicaCtrlrLossTimeoutSec),
 		int32(replicaReconnectDelaySec),
 		int32(replicaFastIOFailTimeoutSec),
 		int32(replicaTransportAckTimeout),
-		int32(replicaKeepAliveTimeoutMs)); err != nil {
+		int32(replicaKeepAliveTimeoutMs),
+		int32(replicaTransportTos)); err != nil {
 		return nil, errors.Wrap(err, "failed to set NVMe options")
 	}
+
+	// Register accel_mlx5 only on RDMA-capable nodes. SPDK is built with
+	// --with-rdma=mlx5_dv so the module is present in the binary, but we
+	// only scan/register it where Mellanox hardware is actually expected.
+	// On TCP-only workers DetectTransport() returns RDMA=false; sw_accel
+	// remains assigned to all ops (correct fallback).
+	//
+	// num_requests sized at runtime (cores × 16) instead of SPDK default
+	// 2047. The default tries to allocate 2047 signature mkeys per device
+	// which returned ENOMEM on ConnectX-6 Dx fw 22.43.2566 (NIC reports
+	// crc32c capability but firmware can't back 2047 PSVs). cores × 16
+	// is SPDK's enforced minimum (ACCEL_MLX5_MAX_MKEYS_IN_TASK).
+	if DetectTransport().RDMA {
+		if _, err = cli.Mlx5ScanAccelModule(accelMlx5NumRequests()); err != nil {
+			logrus.WithError(err).Warn("Failed to register accel_mlx5 driver; falling back to sw_accel for RDMA UMR registration (per-op CPU memcpy)")
+		} else {
+			logrus.Info("Registered accel_mlx5 driver for RDMA UMR per-IO acceleration")
+		}
+	}
+
+	if _, err = cli.FrameworkStartInit(); err != nil {
+		return nil, errors.Wrap(err, "failed to start SPDK subsystem init")
+	}
+	if _, err = cli.FrameworkWaitInit(); err != nil {
+		return nil, errors.Wrap(err, "failed to wait for SPDK subsystem init")
+	}
+	logrus.Info("SPDK subsystem init complete")
 
 	nodeTransport := NegotiateNodeTransport(cli)
 	StartTransportReprobe(ctx, cli, nodeTransport)
