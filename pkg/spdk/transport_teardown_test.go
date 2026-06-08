@@ -104,6 +104,23 @@ func (s *TestSuite) TestTeardownRemoteRDMAPathIfNeededEmptyIP(c *C) {
 	c.Assert(called, Equals, false)
 }
 
+func (s *TestSuite) TestUpsertNVMeTCPPathSetsTransport(c *C) {
+	ef := newRDMAEngineFrontend(false)
+
+	// An explicit RDMA transport is recorded on the path so switchover can later
+	// identify it as needing an explicit HCA queue-pair teardown.
+	addr := ef.upsertNVMeTCPPathLocked("10.0.0.2", 3000, "engine-b", "nqn.test", "nguid", NvmeTCPANAStateOptimized, NvmfTransportRDMA)
+	c.Assert(addr, Equals, "10.0.0.2:3000")
+	c.Assert(ef.NvmeTCPPathMap[addr], NotNil)
+	c.Assert(ef.NvmeTCPPathMap[addr].Transport, Equals, NvmfTransportRDMA)
+
+	// An empty transport falls back to the default (TCP), which the teardown
+	// treats as a no-op path.
+	addr2 := ef.upsertNVMeTCPPathLocked("10.0.0.3", 4000, "engine-c", "nqn.test", "nguid", NvmeTCPANAStateOptimized, "")
+	c.Assert(ef.NvmeTCPPathMap[addr2], NotNil)
+	c.Assert(ef.NvmeTCPPathMap[addr2].Transport, Equals, DefaultNvmfTransport)
+}
+
 func (s *TestSuite) TestTeardownRemoteRDMAPathIfNeededAggregatesErrors(c *C) {
 	ef := newRDMAEngineFrontend(true)
 	ef.teardownRemoteRDMAPathFn = func(nqn, ip, port string) error {
