@@ -507,6 +507,55 @@ func (e *Engine) targetTransport() NvmfTransportType {
 	return e.NvmeTcpTarget.Transport
 }
 
+// RemoveTargetListener removes this engine's NVMe-oF target listener for the
+// given transport. During a switchover the old RDMA path's HCA queue pair stays
+// pinned in the device's QP table until both the initiator disconnects and the
+// target releases its listener; setting the path ANA-inaccessible does not free
+// it. This is called on the old target to release that resource. TCP listeners
+// are left to ctrl-loss-tmo so a passed-in transport of "" falls back to the
+// engine's own target transport.
+func (e *Engine) RemoveTargetListener(spdkClient *spdkclient.Client, transport NvmfTransportType) error {
+	if e == nil {
+		return fmt.Errorf("engine is nil")
+	}
+	if spdkClient == nil {
+		return fmt.Errorf("SPDK client is nil for engine %s", e.Name)
+	}
+
+	e.Lock()
+	defer e.Unlock()
+
+	if e.NvmeTcpTarget == nil {
+		return nil
+	}
+
+	nqn := e.NvmeTcpTarget.Nqn
+	ip := e.NvmeTcpTarget.IP
+	port := e.NvmeTcpTarget.Port
+	if nqn == "" || ip == "" || port == 0 {
+		return nil
+	}
+
+	if transport == "" {
+		transport = e.targetTransport()
+	}
+
+	_, err := spdkClient.NvmfSubsystemRemoveListener(
+		nqn, ip, strconv.Itoa(int(port)),
+		transport.ToSPDKTransportType(),
+		spdktypes.NvmeAddressFamilyIPv4,
+	)
+	if err != nil {
+		return errors.Wrapf(err, "failed to remove %s target listener for engine %s", transport, e.Name)
+	}
+	e.log.WithFields(logrus.Fields{
+		"targetIP":   ip,
+		"targetPort": port,
+		"transport":  transport,
+	}).Info("Removed engine target listener")
+	return nil
+}
+
 // resolveCntlidRange returns the cntlid [min, max] range for this engine's
 // subsystem. Every engine generation gets a large, disjoint window so that
 // (a) initiator reconnect churn can never exhaust the subsystem's controller

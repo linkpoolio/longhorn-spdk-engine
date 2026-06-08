@@ -1177,6 +1177,9 @@ func (s *Server) recoverEngineFrontends(ctx context.Context) {
 		ef := NewEngineFrontend(record.Name, record.EngineName, record.VolumeName,
 			record.Frontend, record.SpecSize, 0, 0, s.updateChs[types.InstanceTypeEngineFrontend])
 		ef.metadataDir = s.metadataDir
+		// Tag with the node's current transport so a switchover after recovery
+		// can explicitly release an old RDMA path's HCA queue pair.
+		ef.NvmeTcpFrontend.Transport = s.nodeTransport
 		ef.VolumeNQN = record.VolumeNQN
 		ef.VolumeNGUID = record.VolumeNGUID
 		ef.ActivePath = record.ActivePath

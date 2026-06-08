@@ -244,6 +244,29 @@ func (s *Server) EngineSetTargetListenerANAState(ctx context.Context, req *spdkr
 	return &emptypb.Empty{}, nil
 }
 
+// EngineRemoveTargetListener removes the target listener for the given transport
+// from an engine, releasing the HCA queue pair held by an old RDMA path during
+// switchover. A missing engine is treated as already-removed (no error).
+func (s *Server) EngineRemoveTargetListener(ctx context.Context, req *spdkrpc.EngineRemoveTargetListenerRequest) (ret *emptypb.Empty, err error) {
+	if req == nil || req.Name == "" {
+		return nil, grpcstatus.Error(grpccodes.InvalidArgument, "engine name is required")
+	}
+
+	s.RLock()
+	e := s.engineMap[req.Name]
+	spdkClient := s.spdkClient
+	s.RUnlock()
+
+	if e == nil {
+		return &emptypb.Empty{}, nil
+	}
+
+	if err := e.RemoveTargetListener(spdkClient, NvmfTransportType(req.Transport)); err != nil {
+		return nil, grpcstatus.Errorf(grpccodes.Internal, "failed to remove target listener for engine %s: %v", req.Name, err)
+	}
+	return &emptypb.Empty{}, nil
+}
+
 // EngineGet returns a specific engine
 func (s *Server) EngineGet(ctx context.Context, req *spdkrpc.EngineGetRequest) (ret *spdkrpc.Engine, err error) {
 	s.RLock()
