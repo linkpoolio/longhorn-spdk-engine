@@ -620,11 +620,20 @@ func (ef *EngineFrontend) Heal(spdkClient *spdkclient.Client, record *EngineFron
 	}
 
 	ef.Lock()
-	if ef.isCreating || ef.isSwitchingOver || ef.isExpanding {
+	// Deletion guard: Delete closes stopCh and marks the EF Terminating; a
+	// heal racing (or trailing) a delete would resurrect host state for a
+	// frontend the manager is tearing down.
+	deleting := false
+	select {
+	case <-ef.stopCh:
+		deleting = true
+	default:
+	}
+	if ef.isCreating || ef.isSwitchingOver || ef.isExpanding || deleting || ef.State == types.InstanceStateTerminating {
 		// In-flight RPC owns this EF — back off, the next reconciler tick
 		// will reassess once the RPC completes.
 		ef.Unlock()
-		ef.log.Info("Heal: skipping, lifecycle op in flight")
+		ef.log.Info("Heal: skipping, lifecycle op in flight or frontend is being deleted")
 		return nil
 	}
 

@@ -101,6 +101,10 @@ type EngineFrontend struct {
 	teardownRemoteRDMAPathFn func(nqn, targetIP, targetPort string) error
 	// Test hook for remote SPDK listener removal during switchover.
 	removeRemoteTargetListenerFn func(targetIP, engineName string, transport NvmfTransportType) error
+	// Test hook for observing the transport of the kernel controller
+	// connected to a path (the remote listener's trtype as seen locally).
+	// Returns (transport, true) when observed; (_, false) when unobservable.
+	observePathTransportFn func(nqn, targetIP, targetPort string) (NvmfTransportType, bool)
 
 	// metadataDir is the base path for persisting engine frontend records.
 	// If empty, persistence is disabled.
@@ -116,9 +120,12 @@ type NvmeTcpFrontend struct {
 	Nqn   string
 	Nguid string
 
-	// Transport is the NVMe-oF transport this frontend's target listens on,
-	// propagated to each NvmeTCPPath so switchover can tear down RDMA paths
-	// explicitly. Set from the node's negotiated transport at create time.
+	// Transport is the NVMe-oF transport of the engine target this frontend
+	// dials, propagated to each NvmeTCPPath. Set from the engine target's
+	// actual transport (engineFrontendTargetTransport — TCP today, the kernel
+	// initiator connects over nvme-tcp), NOT from the node's negotiated
+	// transport. RDMA-specific teardown at switchover keys on the transport
+	// observed on the live controller, with this tag as the fallback.
 	Transport NvmfTransportType
 }
 
@@ -565,7 +572,15 @@ func isSubsystemNotFoundError(err error) bool {
 // it removes the remote target's RDMA listener and disconnects the local
 // initiator controller, freeing the HCA queue pair that an ANA-inaccessible
 // transition alone leaves pinned. It is a no-op when the old path is not RDMA
-// (TCP controllers are reclaimed by ctrl-loss-tmo).
+// (TCP controllers are reclaimed by ctrl-loss-tmo; force-disconnecting them
+// would leave an ANA rollback after a phase-3 failure with no path).
+//
+// Whether the old path is RDMA is decided by the transport observed on the
+// kernel controller connected to that listener (its trtype), falling back to
+// the recorded path tag when the controller is unobservable. The recorded tag
+// is derived from the engine target's transport at create time (TCP today)
+// and can be stale for legacy targets that exposed an RDMA listener — those
+// must still get the explicit RDMA teardown.
 func (ef *EngineFrontend) teardownRemoteRDMAPathIfNeeded(oldTargetIP, oldEngineName string) error {
 	if oldTargetIP == "" {
 		return nil
@@ -573,24 +588,37 @@ func (ef *EngineFrontend) teardownRemoteRDMAPathIfNeeded(oldTargetIP, oldEngineN
 
 	ef.RLock()
 	var (
-		matchedPort int32
-		matchedNQN  string
-		isRDMA      bool
+		matchedPort       int32
+		matchedNQN        string
+		recordedTransport NvmfTransportType
+		found             bool
 	)
 	for _, path := range ef.NvmeTCPPathMap {
 		if path == nil {
 			continue
 		}
-		if path.TargetIP == oldTargetIP && path.Transport.IsRDMA() {
+		if path.TargetIP == oldTargetIP {
 			matchedPort = path.TargetPort
 			matchedNQN = path.Nqn
-			isRDMA = true
+			recordedTransport = path.Transport
+			found = true
 			break
 		}
 	}
 	ef.RUnlock()
 
+	if !found {
+		return nil
+	}
+
+	portStr := strconv.Itoa(int(matchedPort))
+
+	isRDMA := recordedTransport.IsRDMA()
+	if observedTransport, observed := ef.observePathTransport(matchedNQN, oldTargetIP, portStr); observed {
+		isRDMA = observedTransport.IsRDMA()
+	}
 	if !isRDMA {
+		// TCP-observed path: leave the old controller to ctrl-loss-tmo.
 		return nil
 	}
 
@@ -599,7 +627,6 @@ func (ef *EngineFrontend) teardownRemoteRDMAPathIfNeeded(oldTargetIP, oldEngineN
 		combinedErr = multierr.Append(combinedErr, errors.Wrap(err, "remove remote target listener"))
 	}
 
-	portStr := strconv.Itoa(int(matchedPort))
 	ef.log.WithFields(logrus.Fields{
 		"oldTargetIP":   oldTargetIP,
 		"oldTargetPort": matchedPort,
@@ -617,6 +644,38 @@ func (ef *EngineFrontend) teardownRemoteRDMAPathIfNeeded(oldTargetIP, oldEngineN
 	}
 
 	return combinedErr
+}
+
+// observePathTransport reports the transport of the kernel NVMe controller
+// connected to the given listener (i.e. the remote listener's trtype as the
+// connected initiator sees it). Returns false when the controller cannot be
+// observed (already disconnected, no initiator, transient nvme-cli failure);
+// callers then fall back to the recorded path tag.
+func (ef *EngineFrontend) observePathTransport(nqn, targetIP, targetPort string) (NvmfTransportType, bool) {
+	if ef.observePathTransportFn != nil {
+		return ef.observePathTransportFn(nqn, targetIP, targetPort)
+	}
+	if ef.initiator == nil || nqn == "" {
+		return "", false
+	}
+	devices, err := initiator.GetDevices(targetIP, targetPort, nqn, ef.initiator.GetExecutor())
+	if err != nil {
+		ef.log.WithError(err).Debugf("Failed to observe controller transport for nqn %s at %s:%s", nqn, targetIP, targetPort)
+		return "", false
+	}
+	for _, d := range devices {
+		for _, ctrl := range d.Controllers {
+			controllerIP, controllerPort := initiator.GetIPAndPortFromControllerAddress(ctrl.Address)
+			if controllerIP != targetIP || controllerPort != targetPort {
+				continue
+			}
+			if ctrl.Transport == "" {
+				continue
+			}
+			return NvmfTransportType(strings.ToLower(ctrl.Transport)), true
+		}
+	}
+	return "", false
 }
 
 // removeRemoteTargetListener asks the (possibly remote) engine SPDK service to

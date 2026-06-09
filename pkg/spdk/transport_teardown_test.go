@@ -121,6 +121,100 @@ func (s *TestSuite) TestUpsertNVMeTCPPathSetsTransport(c *C) {
 	c.Assert(ef.NvmeTCPPathMap[addr2].Transport, Equals, DefaultNvmfTransport)
 }
 
+// The RDMA-specific teardown keys on the transport observed on the live
+// controller (the remote listener's trtype): an observed-TCP path must be a
+// no-op even when the recorded tag claims RDMA — force-disconnecting a TCP
+// controller would leave an ANA rollback after a phase-3 failure with no
+// path; ctrl-loss-tmo owns its cleanup.
+func (s *TestSuite) TestTeardownRemoteRDMAPathNoopWhenObservedTCP(c *C) {
+	ef := newRDMAEngineFrontend(true) // recorded tag says RDMA
+	ef.observePathTransportFn = func(nqn, ip, port string) (NvmfTransportType, bool) {
+		return NvmfTransportTCP, true // live controller is actually TCP
+	}
+
+	called := false
+	ef.teardownRemoteRDMAPathFn = func(nqn, ip, port string) error {
+		called = true
+		return nil
+	}
+	ef.removeRemoteTargetListenerFn = func(string, string, NvmfTransportType) error {
+		called = true
+		return nil
+	}
+
+	err := ef.teardownRemoteRDMAPathIfNeeded("10.0.0.1", "engine-old")
+	c.Assert(err, IsNil)
+	c.Assert(called, Equals, false)
+}
+
+// Conversely, a legacy RDMA target must still get the explicit RDMA teardown
+// even though new builds tag EF paths with the engine target's transport
+// (TCP): the observed controller trtype wins over the recorded tag.
+func (s *TestSuite) TestTeardownRemoteRDMAPathFiresWhenObservedRDMA(c *C) {
+	ef := newRDMAEngineFrontend(false) // recorded tag says TCP (new tagging)
+	ef.observePathTransportFn = func(nqn, ip, port string) (NvmfTransportType, bool) {
+		return NvmfTransportRDMA, true // legacy target listener is RDMA
+	}
+
+	var gotNQN, gotIP, gotPort string
+	ef.teardownRemoteRDMAPathFn = func(nqn, ip, port string) error {
+		gotNQN, gotIP, gotPort = nqn, ip, port
+		return nil
+	}
+	var gotListenerTransport NvmfTransportType
+	ef.removeRemoteTargetListenerFn = func(targetIP, engineName string, transport NvmfTransportType) error {
+		gotListenerTransport = transport
+		return nil
+	}
+
+	err := ef.teardownRemoteRDMAPathIfNeeded("10.0.0.1", "engine-old")
+	c.Assert(err, IsNil)
+	c.Assert(gotNQN, Equals, "nqn.test")
+	c.Assert(gotIP, Equals, "10.0.0.1")
+	c.Assert(gotPort, Equals, "2000")
+	c.Assert(gotListenerTransport, Equals, NvmfTransportRDMA)
+}
+
+// When the controller is unobservable (already disconnected, transient
+// nvme-cli failure) the teardown falls back to the recorded path tag.
+func (s *TestSuite) TestTeardownRemoteRDMAPathFallsBackToRecordedTag(c *C) {
+	ef := newRDMAEngineFrontend(true)
+	ef.observePathTransportFn = func(nqn, ip, port string) (NvmfTransportType, bool) {
+		return "", false // unobservable
+	}
+	called := false
+	ef.teardownRemoteRDMAPathFn = func(nqn, ip, port string) error {
+		called = true
+		return nil
+	}
+	ef.removeRemoteTargetListenerFn = func(string, string, NvmfTransportType) error { return nil }
+
+	err := ef.teardownRemoteRDMAPathIfNeeded("10.0.0.1", "engine-old")
+	c.Assert(err, IsNil)
+	c.Assert(called, Equals, true)
+}
+
+// The EF path transport tag must be derived from the engine target's actual
+// transport — the listener the kernel initiator dials is pinned to TCP in
+// createNVMeTCPTarget — not from the node's negotiated transport.
+func (s *TestSuite) TestEngineFrontendPathTransportDerivation(c *C) {
+	c.Check(engineFrontendTargetTransport(), Equals, NvmfTransportTCP)
+
+	// The engine's own target transport agrees with the shared derivation.
+	e := &Engine{NvmeTcpTarget: &NvmeTcpTarget{Transport: engineFrontendTargetTransport()}}
+	c.Check(e.targetTransport(), Equals, engineFrontendTargetTransport())
+
+	// Paths tagged through syncCurrentNVMeTCPPathLocked inherit the tag.
+	ef := NewEngineFrontend("ef-t", "engine-t", "vol-t", lhtypes.FrontendSPDKTCPNvmf, 1024, 0, 0, make(chan interface{}, 1))
+	ef.NvmeTcpFrontend.Transport = engineFrontendTargetTransport()
+	ef.NvmeTcpFrontend.TargetIP = "10.0.0.5"
+	ef.NvmeTcpFrontend.TargetPort = 2100
+	ef.syncCurrentNVMeTCPPathLocked()
+	path := ef.NvmeTCPPathMap["10.0.0.5:2100"]
+	c.Assert(path, NotNil)
+	c.Check(path.Transport, Equals, NvmfTransportTCP)
+}
+
 func (s *TestSuite) TestTeardownRemoteRDMAPathIfNeededAggregatesErrors(c *C) {
 	ef := newRDMAEngineFrontend(true)
 	ef.teardownRemoteRDMAPathFn = func(nqn, ip, port string) error {

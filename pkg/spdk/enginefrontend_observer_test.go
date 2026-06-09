@@ -283,3 +283,34 @@ func (s *TestSuite) TestBoolsToBitmap(c *C) {
 	c.Check(boolsToBitmap(false, false, false, true), Equals, 0b0001)
 	c.Check(boolsToBitmap(true, false, true, false), Equals, 0b1010)
 }
+
+// Heal must not race a deletion: Delete closes stopCh and marks the EF
+// Terminating, and a heal firing in that window would resurrect host state
+// (kernel NVMe session, dm device) for a frontend the manager is tearing
+// down. The guard mirrors the existing isCreating/isSwitchingOver/isExpanding
+// checks.
+func (s *TestSuite) TestEngineFrontendHealSkipsDuringDeletion(c *C) {
+	fmt.Println("Testing EngineFrontend.Heal deletion guard")
+
+	record := &EngineFrontendRecord{
+		Name:       "ef-del",
+		VolumeName: "vol-del",
+		Frontend:   lhtypes.FrontendSPDKTCPBlockdev,
+		TargetIP:   "10.0.0.7",
+		TargetPort: 2100,
+	}
+
+	// stopCh closed (Delete ran or is running) -> Heal must back off without
+	// touching state or attempting a Create.
+	ef := NewEngineFrontend("ef-del", "engine-del", "vol-del", lhtypes.FrontendSPDKTCPBlockdev, 1024, 0, 0, make(chan interface{}, 1))
+	ef.State = lhtypes.InstanceStateRunning
+	close(ef.stopCh)
+	c.Assert(ef.Heal(nil, record), IsNil)
+	c.Check(string(ef.State), Equals, lhtypes.InstanceStateRunning) // not reset to Pending
+
+	// Terminating state (Delete's defer already ran) -> same back-off.
+	ef2 := NewEngineFrontend("ef-del2", "engine-del2", "vol-del", lhtypes.FrontendSPDKTCPBlockdev, 1024, 0, 0, make(chan interface{}, 1))
+	ef2.State = lhtypes.InstanceStateTerminating
+	c.Assert(ef2.Heal(nil, record), IsNil)
+	c.Check(string(ef2.State), Equals, lhtypes.InstanceStateTerminating)
+}

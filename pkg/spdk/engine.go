@@ -48,12 +48,18 @@ type NvmeTcpTarget struct {
 	Nguid     string
 	ANAState  NvmeTCPANAState
 	Transport NvmfTransportType
+}
 
-	// TCPFallbackPort is the secondary TCP listener port used on
-	// RDMA-capable nodes. The fallback listener stays pinned at
-	// NvmeTCPANAStateNonOptimized; ANA switchover only flips the primary.
-	// Zero means no fallback (primary is already TCP).
-	TCPFallbackPort int32
+// engineFrontendTargetTransport is the transport of the engine's
+// frontend-facing NVMe-oF target listener. Pinned to TCP: the engine target
+// serves the host-side kernel NVMe initiator, which connects over nvme-tcp
+// (see createNVMeTCPTarget for the full rationale). EngineFrontend path
+// tagging derives from this same function so the EF never tags a path RDMA
+// while the target it actually dials listens on TCP — a mistagged path would
+// make the switchover RDMA teardown force-disconnect a TCP controller that
+// must instead be left to ctrl-loss-tmo for ANA rollback.
+func engineFrontendTargetTransport() NvmfTransportType {
+	return NvmfTransportTCP
 }
 
 func toSPDKListenerANAState(anaState NvmeTCPANAState) (spdktypes.NvmfSubsystemListenerAnaState, error) {
@@ -458,7 +464,7 @@ func (e *Engine) createNVMeTCPTarget(spdkClient *spdkclient.Client, superiorPort
 	// separately-allocated "TCP fallback" port never matches the address the
 	// frontend connects to. replicaTransport() still controls RDMA for the
 	// inter-SPDK replica attach, which is where the bandwidth benefit lives.
-	e.NvmeTcpTarget.Transport = NvmfTransportTCP
+	e.NvmeTcpTarget.Transport = engineFrontendTargetTransport()
 
 	spdkANAState, err := toSPDKListenerANAState(initialANAState)
 	if err != nil {
