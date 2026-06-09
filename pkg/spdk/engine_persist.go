@@ -27,17 +27,23 @@ const (
 // base-bdev relationship can be re-established against the existing SPDK
 // objects that survived the restart.
 type EngineRecord struct {
-	Name                string                          `json:"name"`
-	VolumeName          string                          `json:"volumeName"`
-	Frontend            string                          `json:"frontend"`
-	SpecSize            uint64                          `json:"specSize"`
-	RaidBdevUUID        string                          `json:"raidBdevUUID,omitempty"`
-	ReplicaTransport    NvmfTransportType               `json:"replicaTransport,omitempty"`
-	ReplicaStatusMap    map[string]*EngineReplicaStatus `json:"replicaStatusMap,omitempty"`
-	NvmeTcpTarget       *NvmeTcpTarget                  `json:"nvmeTcpTarget,omitempty"`
-	DeltaBitmapEnabled  bool                            `json:"deltaBitmapEnabled,omitempty"`
-	ReplicaDirtyBitmaps map[string]*ReplicaDirtyBitmap  `json:"replicaDirtyBitmaps,omitempty"`
-	QosLimits           QosLimits                       `json:"qosLimits,omitempty"`
+	Name             string                          `json:"name"`
+	VolumeName       string                          `json:"volumeName"`
+	Frontend         string                          `json:"frontend"`
+	SpecSize         uint64                          `json:"specSize"`
+	RaidBdevUUID     string                          `json:"raidBdevUUID,omitempty"`
+	ReplicaTransport NvmfTransportType               `json:"replicaTransport,omitempty"`
+	ReplicaStatusMap map[string]*EngineReplicaStatus `json:"replicaStatusMap,omitempty"`
+	NvmeTcpTarget    *NvmeTcpTarget                  `json:"nvmeTcpTarget,omitempty"`
+	// DeltaBitmapEnabled is a pointer so that records written by older builds
+	// (field absent) can be told apart from an explicit false: the raid
+	// delta-bitmap flag must stay stable across reconstruct for the volume's
+	// lifetime, and a bool field with omitempty silently flipped it to false
+	// on restore. nil means "field absent from the record" and restore keeps
+	// the default the engine would have chosen on fresh create.
+	DeltaBitmapEnabled  *bool                          `json:"deltaBitmapEnabled,omitempty"`
+	ReplicaDirtyBitmaps map[string]*ReplicaDirtyBitmap `json:"replicaDirtyBitmaps,omitempty"`
+	QosLimits           QosLimits                      `json:"qosLimits"`
 }
 
 func engineRecordDir(metadataDir, engineName string) string {
@@ -89,6 +95,7 @@ func saveEngineRecord(metadataDir string, e *Engine) error {
 		}
 	}
 
+	deltaBitmapEnabled := e.deltaBitmapEnabled
 	rec := EngineRecord{
 		Name:                e.Name,
 		VolumeName:          e.VolumeName,
@@ -98,7 +105,7 @@ func saveEngineRecord(metadataDir string, e *Engine) error {
 		ReplicaTransport:    e.ReplicaTransport,
 		ReplicaStatusMap:    replicaStatusCopy,
 		NvmeTcpTarget:       nvmeTarget,
-		DeltaBitmapEnabled:  e.deltaBitmapEnabled,
+		DeltaBitmapEnabled:  &deltaBitmapEnabled,
 		ReplicaDirtyBitmaps: bitmapsCopy,
 		QosLimits:           e.QosLimits,
 	}
@@ -225,10 +232,19 @@ func (e *Engine) restoreFromRecord(rec *EngineRecord) {
 			if s == nil {
 				continue
 			}
+			// DialedAddress and Transport must survive the restore: after an
+			// IM restart the reconnect/validation paths compare the attached
+			// bdev against dialAddress(), so dropping them would fail
+			// dial-address validation for every fallback-dialed replica.
+			// Restoring Transport also keeps server.recoverEngines' tcp->rdma
+			// engine-transport upgrade from misclassifying replicas that were
+			// genuinely attached over TCP.
 			e.ReplicaStatusMap[name] = &EngineReplicaStatus{
-				Address:  s.Address,
-				BdevName: s.BdevName,
-				Mode:     s.Mode,
+				Address:       s.Address,
+				DialedAddress: s.DialedAddress,
+				BdevName:      s.BdevName,
+				Mode:          s.Mode,
+				Transport:     s.Transport,
 			}
 		}
 	}
@@ -236,7 +252,12 @@ func (e *Engine) restoreFromRecord(rec *EngineRecord) {
 		t := *rec.NvmeTcpTarget
 		e.NvmeTcpTarget = &t
 	}
-	e.deltaBitmapEnabled = rec.DeltaBitmapEnabled
+	if rec.DeltaBitmapEnabled != nil {
+		e.deltaBitmapEnabled = *rec.DeltaBitmapEnabled
+	}
+	// else: the record predates the field; keep the default NewEngine chose
+	// (defaultRaidDeltaBitmapEnabled()), which is what the engine used when
+	// the record was written. The flag must stay stable across reconstruct.
 	e.QosLimits = rec.QosLimits
 	if len(rec.ReplicaDirtyBitmaps) > 0 {
 		e.ReplicaDirtyBitmaps = make(map[string]*ReplicaDirtyBitmap, len(rec.ReplicaDirtyBitmaps))
@@ -251,4 +272,3 @@ func (e *Engine) restoreFromRecord(rec *EngineRecord) {
 	e.log.Infof("Restored engine %s (volume=%s) from persisted record: replicas=%d raid=%s deltaBitmap=%v bitmaps=%d",
 		e.Name, e.VolumeName, len(e.ReplicaStatusMap), e.RaidBdevUUID, e.deltaBitmapEnabled, len(e.ReplicaDirtyBitmaps))
 }
-

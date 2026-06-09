@@ -1146,6 +1146,12 @@ func (s *Server) recoverEngines() {
 		e := NewEngine(rec.Name, rec.VolumeName, rec.Frontend, rec.SpecSize, transport, s.updateChs[types.InstanceTypeEngine], 0)
 		e.metadataDir = s.metadataDir
 		e.restoreFromRecord(rec)
+		// Mark Running before any validation has happened. This is an
+		// accepted tradeoff: the manager's first EngineGet must not see
+		// NotFound (it would fall back to EngineCreate mid-recovery), and a
+		// stale Running is corrected by the next verify() tick, whose
+		// ValidateAndUpdate reconciles the record against live SPDK state and
+		// demotes the engine to Error if the RAID/base bdevs are gone.
 		e.State = types.InstanceStateRunning
 		s.engineMap[name] = e
 	}
