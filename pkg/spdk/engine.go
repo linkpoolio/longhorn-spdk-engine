@@ -600,12 +600,16 @@ func (e *Engine) SetQosLimit(spdkClient *spdkclient.Client, limits QosLimits) er
 }
 
 // pickReplicaAddress selects the address + transport to dial for a replica.
-// When the transport-aware map carries an entry for the replica it is used;
-// otherwise the legacy address is dialed with the engine's replicaTransport().
+// When the transport-aware map carries an entry for the replica (a storage IM
+// that reports its typed TCP/RDMA ports) it is the source of truth. When it
+// does not -- a transport-unaware/older storage IM that reports only the
+// legacy primary port -- we fall back to the addressing convention via
+// legacyTransportFallback, which keeps a rebased engine backward-compatible
+// with storage IMs that predate typed-port reporting (no storage roll needed).
 func (e *Engine) pickReplicaAddress(replicaName, legacyAddress string, replicaTransportAddressMap map[string]*spdkrpc.ReplicaTransportAddresses) (string, NvmfTransportType) {
 	tAddrs, ok := replicaTransportAddressMap[replicaName]
 	if !ok || tAddrs == nil {
-		return legacyAddress, e.replicaTransport()
+		return e.legacyTransportFallback(legacyAddress)
 	}
 	return e.pickFromTransportAddresses(legacyAddress, tAddrs)
 }
@@ -616,13 +620,13 @@ func (e *Engine) pickRebuildDstAddress(legacyAddress string, tAddrs *spdkrpc.Rep
 	return e.pickFromTransportAddresses(legacyAddress, tAddrs)
 }
 
-// pickFromTransportAddresses is the shared selection rule: prefer the RDMA
-// address when this engine is RDMA-capable and the replica advertises one;
-// otherwise fall back to the replica's TCP address; otherwise the legacy
-// address with the engine's default transport.
+// pickFromTransportAddresses is the shared selection rule when the replica
+// advertises typed transport addresses: prefer the RDMA address when this
+// engine is RDMA-capable and the replica advertises one; otherwise the
+// replica's advertised TCP address; otherwise fall back to the convention.
 func (e *Engine) pickFromTransportAddresses(legacyAddress string, tAddrs *spdkrpc.ReplicaTransportAddresses) (string, NvmfTransportType) {
 	if tAddrs == nil {
-		return legacyAddress, e.replicaTransport()
+		return e.legacyTransportFallback(legacyAddress)
 	}
 	if e.replicaTransport().IsRDMA() && tAddrs.RdmaAddress != "" {
 		return tAddrs.RdmaAddress, NvmfTransportRDMA
@@ -630,7 +634,36 @@ func (e *Engine) pickFromTransportAddresses(legacyAddress string, tAddrs *spdkrp
 	if tAddrs.TcpAddress != "" {
 		return tAddrs.TcpAddress, NvmfTransportTCP
 	}
-	return legacyAddress, e.replicaTransport()
+	return e.legacyTransportFallback(legacyAddress)
+}
+
+// legacyTransportFallback derives the address+transport to dial when a replica
+// advertises no usable transport-address map entry, i.e. its storage IM does
+// not report typed TCP/RDMA ports. It mirrors the storage exposure convention
+// (Replica.listenerPortsForTransport / addTCPFallbackListener) and the
+// pre-rebase engine behaviour:
+//
+//   - the legacy address is the replica's primary listener port;
+//   - on an RDMA storage node that primary is the RDMA listener, with a TCP
+//     fallback exposed at primary+1.
+//
+// So an RDMA engine dials the legacy (RDMA primary) address over RDMA, and a
+// TCP engine dials primary+1 over TCP. This keeps a rebased engine connecting
+// to an older, transport-unaware storage IM without a storage roll. If the
+// address can't be parsed, dial it as-is over TCP as a last resort.
+func (e *Engine) legacyTransportFallback(legacyAddress string) (string, NvmfTransportType) {
+	if e.replicaTransport().IsRDMA() {
+		return legacyAddress, NvmfTransportRDMA
+	}
+	host, portStr, err := net.SplitHostPort(legacyAddress)
+	if err != nil {
+		return legacyAddress, NvmfTransportTCP
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return legacyAddress, NvmfTransportTCP
+	}
+	return net.JoinHostPort(host, strconv.Itoa(int(tcpFallbackPortFor(int32(port))))), NvmfTransportTCP
 }
 
 func (e *Engine) connectReplicas(spdkClient *spdkclient.Client, replicaAddressMap map[string]string, replicaTransportAddressMap map[string]*spdkrpc.ReplicaTransportAddresses) []string {
