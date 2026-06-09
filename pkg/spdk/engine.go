@@ -3624,7 +3624,12 @@ func (e *Engine) validateAndUpdateReplicaNvme(replicaName string, bdev *spdktype
 	}
 
 	replicaStatus := e.ReplicaStatusMap[replicaName]
-	if err := validateReplicaAddress(replicaName, bdev.Name, replicaStatus.Address, nvmeInfo); err != nil {
+	// Validate against the address the engine actually dialed, not the
+	// canonical primary Address. They differ when the engine fell back to a
+	// replica's TCP listener at port+1 (RDMA-primary replica + TCP engine):
+	// the attached NVMe bdev reports the +1 address, so comparing against the
+	// canonical Address would wrongly flag a mismatch and mark the replica ERR.
+	if err := validateReplicaAddress(replicaName, bdev.Name, replicaStatus.dialAddress(), nvmeInfo); err != nil {
 		return types.ModeERR, err
 	}
 	if err := validateControllerName(replicaName, bdev.Name, replicaStatus.BdevName); err != nil {
