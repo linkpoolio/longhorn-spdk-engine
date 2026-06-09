@@ -14,6 +14,7 @@ import (
 	spdktypes "github.com/longhorn/go-spdk-helper/pkg/spdk/types"
 	helpertypes "github.com/longhorn/go-spdk-helper/pkg/types"
 
+	safelog "github.com/longhorn/longhorn-spdk-engine/pkg/log"
 	"github.com/longhorn/longhorn-spdk-engine/pkg/types"
 )
 
@@ -21,16 +22,64 @@ import (
 // replica records and heals desync. 30s matches the EngineFrontend cadence.
 const ReplicaReconcileInterval = 30 * time.Second
 
-// ReplicaHealConsecutiveFailures is the number of consecutive Error
-// observations required before the Replica reconciler will fire heal.
-// Same rationale as EngineFrontendHealConsecutiveFailures: filter out
-// transient SPDK probe blips (BdevGetBdevs / NvmfGetSubsystems hitting a
-// busy reactor for a tick) from genuine listener-missing desync. Replica
-// heal is much less destructive than EngineFrontend heal — there's no
-// userspace fs mount to break, just brief I/O pauses on peer engines
-// reconnecting — so this guard is mostly belt-and-braces, but the cost is
-// negligible.
+// ReplicaHealConsecutiveFailures is the number of consecutive
+// exposed-but-no-listener observations required before the Replica reconciler
+// will fire heal. Same rationale as EngineFrontendHealConsecutiveFailures:
+// require a sustained desync before acting. SPDK probe errors (BdevGetBdevs /
+// NvmfGetSubsystems hitting a busy reactor for a tick) do NOT count toward
+// this threshold — a failed probe says nothing about the listener, and Heal
+// would be just as likely to fail against the same busy target. Replica heal
+// is much less destructive than EngineFrontend heal — there's no userspace fs
+// mount to break, just brief I/O pauses on peer engines reconnecting — so
+// this guard is mostly belt-and-braces, but the cost is negligible.
 const ReplicaHealConsecutiveFailures = 3
+
+// replicaHealSignal classifies a single reconciler observation of one replica.
+type replicaHealSignal string
+
+const (
+	// replicaHealSignalHealthy: the replica should be exposed and SPDK shows
+	// a listener for it.
+	replicaHealSignalHealthy replicaHealSignal = "healthy"
+	// replicaHealSignalCandidate: the in-memory replica says it should be
+	// exposed (r.IsExposed) but SPDK shows no subsystem listener — the heal
+	// target condition ("head lvol present, NVMe-oF listener missing").
+	replicaHealSignalCandidate replicaHealSignal = "heal-candidate"
+	// replicaHealSignalNone: nothing to heal — the replica isn't supposed to
+	// be exposed (cleanly stopped or not yet created), or the head lvol is
+	// gone (Heal cannot recover a missing head; the manager must drive a
+	// fresh Create or accept replica failure).
+	replicaHealSignalNone replicaHealSignal = "none"
+	// replicaHealSignalSkipProbe: the SPDK probe itself failed, so the
+	// observation is unusable; it must not count toward (or reset) the heal
+	// threshold.
+	replicaHealSignalSkipProbe replicaHealSignal = "skip-probe-error"
+)
+
+// deriveReplicaHealSignal classifies one observation. shouldBeExposed is the
+// in-memory intent (Replica.IsExposed — the record has no exposure field);
+// derived is the BuildReplicaFromRecord-style observation; probeErr is any
+// SPDK probe failure for this tick. Pure function so the reconciler's heal
+// condition is unit-testable.
+func deriveReplicaHealSignal(shouldBeExposed bool, derived *Replica, probeErr error) replicaHealSignal {
+	if probeErr != nil || derived == nil || derived.State == types.InstanceStateError {
+		// Probe failures and structurally broken observations carry no
+		// information about the listener; skip the tick entirely.
+		return replicaHealSignalSkipProbe
+	}
+	if !shouldBeExposed {
+		return replicaHealSignalNone
+	}
+	if derived.Head == nil {
+		// Head lvol absent (derived Stopped): not the listener-missing case
+		// and not recoverable by re-exposing.
+		return replicaHealSignalNone
+	}
+	if derived.IsExposed {
+		return replicaHealSignalHealthy
+	}
+	return replicaHealSignalCandidate
+}
 
 // Heal drives a Replica whose host-side state has desynced from its persisted
 // record back into agreement. For replicas, the recoverable failure mode is
@@ -72,21 +121,30 @@ func (r *Replica) Heal(spdkClient *spdkclient.Client, record *ReplicaRecord) err
 
 	r.log.Warn("Replica.Heal: re-exposing missing NVMe-oF listener from persisted record")
 
-	nqn := helpertypes.GetNQN(record.Name)
+	params := r.healExposeParams(record)
 	// Best-effort tear down any partial subsystem state first; ignore
 	// not-found because the whole point is to recover from a missing
 	// subsystem.
-	if err := spdkClient.StopExposeBdev(nqn); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
+	if err := spdkClient.StopExposeBdev(params.Nqn); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
 		r.log.WithError(err).Warn("Replica.Heal: StopExposeBdev returned an error; continuing with re-expose")
 	}
 
-	port := strconv.Itoa(int(record.PortStart))
-	transport := r.transport().ToSPDKTransportType()
-	if err := spdkClient.StartExposeBdevWithTransport(nqn, alias, "", record.IP, port, transport); err != nil {
+	port := strconv.Itoa(int(params.Port))
+	if err := spdkClient.StartExposeBdevWithTransport(params.Nqn, alias, params.Nguid, params.IP, port, params.Transport.ToSPDKTransportType()); err != nil {
 		r.State = types.InstanceStateError
 		r.ErrorMsg = err.Error()
 		r.Unlock()
 		return errors.Wrapf(err, "Replica.Heal: StartExposeBdevWithTransport for %s", record.Name)
+	}
+	// Mirror Create's expose sequence: on RDMA nodes the replica also serves
+	// a secondary TCP listener at primary+1 so TCP-only engines can attach.
+	if params.NeedTCPFallback {
+		if err := r.addTCPFallbackListener(spdkClient, params.Nqn, params.IP, params.Port); err != nil {
+			r.State = types.InstanceStateError
+			r.ErrorMsg = err.Error()
+			r.Unlock()
+			return errors.Wrapf(err, "Replica.Heal: addTCPFallbackListener for %s", record.Name)
+		}
 	}
 
 	r.IsExposed = true
@@ -102,11 +160,40 @@ func (r *Replica) Heal(spdkClient *spdkclient.Client, record *ReplicaRecord) err
 	return nil
 }
 
+// replicaExposeParams are the NVMe-oF expose parameters Heal re-applies. They
+// must mirror what Create used (same NQN, the same generated NGUID — Create
+// passes generateNGUID(name) — the record's IP/primary port, the node
+// transport, and the TCP fallback listener on RDMA nodes), otherwise a healed
+// replica advertises a different namespace identity than the one engines
+// originally attached.
+type replicaExposeParams struct {
+	Nqn             string
+	Nguid           string
+	IP              string
+	Port            int32
+	Transport       NvmfTransportType
+	NeedTCPFallback bool
+}
+
+func (r *Replica) healExposeParams(record *ReplicaRecord) replicaExposeParams {
+	return replicaExposeParams{
+		Nqn:             helpertypes.GetNQN(record.Name),
+		Nguid:           generateNGUID(record.Name),
+		IP:              record.IP,
+		Port:            record.PortStart,
+		Transport:       r.transport(),
+		NeedTCPFallback: r.transport().IsRDMA(),
+	}
+}
+
 // reconcileReplicas is the self-heal loop for replica desync. Every tick:
-// load all persisted replica records, observe each one's SPDK-side state via
-// BuildReplicaFromRecord, and when state == Error (head lvol on disk but no
-// NVMe-oF listener exposed) call Heal to re-run StartExposeBdev from the
-// record.
+// load all persisted replica records, observe each one's SPDK-side state
+// (one shared bdev + subsystem dump per tick), and when the in-memory replica
+// says it should be exposed but SPDK shows no NVMe-oF listener for it
+// (deriveReplicaHealSignal == heal-candidate) for
+// ReplicaHealConsecutiveFailures consecutive ticks, call Heal to re-run the
+// expose sequence from the record. SPDK probe errors are skipped and never
+// count toward the threshold.
 //
 // Complementary to s.monitoring()'s verify() loop: verify() reconciles the
 // cached *Replica (workflow flags + per-operation state) against SPDK every
@@ -148,6 +235,28 @@ func (s *Server) reconcileReplicasOnce() {
 		return
 	}
 
+	s.RLock()
+	spdkClient := s.spdkClient
+	nodeTransport := s.nodeTransport
+	s.RUnlock()
+
+	// One SPDK observation per tick, shared across all replicas (same dumps
+	// ReplicaList uses) instead of a full unfiltered BdevGetBdevs per replica.
+	bdevList, probeErr := spdkClient.BdevGetBdevs("", 0)
+	var subsystems []spdktypes.NvmfSubsystem
+	if probeErr == nil {
+		subsystems, probeErr = spdkClient.NvmfGetSubsystems("", "")
+		if probeErr != nil && jsonrpc.IsJSONRPCRespErrorNoSuchDevice(probeErr) {
+			subsystems, probeErr = nil, nil
+		}
+	}
+	if probeErr != nil {
+		// A failed probe says nothing about listeners; do not count it
+		// toward (or reset) any heal threshold — just retry next tick.
+		logrus.WithError(probeErr).Warn("Replica reconciler: SPDK probe failed; skipping tick")
+		return
+	}
+
 	// Track which records we observed so we can GC stale counters at the
 	// end of the tick (records deleted between ticks).
 	seen := map[string]struct{}{}
@@ -157,41 +266,41 @@ func (s *Server) reconcileReplicasOnce() {
 
 		s.RLock()
 		r := s.replicaMap[name]
-		spdkClient := s.spdkClient
-		nodeTransport := s.nodeTransport
 		s.RUnlock()
 
-		// Single observation function — same one ReplicaGet/List use.
-		// A *Replica back with State=Error means "head lvol on disk but
-		// no listener exposed AND something probe-side is wrong" →
-		// candidate for heal. Other states (Running, Stopped) require no
-		// action from the reconciler.
-		derived, err := BuildReplicaFromRecord(spdkClient, record, nodeTransport)
-		if err != nil {
-			logrus.WithError(err).Warnf("Replica reconciler: probe failed for %s", record.Name)
+		if r == nil {
+			// No cached *Replica yet — verify() hasn't reconciled the
+			// cache after a recent IM restart, so there is no in-memory
+			// exposure intent to compare against. Skip; next tick will
+			// catch it. Don't bump the counter for this bookkeeping
+			// window.
 			continue
 		}
 
-		// Non-Error states reset the counter. Stopped is "the replica is
-		// legitimately not exposed right now" — usually fine, the manager
-		// will drive Create when it wants this exposed; not our job to
-		// heal toward Running.
-		if derived.State != types.InstanceStateError {
+		r.RLock()
+		shouldBeExposed := r.IsExposed
+		r.RUnlock()
+
+		derived, deriveErr := buildReplicaFromObservation(record, nodeTransport, bdevList, subsystems)
+		signal := deriveReplicaHealSignal(shouldBeExposed, derived, deriveErr)
+
+		switch signal {
+		case replicaHealSignalSkipProbe:
+			// Unusable observation — leave the counter untouched so probe
+			// blips neither accumulate toward heal nor mask a real desync.
+			logrus.Warnf("Replica reconciler: unusable observation for %s; skipping (counter unchanged)", record.Name)
+			continue
+		case replicaHealSignalHealthy, replicaHealSignalNone:
 			s.Lock()
 			if s.replicaDesyncCounts[record.Name] > 0 {
-				logrus.Infof("Replica reconciler: %s recovered after %d transient probe failures",
+				logrus.Infof("Replica reconciler: %s recovered after %d desync observations",
 					record.Name, s.replicaDesyncCounts[record.Name])
 				delete(s.replicaDesyncCounts, record.Name)
 			}
 			s.Unlock()
 			continue
-		}
-		if r == nil {
-			// No cached *Replica yet — verify() hasn't reconciled the
-			// cache after a recent IM restart. Skip; next tick will
-			// catch it. Don't bump the counter for this bookkeeping
-			// window.
-			continue
+		case replicaHealSignalCandidate:
+			// Fall through to the counter/heal logic below.
 		}
 
 		s.Lock()
@@ -199,14 +308,13 @@ func (s *Server) reconcileReplicasOnce() {
 		count := s.replicaDesyncCounts[record.Name]
 		s.Unlock()
 
-		// Below threshold: log the desync and wait. Most "Error" probe
-		// outcomes for replicas are transient SPDK busy windows; only a
-		// sustained Error across multiple ticks justifies firing the
-		// re-expose flow.
+		// Below threshold: log the desync and wait. Only a sustained
+		// exposed-but-no-listener condition across multiple ticks justifies
+		// firing the re-expose flow.
 		if count < ReplicaHealConsecutiveFailures {
 			logrus.WithFields(logrus.Fields{
 				"name":   record.Name,
-				"reason": derived.ErrorMsg,
+				"reason": "replica should be exposed but SPDK shows no NVMe-oF listener",
 				"count":  count,
 				"thresh": ReplicaHealConsecutiveFailures,
 			}).Warn("Replica reconciler: desync observed, below heal threshold")
@@ -215,7 +323,7 @@ func (s *Server) reconcileReplicasOnce() {
 
 		logrus.WithFields(logrus.Fields{
 			"name":   record.Name,
-			"reason": derived.ErrorMsg,
+			"reason": "replica should be exposed but SPDK shows no NVMe-oF listener",
 			"count":  count,
 		}).Warn("Replica reconciler: detected sustained desync, attempting heal")
 
@@ -261,13 +369,40 @@ func BuildReplicaFromRecord(spdkClient *spdkclient.Client, record *ReplicaRecord
 		return nil, errors.New("BuildReplicaFromRecord: nil record")
 	}
 
+	// Read all bdevs plus the nvmf subsystem list once; the actual derivation
+	// is the pure buildReplicaFromObservation, which batch callers
+	// (ReplicaList, the replica reconciler) feed with a single shared dump
+	// instead of one full BdevGetBdevs per replica.
+	bdevList, err := spdkClient.BdevGetBdevs("", 0)
+	if err != nil {
+		r := newReplicaSkeletonFromRecord(record, nodeTransport)
+		r.State = types.InstanceStateError
+		r.ErrorMsg = "BuildReplicaFromRecord: BdevGetBdevs: " + err.Error()
+		return r, nil
+	}
+	subsystems, err := spdkClient.NvmfGetSubsystems("", "")
+	if err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
+		r := newReplicaSkeletonFromRecord(record, nodeTransport)
+		r.State = types.InstanceStateError
+		r.ErrorMsg = "BuildReplicaFromRecord: NvmfGetSubsystems: " + err.Error()
+		return r, nil
+	}
+
+	return buildReplicaFromObservation(record, nodeTransport, bdevList, subsystems)
+}
+
+// newReplicaSkeletonFromRecord builds the identity-only *Replica that all
+// derive paths start from. The logger is real (fix for a nil-deref panic:
+// ServiceReplicaToProtoReplica logs through r.log when the BackingImage name
+// fails to parse, which is reachable from the ReplicaGet/List gRPC read path).
+func newReplicaSkeletonFromRecord(record *ReplicaRecord, nodeTransport NvmfTransportType) *Replica {
 	log := logrus.StandardLogger().WithFields(logrus.Fields{
 		"replicaName": record.Name,
 		"lvsName":     record.LvsName,
 		"lvsUUID":     record.LvsUUID,
 		"derived":     true,
 	})
-	r := &Replica{
+	return &Replica{
 		Name:              record.Name,
 		Alias:             record.LvsName + "/" + record.Name,
 		LvsName:           record.LvsName,
@@ -279,19 +414,22 @@ func BuildReplicaFromRecord(spdkClient *spdkclient.Client, record *ReplicaRecord
 		ListenerTransport: nodeTransport,
 		ActiveChain:       []*Lvol{nil},
 		SnapshotLvolMap:   map[string]*Lvol{},
-		log:               nil, // not used by ServiceReplicaToProtoReplica unless BackingImage extract fails
+		log:               safelog.NewSafeLogger(log),
 	}
-	_ = log // log reserved for future error-path logging
+}
 
-	// Read all bdevs in this lvstore. constructSnapshotLvolMap and
-	// constructActiveChainFromSnapshotLvolMap are pure functions that
-	// derive the snapshot tree from this map.
-	bdevList, err := spdkClient.BdevGetBdevs("", 0)
-	if err != nil {
-		r.State = types.InstanceStateError
-		r.ErrorMsg = "BuildReplicaFromRecord: BdevGetBdevs: " + err.Error()
-		return r, nil
+// buildReplicaFromObservation derives a transient *Replica from a persisted
+// record plus prefetched SPDK dumps (all bdevs + all nvmf subsystems). Pure —
+// no SPDK calls — so batch callers can share one dump across many replicas.
+func buildReplicaFromObservation(record *ReplicaRecord, nodeTransport NvmfTransportType, bdevList []spdktypes.BdevInfo, subsystems []spdktypes.NvmfSubsystem) (*Replica, error) {
+	if record == nil {
+		return nil, errors.New("buildReplicaFromObservation: nil record")
 	}
+
+	r := newReplicaSkeletonFromRecord(record, nodeTransport)
+
+	// constructSnapshotLvolMap and constructActiveChainFromSnapshotLvolMap
+	// are pure functions that derive the snapshot tree from this map.
 	bdevLvolMap := map[string]*spdktypes.BdevInfo{}
 	for i := range bdevList {
 		bdev := &bdevList[i]
@@ -346,15 +484,10 @@ func BuildReplicaFromRecord(spdkClient *spdkclient.Client, record *ReplicaRecord
 		r.ActualSize = actual
 	}
 
-	// Derive expose state from nvmf subsystem.
+	// Derive expose state from the prefetched nvmf subsystem dump.
 	nqn := r.Nqn
-	subsystems, err := spdkClient.NvmfGetSubsystems(nqn, "")
-	if err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
-		r.State = types.InstanceStateError
-		r.ErrorMsg = "BuildReplicaFromRecord: NvmfGetSubsystems: " + err.Error()
-		return r, nil
-	}
-	for _, ss := range subsystems {
+	for i := range subsystems {
+		ss := &subsystems[i]
 		if ss.Nqn != nqn {
 			continue
 		}

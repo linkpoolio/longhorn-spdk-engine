@@ -1157,7 +1157,7 @@ func (r *Replica) Create(spdkClient *spdkclient.Client, portCount int32, superio
 	}
 	// On RDMA-capable nodes also add a secondary TCP listener so TCP-only
 	// engines can still attach to this replica (no-op when primary is TCP).
-	if err := r.addTCPFallbackListener(spdkClient, r.Nqn, r.PortStart); err != nil {
+	if err := r.addTCPFallbackListener(spdkClient, r.Nqn, r.IP, r.PortStart); err != nil {
 		return nil, err
 	}
 
@@ -1321,9 +1321,7 @@ func (r *Replica) Delete(spdkClient *spdkclient.Client, cleanupRequired bool, su
 		updateRequired = true
 	}
 
-	if err := removeReplicaRecord(r.metadataDir, r.Name); err != nil {
-		r.log.WithError(err).Warn("Failed to remove persisted replica record during cleanup delete")
-	}
+	r.finishDeleteRecord(cleanupRequired)
 
 	if !cleanupRequired {
 		return nil
@@ -1345,6 +1343,22 @@ func (r *Replica) Delete(spdkClient *spdkclient.Client, cleanupRequired bool, su
 	r.log.Info("Deleted replica with all possible lvols")
 
 	return nil
+}
+
+// finishDeleteRecord drops the persisted replica record when, and only when,
+// the delete is a real cleanup. A cleanly-stopped replica (cleanupRequired=
+// false) must keep its record: ReplicaGet/ReplicaList are record-driven and
+// BuildReplicaFromRecord derives the legitimate Stopped state from a record
+// whose head lvol is still on disk. Removing the record on a clean stop made
+// the replica invisible to the manager and broke the salvage flow, which
+// gates on Status.CurrentState=Stopped.
+func (r *Replica) finishDeleteRecord(cleanupRequired bool) {
+	if !cleanupRequired {
+		return
+	}
+	if err := removeReplicaRecord(r.metadataDir, r.Name); err != nil {
+		r.log.WithError(err).Warn("Failed to remove persisted replica record during cleanup delete")
+	}
 }
 
 func (r *Replica) Get() (pReplica *spdkrpc.Replica) {
@@ -4447,7 +4461,7 @@ func getExposedPortForTransport(subsystem *spdktypes.NvmfSubsystem, trtype spdkt
 
 	return 0, fmt.Errorf("cannot find a %s exposed port in the NVMf subsystem", trtype)
 }
-func (r *Replica) addTCPFallbackListener(spdkClient *spdkclient.Client, nqn string, primaryPort int32) error {
+func (r *Replica) addTCPFallbackListener(spdkClient *spdkclient.Client, nqn, ip string, primaryPort int32) error {
 	if r.transport() == NvmfTransportTCP {
 		return nil
 	}
@@ -4456,13 +4470,13 @@ func (r *Replica) addTCPFallbackListener(spdkClient *spdkclient.Client, nqn stri
 	}
 	fallbackPort := strconv.Itoa(int(tcpFallbackPortFor(primaryPort)))
 	if err := spdkClient.EnsureNvmfTransport(spdktypes.NvmeTransportTypeTCP); err != nil {
-		return errors.Wrapf(err, "failed to ensure TCP transport before adding fallback listener on %s:%s for nqn %s", r.IP, fallbackPort, nqn)
+		return errors.Wrapf(err, "failed to ensure TCP transport before adding fallback listener on %s:%s for nqn %s", ip, fallbackPort, nqn)
 	}
 	if _, err := spdkClient.NvmfSubsystemAddListener(
-		nqn, r.IP, fallbackPort,
+		nqn, ip, fallbackPort,
 		spdktypes.NvmeTransportTypeTCP, spdktypes.NvmeAddressFamilyIPv4,
 	); err != nil {
-		return errors.Wrapf(err, "failed to add TCP fallback listener on %s:%s for nqn %s", r.IP, fallbackPort, nqn)
+		return errors.Wrapf(err, "failed to add TCP fallback listener on %s:%s for nqn %s", ip, fallbackPort, nqn)
 	}
 	return nil
 }

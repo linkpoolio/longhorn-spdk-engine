@@ -17,10 +17,12 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 
 	"github.com/longhorn/backupstore"
+	"github.com/longhorn/go-spdk-helper/pkg/jsonrpc"
 	"github.com/longhorn/types/pkg/generated/spdkrpc"
 
 	btypes "github.com/longhorn/backupstore/types"
 	butil "github.com/longhorn/backupstore/util"
+	spdktypes "github.com/longhorn/go-spdk-helper/pkg/spdk/types"
 
 	"github.com/longhorn/longhorn-spdk-engine/pkg/api"
 	"github.com/longhorn/longhorn-spdk-engine/pkg/types"
@@ -157,11 +159,40 @@ func (s *Server) ReplicaList(ctx context.Context, req *emptypb.Empty) (*spdkrpc.
 	nodeTransport := s.nodeTransport
 	s.RUnlock()
 
+	// Fetch the SPDK state once for the whole list (one bdev dump + one
+	// subsystem dump) and feed every record through the pure derivation;
+	// previously each replica issued its own full unfiltered BdevGetBdevs,
+	// i.e. N full dumps per manager poll.
+	bdevList, bdevErr := spdkClient.BdevGetBdevs("", 0)
+	var subsystems []spdktypes.NvmfSubsystem
+	var subsysErr error
+	if bdevErr == nil {
+		subsystems, subsysErr = spdkClient.NvmfGetSubsystems("", "")
+		if subsysErr != nil && jsonrpc.IsJSONRPCRespErrorNoSuchDevice(subsysErr) {
+			subsystems, subsysErr = nil, nil
+		}
+	}
+
 	for name, record := range records {
-		r, err := BuildReplicaFromRecord(spdkClient, record, nodeTransport)
-		if err != nil {
-			logrus.WithError(err).Warnf("ReplicaList: failed to derive %s; skipping", name)
-			continue
+		var r *Replica
+		switch {
+		case bdevErr != nil:
+			// Mirror BuildReplicaFromRecord's probe-failure semantics: return
+			// a coherent Error-state replica instead of a server error.
+			r = newReplicaSkeletonFromRecord(record, nodeTransport)
+			r.State = types.InstanceStateError
+			r.ErrorMsg = "ReplicaList: BdevGetBdevs: " + bdevErr.Error()
+		case subsysErr != nil:
+			r = newReplicaSkeletonFromRecord(record, nodeTransport)
+			r.State = types.InstanceStateError
+			r.ErrorMsg = "ReplicaList: NvmfGetSubsystems: " + subsysErr.Error()
+		default:
+			var err error
+			r, err = buildReplicaFromObservation(record, nodeTransport, bdevList, subsystems)
+			if err != nil {
+				logrus.WithError(err).Warnf("ReplicaList: failed to derive %s; skipping", name)
+				continue
+			}
 		}
 		res[name] = ServiceReplicaToProtoReplica(r)
 	}
