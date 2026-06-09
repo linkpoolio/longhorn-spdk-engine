@@ -88,3 +88,23 @@ func (s *TestSuite) TestEngineLegacyTransportFallback(c *C) {
 	c.Check(addr, Equals, "garbage-no-port")
 	c.Check(trans, Equals, NvmfTransportTCP)
 }
+
+// dialAddress drives replica validation/reconnect: it must return the address
+// the engine actually dialed (DialedAddress, e.g. the +1 TCP fallback), not
+// the canonical primary Address -- otherwise validateAndUpdateReplicaNvme
+// flags a mismatch and marks the replica ERR.
+func (s *TestSuite) TestEngineReplicaStatusDialAddress(c *C) {
+	fmt.Println("Testing EngineReplicaStatus.dialAddress (DialedAddress preferred over Address)")
+
+	// Fell back to the TCP fallback: DialedAddress (+1) is what was attached.
+	withDialed := &EngineReplicaStatus{Address: "10.10.3.19:28929", DialedAddress: "10.10.3.19:28930"}
+	c.Check(withDialed.dialAddress(), Equals, "10.10.3.19:28930")
+
+	// No fallback (transports matched / pre-dual-listener): use canonical Address.
+	noDialed := &EngineReplicaStatus{Address: "10.10.3.19:28929"}
+	c.Check(noDialed.dialAddress(), Equals, "10.10.3.19:28929")
+
+	// nil-safe.
+	var nilStatus *EngineReplicaStatus
+	c.Check(nilStatus.dialAddress(), Equals, "")
+}
