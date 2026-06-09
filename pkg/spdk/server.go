@@ -121,7 +121,21 @@ func NewServer(ctx context.Context, portStart, portEnd int32) (*Server, error) {
 		return nil, err
 	}
 
-	bitmap, err := commonbitmap.NewBitmap(portStart, portEnd)
+	// Seed the port allocator with the port ranges persisted by replicas and
+	// engine targets that survived an spdk_tgt/IM restart. Restored replicas
+	// reuse their persisted ranges (Replica.restoreFromRecord) and restored
+	// engine targets keep their listener port without re-allocating, so the
+	// allocator must consider those ranges taken before any create can run;
+	// otherwise a fresh create could collide with a restored instance.
+	replicaRecords, recErr := loadReplicaRecords(types.MetadataDir)
+	if recErr != nil {
+		logrus.WithError(recErr).Warn("Failed to load replica records for port reservation seeding; continuing without replica reservations")
+	}
+	engineRecords, recErr := loadEngineRecords(types.MetadataDir)
+	if recErr != nil {
+		logrus.WithError(recErr).Warn("Failed to load engine records for port reservation seeding; continuing without engine reservations")
+	}
+	bitmap, err := newPortAllocatorWithReservations(portStart, portEnd, collectReservedPortRanges(replicaRecords, engineRecords))
 	if err != nil {
 		return nil, err
 	}

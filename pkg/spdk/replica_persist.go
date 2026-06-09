@@ -72,22 +72,53 @@ func removeReplicaRecord(metadataDir, replicaName string) error {
 	return nil
 }
 
-func newPortAllocatorWithReservations(portStart, portEnd int32, records map[string]*ReplicaRecord) (*commonbitmap.Bitmap, error) {
+// reservedPortRange is a [start, end] port range (inclusive) that must not be
+// handed out by the superior port allocator because a persisted replica or
+// engine target restored after an spdk_tgt/IM restart still owns it.
+type reservedPortRange struct {
+	name       string
+	start, end int32
+}
+
+// collectReservedPortRanges gathers the port ranges owned by persisted
+// replicas (PortStart..PortEnd) and engine targets (single port) so NewServer
+// can seed the superior port allocator before any create can run. Both kinds
+// of instances allocate from the same allocator (s.portAllocator).
+func collectReservedPortRanges(replicaRecords map[string]*ReplicaRecord, engineRecords map[string]*EngineRecord) []reservedPortRange {
+	ranges := []reservedPortRange{}
+	for _, rec := range replicaRecords {
+		if rec == nil || rec.PortStart == 0 {
+			continue
+		}
+		ranges = append(ranges, reservedPortRange{name: "replica " + rec.Name, start: rec.PortStart, end: rec.PortEnd})
+	}
+	for _, rec := range engineRecords {
+		if rec == nil || rec.NvmeTcpTarget == nil || rec.NvmeTcpTarget.Port == 0 {
+			continue
+		}
+		// Engine targets allocate (and on Delete release) a single port; the
+		// record only carries that port.
+		ranges = append(ranges, reservedPortRange{name: "engine " + rec.Name, start: rec.NvmeTcpTarget.Port, end: rec.NvmeTcpTarget.Port})
+	}
+	return ranges
+}
+
+func newPortAllocatorWithReservations(portStart, portEnd int32, reservations []reservedPortRange) (*commonbitmap.Bitmap, error) {
 	b, err := commonbitmap.NewBitmap(portStart, portEnd)
 	if err != nil {
 		return nil, err
 	}
-	if len(records) == 0 {
+	if len(reservations) == 0 {
 		return b, nil
 	}
 	type portRange struct{ start, end int32 }
-	ranges := make([]portRange, 0, len(records))
-	for _, rec := range records {
-		if rec.PortStart < portStart || rec.PortEnd > portEnd || rec.PortEnd < rec.PortStart {
-			logrus.Warnf("Persisted replica %s port range [%d, %d] outside allocator [%d, %d]; skipping reservation", rec.Name, rec.PortStart, rec.PortEnd, portStart, portEnd)
+	ranges := make([]portRange, 0, len(reservations))
+	for _, rec := range reservations {
+		if rec.start < portStart || rec.end > portEnd || rec.end < rec.start {
+			logrus.Warnf("Persisted %s port range [%d, %d] outside allocator [%d, %d]; skipping reservation", rec.name, rec.start, rec.end, portStart, portEnd)
 			continue
 		}
-		ranges = append(ranges, portRange{rec.PortStart, rec.PortEnd})
+		ranges = append(ranges, portRange{rec.start, rec.end})
 	}
 	if len(ranges) == 0 {
 		return b, nil
@@ -114,7 +145,7 @@ func newPortAllocatorWithReservations(portStart, portEnd int32, records map[stri
 			return nil, fmt.Errorf("failed to release trailing gap [%d, %d] during reservation seeding: %w", cursor, portEnd, err)
 		}
 	}
-	logrus.Infof("Seeded port allocator with %d reserved replica port ranges from persisted records", len(ranges))
+	logrus.Infof("Seeded port allocator with %d reserved port ranges from persisted records", len(ranges))
 	return b, nil
 }
 
