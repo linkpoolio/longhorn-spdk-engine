@@ -25,8 +25,18 @@ func (c *SPDKClient) EngineCreate(name, volumeName, frontend string, specSize ui
 	if volumeName == "" {
 		return nil, fmt.Errorf("failed to start engine: missing required parameter volumeName")
 	}
-	if len(replicaAddressMap) == 0 && len(replicaTransportAddressMap) == 0 {
-		return nil, fmt.Errorf("failed to start engine: missing required parameter replicaAddressMap or replicaTransportAddressMap")
+	// replicaAddressMap is the authoritative replica set: Engine.Create
+	// iterates it and only consults replicaTransportAddressMap for the
+	// matching entries. A transport-map-only request would therefore create a
+	// zero-replica engine, and a transport-map key without an address-map
+	// entry would be silently ignored — reject both up front.
+	if len(replicaAddressMap) == 0 {
+		return nil, fmt.Errorf("failed to start engine: missing required parameter replicaAddressMap")
+	}
+	for replicaName := range replicaTransportAddressMap {
+		if _, ok := replicaAddressMap[replicaName]; !ok {
+			return nil, fmt.Errorf("failed to start engine: replica %s is present in replicaTransportAddressMap but missing from replicaAddressMap", replicaName)
+		}
 	}
 
 	client := c.getSPDKServiceClient()
