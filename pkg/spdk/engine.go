@@ -3693,7 +3693,14 @@ func validateAndGetSingleNvmeInfo(replicaName string, bdev *spdktypes.BdevInfo) 
 }
 
 func validateNvmeTransport(replicaName, bdevName string, nvmeInfo spdktypes.NvmeNamespaceInfo) error {
-	if !strings.EqualFold(string(nvmeInfo.Trid.Trtype), string(spdktypes.NvmeTransportTypeTCP)) {
+	// A remote replica base bdev may be attached over either NVMe-oF fabric
+	// transport: TCP (compute-node engines, or the port+1 TCP fallback) or RDMA
+	// (storage/RDMA-node engines dialing the replica's RDMA primary). Both are
+	// valid. Restricting this to TCP wrongly faulted every replica on an
+	// RDMA-transport engine, leaving the engine with no RW replica and erroring
+	// the volume. Only non-fabric (e.g. PCIe) or unknown transports are rejected.
+	if !strings.EqualFold(string(nvmeInfo.Trid.Trtype), string(spdktypes.NvmeTransportTypeTCP)) &&
+		!strings.EqualFold(string(nvmeInfo.Trid.Trtype), string(spdktypes.NvmeTransportTypeRDMA)) {
 		return fmt.Errorf(
 			"found invalid transport type %s in a remote NVMe base bdev %s during replica %s mode validation",
 			nvmeInfo.Trid.Trtype, bdevName, replicaName,
