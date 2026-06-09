@@ -301,13 +301,30 @@ func ExtractBackingImageAndDiskUUID(lvolName string) (string, string, error) {
 	return backingImageName, diskUUID, nil
 }
 
-func connectNVMfBdevWithTransport(spdkClient *spdkclient.Client, controllerName, address string, transport NvmfTransportType, ctrlrLossTimeout, fastIOFailTimeoutSec int, maxRetries int, retryInterval time.Duration) (bdevName string, err error) {
-	return connectNVMfBdevWithReconnect(spdkClient, controllerName, address, transport, ctrlrLossTimeout, replicaReconnectDelaySec, fastIOFailTimeoutSec, maxRetries, retryInterval)
+// connectNVMfBdevWithTransport attaches the remote lvol over the given
+// transport and returns the bdev name plus the address/transport actually
+// dialed. They differ from the inputs only when the legacy TCP fallback at
+// primary port+1 was attempted (see shouldAttemptLegacyTCPFallback); callers
+// must record the returned values (EngineReplicaStatus.DialedAddress /
+// .Transport) so dial-address validation compares against what was attached.
+func connectNVMfBdevWithTransport(spdkClient *spdkclient.Client, controllerName, address string, transport NvmfTransportType, ctrlrLossTimeout, fastIOFailTimeoutSec int, maxRetries int, retryInterval time.Duration, allowLegacyTCPFallback bool) (bdevName, dialedAddress string, dialedTransport NvmfTransportType, err error) {
+	return connectNVMfBdevWithReconnect(spdkClient, controllerName, address, transport, ctrlrLossTimeout, replicaReconnectDelaySec, fastIOFailTimeoutSec, maxRetries, retryInterval, allowLegacyTCPFallback)
 }
 
-func connectNVMfBdevWithReconnect(spdkClient *spdkclient.Client, controllerName, address string, transport NvmfTransportType, ctrlrLossTimeout, reconnectDelay, fastIOFailTimeoutSec int, maxRetries int, retryInterval time.Duration) (bdevName string, err error) {
+// shouldAttemptLegacyTCPFallback reports whether a failed primary attach may
+// retry the replica's conventional TCP fallback listener at primary port+1.
+// Only legacy-convention RDMA dials qualify:
+//   - addresses derived from the explicit transport map must not fall back —
+//     the map is the source of truth and tcp_address+1 has no defined listener;
+//   - a legacy-convention TCP dial already targets the fallback listener at
+//     primary+1, so another +1 would point at an arbitrary port.
+func shouldAttemptLegacyTCPFallback(legacyConvention bool, transport NvmfTransportType) bool {
+	return legacyConvention && transport.IsRDMA()
+}
+
+func connectNVMfBdevWithReconnect(spdkClient *spdkclient.Client, controllerName, address string, transport NvmfTransportType, ctrlrLossTimeout, reconnectDelay, fastIOFailTimeoutSec int, maxRetries int, retryInterval time.Duration, allowLegacyTCPFallback bool) (bdevName, dialedAddress string, dialedTransport NvmfTransportType, err error) {
 	if controllerName == "" || address == "" {
-		return "", fmt.Errorf("controllerName or address is empty")
+		return "", "", "", fmt.Errorf("controllerName or address is empty")
 	}
 
 	defer func() {
@@ -320,13 +337,16 @@ func connectNVMfBdevWithReconnect(spdkClient *spdkclient.Client, controllerName,
 
 	ip, port, err := net.SplitHostPort(address)
 	if err != nil {
-		return "", err
+		return "", "", "", err
 	}
 
 	// Blindly detach the controller in case of the previous replica connection is not cleaned up correctly
 	if _, err := spdkClient.BdevNvmeDetachController(controllerName); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
-		return "", err
+		return "", "", "", err
 	}
+
+	dialedAddress = address
+	dialedTransport = transport
 
 	nvmeBdevNameList := []string{}
 	spdkTransport := transport.ToSPDKTransportType()
@@ -360,28 +380,34 @@ func connectNVMfBdevWithReconnect(spdkClient *spdkclient.Client, controllerName,
 	)
 
 	if err != nil {
-		nvmeBdevNameList, err = attemptTCPFallback(spdkClient, controllerName, ip, port, ctrlrLossTimeout, reconnectDelay, fastIOFailTimeoutSec, transport, err)
-		if err != nil {
-			return "", fmt.Errorf("attach NVMe controller failed after %d attempts: %w", maxRetries, err)
+		if !shouldAttemptLegacyTCPFallback(allowLegacyTCPFallback, transport) {
+			return "", "", "", fmt.Errorf("attach NVMe controller failed after %d attempts: %w", maxRetries, err)
 		}
+		var fallbackAddress string
+		nvmeBdevNameList, fallbackAddress, err = attemptTCPFallback(spdkClient, controllerName, ip, port, ctrlrLossTimeout, reconnectDelay, fastIOFailTimeoutSec, transport, err)
+		if err != nil {
+			return "", "", "", fmt.Errorf("attach NVMe controller failed after %d attempts: %w", maxRetries, err)
+		}
+		dialedAddress = fallbackAddress
+		dialedTransport = NvmfTransportTCP
 	}
 
 	if len(nvmeBdevNameList) != 1 {
-		return "", fmt.Errorf("got zero or multiple results when attaching lvol %s with address %s as a NVMe bdev: %+v", controllerName, address, nvmeBdevNameList)
+		return "", "", "", fmt.Errorf("got zero or multiple results when attaching lvol %s with address %s as a NVMe bdev: %+v", controllerName, address, nvmeBdevNameList)
 	}
 
-	return nvmeBdevNameList[0], nil
+	return nvmeBdevNameList[0], dialedAddress, dialedTransport, nil
 }
 
-func attemptTCPFallback(spdkClient *spdkclient.Client, controllerName, ip, port string, ctrlrLossTimeout, reconnectDelay, fastIOFailTimeoutSec int, originalTransport NvmfTransportType, primaryErr error) ([]string, error) {
+func attemptTCPFallback(spdkClient *spdkclient.Client, controllerName, ip, port string, ctrlrLossTimeout, reconnectDelay, fastIOFailTimeoutSec int, originalTransport NvmfTransportType, primaryErr error) ([]string, string, error) {
 	primaryPort, parseErr := strconv.Atoi(port)
 	if parseErr != nil {
-		return nil, primaryErr
+		return nil, "", primaryErr
 	}
 	fallbackPort := strconv.Itoa(primaryPort + 1)
 
 	if _, detachErr := spdkClient.BdevNvmeDetachController(controllerName); detachErr != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(detachErr) {
-		return nil, primaryErr
+		return nil, "", primaryErr
 	}
 
 	logrus.WithError(primaryErr).Warnf(
@@ -402,22 +428,7 @@ func attemptTCPFallback(spdkClient *spdkclient.Client, controllerName, ip, port 
 		replicaMultipath,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("primary attach failed (%v) and TCP fallback to %s:%s also failed: %w", primaryErr, ip, fallbackPort, err)
+		return nil, "", fmt.Errorf("primary attach failed (%v) and TCP fallback to %s:%s also failed: %w", primaryErr, ip, fallbackPort, err)
 	}
-	return list, nil
-}
-
-func isRPCConnectionTimedOut(err error) bool {
-	if err == nil {
-		return false
-	}
-	jsonRPCError, ok := err.(jsonrpc.JSONClientError)
-	if !ok {
-		return false
-	}
-	responseError, ok := jsonRPCError.ErrorDetail.(*jsonrpc.ResponseError)
-	if !ok {
-		return false
-	}
-	return responseError.Code == -110
+	return list, net.JoinHostPort(ip, fallbackPort), nil
 }
