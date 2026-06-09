@@ -3,6 +3,7 @@ package client
 import (
 	"net"
 	"path/filepath"
+	"strings"
 
 	"github.com/sirupsen/logrus"
 
@@ -19,7 +20,9 @@ func (c *Client) AddDevice(devicePath, name string, clusterSize uint32) (bdevAio
 		name = filepath.Base(devicePath)
 	}
 
-	if _, err := c.BdevAioCreate(devicePath, name, 4096, false); err != nil {
+	// nil nowait keeps SPDK's built-in default, matching the previous wire
+	// behavior (the old `false` was dropped by omitempty and never sent).
+	if _, err := c.BdevAioCreate(devicePath, name, 4096, nil); err != nil {
 		return "", "", "", err
 	}
 
@@ -84,6 +87,12 @@ func (c *Client) StartExposeBdev(nqn, bdevName, nguid, ip, port string) error {
 	return c.StartExposeBdevWithTransport(nqn, bdevName, nguid, ip, port, spdktypes.NvmeTransportTypeTCP)
 }
 
+// StartExposeBdevWithTransport exposes a bdev on the given transport ("tcp"
+// or "rdma"). Selecting RDMA requires the SPDK target process to have been
+// started with `--rdma` or equivalent transport support; the call will fail
+// if nvmf_create_transport rejects the type.
+//
+// Empty transport defaults to TCP for backward compat.
 func (c *Client) StartExposeBdevWithTransport(nqn, bdevName, nguid, ip, port string, transport spdktypes.NvmeTransportType) error {
 	if transport == "" {
 		transport = spdktypes.NvmeTransportTypeTCP
@@ -121,13 +130,23 @@ func (c *Client) EnsureNvmfTransport(transport spdktypes.NvmeTransportType) erro
 	return c.ensureNvmfTransport(transport)
 }
 
+// transportTypesEqual reports whether two NVMe-oF transport types refer to
+// the same transport. SPDK reports trtype uppercase ("TCP", "RDMA") in
+// nvmf_get_transports responses while this package's constants are lowercase
+// ("tcp", "rdma"), so the comparison must be case-insensitive.
+func transportTypesEqual(a, b spdktypes.NvmeTransportType) bool {
+	return strings.EqualFold(string(a), string(b))
+}
+
+// ensureNvmfTransport creates the requested NVMf transport in SPDK if it is
+// not already present. "Already exists" errors are swallowed (idempotent).
 func (c *Client) ensureNvmfTransport(transport spdktypes.NvmeTransportType) error {
 	existing, err := c.NvmfGetTransports("", "")
 	if err != nil {
 		return err
 	}
 	for _, t := range existing {
-		if t.Trtype == transport {
+		if transportTypesEqual(t.Trtype, transport) {
 			return nil
 		}
 	}
@@ -148,6 +167,11 @@ func (c *Client) StartExposeBdevWithANAState(nqn, bdevName, nguid, nsUUID, ip, p
 	return c.StartExposeBdevWithANAStateAndTransport(nqn, bdevName, nguid, nsUUID, ip, port, spdktypes.NvmeTransportTypeTCP, anaState, minCntlid, maxCntlid)
 }
 
+// StartExposeBdevWithANAStateAndTransport is the transport-aware variant of
+// StartExposeBdevWithANAState. See that function for a description of the
+// nsUUID / cntlid parameters. RDMA requires the SPDK target process to have
+// transport support compiled in and configured. An empty transport defaults
+// to TCP.
 func (c *Client) StartExposeBdevWithANAStateAndTransport(nqn, bdevName, nguid, nsUUID, ip, port string, transport spdktypes.NvmeTransportType, anaState spdktypes.NvmfSubsystemListenerAnaState, minCntlid, maxCntlid uint16) error {
 	if transport == "" {
 		transport = spdktypes.NvmeTransportTypeTCP

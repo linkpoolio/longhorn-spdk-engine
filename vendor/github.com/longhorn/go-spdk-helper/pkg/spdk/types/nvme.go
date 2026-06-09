@@ -129,7 +129,10 @@ type BdevNvmeSetOptionsRequest struct {
 	// TransportTos sets the IPv4 ToS / IPv6 traffic class byte on outbound
 	// NVMe-oF connections. For RoCEv2 with PFC, set to 26 (DSCP AF31, IP
 	// precedence 3) so the NIC tags these packets into the lossless traffic
-	// class. -1 = use SPDK default (no override). Range -1..255.
+	// class. 0 = use SPDK default (the field is omitted from the wire via
+	// omitempty). Valid range 0..255: SPDK decodes transport_tos as a uint8,
+	// so any other value (including -1) makes the whole bdev_nvme_set_options
+	// RPC fail. Note SPDK applies transport_tos to the RDMA transport only.
 	TransportTos int32 `json:"transport_tos,omitempty"`
 }
 

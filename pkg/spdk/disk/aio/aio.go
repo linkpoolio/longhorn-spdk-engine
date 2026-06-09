@@ -34,8 +34,10 @@ func (d *DiskDriverAio) DiskCreate(spdkClient *spdkclient.Client, diskName, disk
 	// NB: longhorn-spdk (0fdfe357b, "bdev_aio: disable RWF_NOWAIT") undefs
 	// RWF_NOWAIT at the top of bdev_aio.c to avoid an EAGAIN infinite loop
 	// on Linux loop devices. Passing nowait=true makes bdev_aio_open fail
-	// there, so we keep it false.
-	return spdkClient.BdevAioCreate(diskPath, diskName, blockSize, false)
+	// there, so the param is left unset (nil): the wire request omits nowait
+	// and the pinned SPDK fork applies its default, which is what production
+	// has always run (the previous bool false was never serialized).
+	return spdkClient.BdevAioCreate(diskPath, diskName, blockSize, nil)
 }
 
 func (d *DiskDriverAio) DiskDelete(spdkClient *spdkclient.Client, diskName, diskPath string) (deleted bool, err error) {

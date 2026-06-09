@@ -41,14 +41,18 @@ func (c *Client) BdevGetBdevs(name string, timeout uint64) (bdevInfoList []spdkt
 	return bdevInfoList, json.Unmarshal(cmdOutput, &bdevInfoList)
 }
 
-// BdevAioCreate constructs Linux AIO bdev. nowait sets RWF_NOWAIT on iocb
+// BdevAioCreate constructs Linux AIO bdev. nowait controls RWF_NOWAIT on iocb
 // read/write submissions (not on fallocate/UNMAP, which uses a separate
-// synchronous path). Requires the backing filename to be a block device;
-// the SPDK side fails bdev create if passed on a regular file. SPDK v26.01
-// flipped the default from on to off (commit 3a396cb) to dodge a kernel
-// bug where io_getevents could return -EAGAIN infinitely on some kernels;
-// upstream Longhorn v1.11.x pins SPDK v25.09 where it is still default-on.
-func (c *Client) BdevAioCreate(filePath, name string, blockSize uint64, nowait bool) (bdevName string, err error) {
+// synchronous path). It is tri-state: nil leaves the field off the wire so
+// SPDK applies its built-in default, while a non-nil pointer sends true or
+// false explicitly. Enabling nowait requires the backing filename to be a
+// block device; the SPDK side fails bdev create if passed on a regular file.
+// SPDK v26.01 flipped the default from on to off (commit 3a396cb) to dodge a
+// kernel bug where io_getevents could return -EAGAIN infinitely on some
+// kernels; upstream Longhorn v1.11.x pins SPDK v25.09 where it is still
+// default-on — so callers that need NOWAIT disabled there must pass an
+// explicit false pointer.
+func (c *Client) BdevAioCreate(filePath, name string, blockSize uint64, nowait *bool) (bdevName string, err error) {
 	req := spdktypes.BdevAioCreateRequest{
 		Name:      name,
 		Filename:  filePath,
@@ -1216,7 +1220,12 @@ func (c *Client) NvmfCreateTransportWithOpts(req spdktypes.NvmfCreateTransportRe
 //  3. caller sends framework_start_init — spdk_tgt initialises subsystems
 //     with the tuned opts
 //
-// Without --wait-for-rpc this RPC is a no-op (subsystems are already up).
+// SPDK registers framework_start_init with the STARTUP state mask only, so
+// calling it on an already-initialized target (e.g. one started without
+// --wait-for-rpc, or a second invocation) returns a JSON-RPC error of the
+// "Method may only be called before framework is initialized" class rather
+// than succeeding as a no-op. Callers that need idempotency must tolerate
+// that error themselves (the longhorn-spdk-engine caller already does).
 func (c *Client) FrameworkStartInit() (result bool, err error) {
 	cmdOutput, err := c.jsonCli.SendCommand("framework_start_init", nil)
 	if err != nil {
@@ -1245,7 +1254,11 @@ func (c *Client) FrameworkWaitInit() (result bool, err error) {
 // enough once nvmf transport opts are tuned — a single nvmf transport with
 // num_shared_buffers=4095 + buf_cache_size=64 per poll group exceeds the
 // large pool and accel fails to create its channel with -ENOMEM.
-func (c *Client) IobufSetOptions(smallPoolCount, largePoolCount uint64, smallBufsizeKB, largeBufsizeKB uint32) (result bool, err error) {
+//
+// smallBufsize and largeBufsize are in BYTES, passed through verbatim to
+// SPDK's small_bufsize/large_bufsize. Zero values are omitted from the wire
+// so SPDK keeps its built-in defaults.
+func (c *Client) IobufSetOptions(smallPoolCount, largePoolCount uint64, smallBufsize, largeBufsize uint32) (result bool, err error) {
 	req := map[string]interface{}{}
 	if smallPoolCount > 0 {
 		req["small_pool_count"] = smallPoolCount
@@ -1253,11 +1266,11 @@ func (c *Client) IobufSetOptions(smallPoolCount, largePoolCount uint64, smallBuf
 	if largePoolCount > 0 {
 		req["large_pool_count"] = largePoolCount
 	}
-	if smallBufsizeKB > 0 {
-		req["small_bufsize"] = smallBufsizeKB * 1024
+	if smallBufsize > 0 {
+		req["small_bufsize"] = smallBufsize
 	}
-	if largeBufsizeKB > 0 {
-		req["large_bufsize"] = largeBufsizeKB * 1024
+	if largeBufsize > 0 {
+		req["large_bufsize"] = largeBufsize
 	}
 	cmdOutput, err := c.jsonCli.SendCommand("iobuf_set_options", req)
 	if err != nil {
