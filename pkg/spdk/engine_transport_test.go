@@ -5,6 +5,7 @@ import (
 
 	. "gopkg.in/check.v1"
 
+	spdktypes "github.com/longhorn/go-spdk-helper/pkg/spdk/types"
 	"github.com/longhorn/types/pkg/generated/spdkrpc"
 )
 
@@ -66,6 +67,32 @@ func (s *TestSuite) TestEnginePickReplicaAddress(c *C) {
 		c.Check(addr, Equals, tc.wantAddr, Commentf("case %q: address", tc.name))
 		c.Check(trans, Equals, tc.wantTrans, Commentf("case %q: transport", tc.name))
 	}
+}
+
+// A remote replica base bdev can be attached over either NVMe-oF fabric
+// transport: TCP (compute-node engines / the port+1 fallback) or RDMA
+// (storage/RDMA-node engines dialing the replica's RDMA primary). Both must
+// pass validation; only non-fabric (PCIe) or unknown transports are rejected.
+// Restricting this to TCP faulted every replica on an RDMA-transport engine,
+// erroring the volume on storage nodes.
+func (s *TestSuite) TestValidateNvmeTransport(c *C) {
+	fmt.Println("Testing validateNvmeTransport: TCP and RDMA both valid, PCIe rejected")
+
+	info := func(tr spdktypes.NvmeTransportType, fam spdktypes.NvmeAddressFamily) spdktypes.NvmeNamespaceInfo {
+		return spdktypes.NvmeNamespaceInfo{Trid: spdktypes.NvmeTransportID{Trtype: tr, Adrfam: fam}}
+	}
+
+	// Valid fabric transports.
+	c.Check(validateNvmeTransport("r-1", "r-1n1", info(spdktypes.NvmeTransportTypeTCP, spdktypes.NvmeAddressFamilyIPv4)), IsNil)
+	c.Check(validateNvmeTransport("r-1", "r-1n1", info(spdktypes.NvmeTransportTypeRDMA, spdktypes.NvmeAddressFamilyIPv4)), IsNil)
+	c.Check(validateNvmeTransport("r-1", "r-1n1", info(spdktypes.NvmeTransportTypeRDMA, spdktypes.NvmeAddressFamilyIPv6)), IsNil)
+	// Case-insensitive (SPDK may report upper-case).
+	c.Check(validateNvmeTransport("r-1", "r-1n1", info(spdktypes.NvmeTransportType("RDMA"), spdktypes.NvmeAddressFamilyIPv4)), IsNil)
+
+	// Non-fabric transport is rejected.
+	c.Check(validateNvmeTransport("r-1", "r-1n1", info(spdktypes.NvmeTransportTypePCIe, spdktypes.NvmeAddressFamilyIPv4)), NotNil)
+	// Valid transport but invalid address family is still rejected.
+	c.Check(validateNvmeTransport("r-1", "r-1n1", info(spdktypes.NvmeTransportTypeRDMA, spdktypes.NvmeAddressFamilyIB)), NotNil)
 }
 
 func (s *TestSuite) TestEngineLegacyTransportFallback(c *C) {
