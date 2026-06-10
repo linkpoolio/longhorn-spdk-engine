@@ -505,15 +505,15 @@ func (c *SPDKClient) ReplicaRebuildingSrcShallowCopyCheck(srcReplicaName, dstRep
 // It creates a new head lvol, exposes it as needed, and returns the destination head lvol address.
 // The external snapshot address is a local alias when source and destination share the same host,
 // otherwise it is the exported NVMf address of the source snapshot lvol.
-func (c *SPDKClient) ReplicaRebuildingDstStart(replicaName, srcReplicaName, srcReplicaAddress, externalSnapshotName, externalSnapshotAddress string, rebuildingSnapshotList []*api.Lvol) (dstHeadLvolAddress string, err error) {
+func (c *SPDKClient) ReplicaRebuildingDstStart(replicaName, srcReplicaName, srcReplicaAddress, externalSnapshotName, externalSnapshotAddress string, rebuildingSnapshotList []*api.Lvol) (dstHeadLvolAddress string, dstHeadLvolTransportAddresses *spdkrpc.ReplicaTransportAddresses, err error) {
 	if replicaName == "" {
-		return "", fmt.Errorf("failed to start replica rebuilding dst: missing required parameter replica name")
+		return "", nil, fmt.Errorf("failed to start replica rebuilding dst: missing required parameter replica name")
 	}
 	if srcReplicaName == "" || srcReplicaAddress == "" {
-		return "", fmt.Errorf("failed to start replica rebuilding dst: missing required parameter src replica name or address")
+		return "", nil, fmt.Errorf("failed to start replica rebuilding dst: missing required parameter src replica name or address")
 	}
 	if externalSnapshotName == "" || externalSnapshotAddress == "" {
-		return "", fmt.Errorf("failed to start replica rebuilding dst: missing required parameter external snapshot name or address")
+		return "", nil, fmt.Errorf("failed to start replica rebuilding dst: missing required parameter external snapshot name or address")
 	}
 
 	client := c.getSPDKServiceClient()
@@ -533,9 +533,9 @@ func (c *SPDKClient) ReplicaRebuildingDstStart(replicaName, srcReplicaName, srcR
 		RebuildingSnapshotList:  protoRebuildingSnapshotList,
 	})
 	if err != nil {
-		return "", errors.Wrapf(err, "failed to start replica rebuilding dst %s", replicaName)
+		return "", nil, errors.Wrapf(err, "failed to start replica rebuilding dst %s", replicaName)
 	}
-	return resp.DstHeadLvolAddress, nil
+	return resp.DstHeadLvolAddress, resp.DstHeadLvolTransportAddresses, nil
 }
 
 // ReplicaRebuildingDstFinish finalizes rebuild state on the destination replica.
