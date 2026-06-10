@@ -150,6 +150,24 @@ type Engine struct {
 
 	NvmeTcpTarget *NvmeTcpTarget
 
+	// deltaBitmapEnabled toggles SPDK raid1's per-base-bdev dirty-region
+	// tracking. When true, a base bdev that disconnects retains its bitmap
+	// of dirty regions and on reconnect only those regions need re-copying
+	// instead of a full resync. Set at engine construction; callers that
+	// re-create the raid (snapshot revert, backup restore, reconstruct)
+	// must pass the same value to keep the flag stable across a volume's
+	// lifetime. Default true; can be forced off via
+	// LONGHORN_V2_RAID_DELTA_BITMAP=0 if the base bdev layer doesn't report
+	// optimal_io_boundary.
+	deltaBitmapEnabled bool
+
+	// ReplicaDirtyBitmaps maps replica name to the last-captured dirty
+	// bitmap from the moment the replica transitioned to ERR. Used on
+	// reconnect to drive incremental (shallow-copy-only-the-dirty-regions)
+	// rebuild instead of full resync. Entries are cleared once the replica
+	// returns to RW.
+	ReplicaDirtyBitmaps map[string]*ReplicaDirtyBitmap
+
 	State    types.InstanceState
 	ErrorMsg string
 
@@ -264,6 +282,8 @@ func NewEngine(engineName, volumeName, frontend string, specSize uint64, replica
 
 		ReplicaTransport: replicaTransport,
 
+		deltaBitmapEnabled: defaultRaidDeltaBitmapEnabled(),
+
 		// TODO: support user-defined values
 		ctrlrLossTimeout:     replicaCtrlrLossTimeoutSec,
 		fastIOFailTimeoutSec: replicaFastIOFailTimeoutSec,
@@ -354,7 +374,7 @@ func (e *Engine) Create(spdkClient *spdkclient.Client, replicaAddressMap map[str
 	e.checkAndUpdateInfoFromReplicasNoLock()
 
 	e.log.Infof("Connected all available replicas %+v, then launching raid during engine creation", e.ReplicaStatusMap)
-	if _, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, "", false); err != nil {
+	if _, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, "", e.deltaBitmapEnabled); err != nil {
 		return nil, err
 	}
 
@@ -1988,7 +2008,7 @@ func (e *Engine) snapshotOperationWithoutLock(spdkClient *spdkclient.Client, rep
 
 		engineErr = retrygo.Do(
 			func() error {
-				_, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, "", false)
+				_, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, "", e.deltaBitmapEnabled)
 				return err
 			},
 			retrygo.Attempts(uint(maxRetries)),
@@ -3127,7 +3147,7 @@ func (e *Engine) reconstructRaidBdev(spdkClient *spdkclient.Client, bdevRaidUUID
 		return fmt.Errorf("no healthy replica bdevs available for RAID creation")
 	}
 
-	if _, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, bdevRaidUUID, false); err != nil {
+	if _, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, bdevRaidUUID, e.deltaBitmapEnabled); err != nil {
 		return err
 	}
 
@@ -3256,7 +3276,11 @@ func (e *Engine) ValidateAndUpdate(spdkClient *spdkclient.Client) (err error) {
 		return err
 	}
 
+	previousModes := e.snapshotReplicaModesNoLock()
 	containValidReplica := e.validateReplicaStatusMapNoLock(bdevMap, &updateRequired)
+	// Capture the dirty bitmap of any replica that just transitioned to ERR,
+	// so a later reconnect can do an incremental (dirty-region-only) rebuild.
+	e.captureBitmapsForFaultedReplicasNoLock(spdkClient, previousModes)
 
 	e.log.UpdateLoggerWithWarnOnFailure(logrus.Fields{
 		"replicaStatusMap": e.ReplicaStatusMap,
