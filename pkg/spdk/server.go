@@ -90,6 +90,20 @@ type Server struct {
 	nodeTransport NvmfTransportType
 
 	newServiceClient ServiceClientFactory
+
+	// engineFrontendDesyncCounts tracks consecutive Error observations per
+	// engine frontend in the reconciler. A heal only fires once the count
+	// reaches EngineFrontendHealConsecutiveFailures, filtering out transient
+	// kernel-side recovery flaps from genuine stuck desyncs. Guarded by the
+	// Server's own RWMutex.
+	engineFrontendDesyncCounts map[string]int
+
+	// replicaDesyncCounts is the equivalent counter for the Replica
+	// reconciler. The replica host surface is simpler (pure SPDK target),
+	// but the counter still guards against firing on transient SPDK probe
+	// errors that resolve on the next tick. Same threshold and reset
+	// semantics as engineFrontendDesyncCounts.
+	replicaDesyncCounts map[string]int
 }
 
 func NewServer(ctx context.Context, portStart, portEnd int32, newServiceClient ServiceClientFactory) (*Server, error) {
@@ -172,6 +186,9 @@ func NewServer(ctx context.Context, portStart, portEnd int32, newServiceClient S
 		metadataDir:      types.MetadataDir,
 		nodeTransport:    nodeTransport,
 		newServiceClient: newServiceClient,
+
+		engineFrontendDesyncCounts: map[string]int{},
+		replicaDesyncCounts:        map[string]int{},
 	}
 	s.hotplugActive.Store(true)
 
@@ -203,8 +220,29 @@ func NewServer(ctx context.Context, portStart, portEnd int32, newServiceClient S
 		s.recoverEngineFrontends(ctx)
 	}()
 
-	// TODO: There is no need to maintain the replica map in cache when we can use one SPDK JSON API call to fetch the Lvol tree/chain info
+	// monitoring() runs verify() every 3s to sync the in-memory replicaMap
+	// with SPDK + drive engine metrics + sync verified objects. Read-path
+	// gRPC handlers (ReplicaGet/List) no longer depend on the cache —
+	// they call BuildReplicaFromRecord which derives state directly from
+	// SPDK + the persisted record (one BdevGetBdevs call). The map is
+	// retained as a per-replica mutex holder for write-side serialisation
+	// in mutating handlers.
 	go s.monitoring()
+
+	// EngineFrontend self-heal reconciler. Every 30s, observes each
+	// persisted EngineFrontend's host-side state, and when the host has
+	// desynced from the record's intent (partial dm/nvme/SPDK state) tears
+	// down + recreates from the record, replacing manual detach/attach
+	// recovery. On by default; LONGHORN_V2_RECONCILE_ENGINE_FRONTENDS=0 is
+	// an emergency kill switch.
+	go s.reconcileEngineFrontends()
+
+	// Replica self-heal reconciler — same pattern, smaller scope. Replicas
+	// have a simpler host surface (pure SPDK target — no kernel dm/nvme), so
+	// the reconciler only handles the listener-missing case: head lvol
+	// present on disk but NVMe-oF subsystem / listener gone, where it re-runs
+	// StartExposeBdev from the persisted record.
+	go s.reconcileReplicas()
 
 	return s, nil
 }
