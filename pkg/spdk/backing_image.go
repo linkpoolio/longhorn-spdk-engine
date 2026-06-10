@@ -344,7 +344,7 @@ func (bi *BackingImage) BackingImageExpose(spdkClient *spdkclient.Client, superi
 		return "", errors.Wrapf(err, "failed to create executor")
 	}
 
-	subsystemNQN, controllerName, err := exposeSnapshotLvolBdev(spdkClient, bi.LvsName, backingImageSnapLvolName, podIP, port, executor)
+	subsystemNQN, controllerName, err := exposeSnapshotLvolBdev(spdkClient, bi.LvsName, backingImageSnapLvolName, podIP, port, DefaultNvmfTransport, executor)
 	if err != nil {
 		bi.log.WithError(err).Errorf("Failed to expose lvol bdev")
 		return "", err
@@ -541,7 +541,7 @@ func (bi *BackingImage) prepareBackingImageSnapshot(spdkClient *spdkclient.Clien
 	if err != nil {
 		return errors.Wrapf(err, "failed to create executor")
 	}
-	subsystemNQN, controllerName, err := backingImageExposeSnapshotLvolBdev(spdkClient, bi.LvsName, backingImageTempHeadName, podIP, port, executor)
+	subsystemNQN, controllerName, err := backingImageExposeSnapshotLvolBdev(spdkClient, bi.LvsName, backingImageTempHeadName, podIP, port, DefaultNvmfTransport, executor)
 	if err != nil {
 		bi.log.WithError(err).Errorf("Failed to expose head lvol")
 		return err
