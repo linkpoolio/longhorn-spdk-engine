@@ -14,7 +14,8 @@ import (
 )
 
 // EngineCreate creates and starts an engine instance with the requested replicas.
-func (c *SPDKClient) EngineCreate(name, volumeName, frontend string, specSize uint64, replicaAddressMap map[string]string, portCount int32, salvageRequested bool, snapshotMaxCount int32) (*api.Engine, error) {
+// qosLimits is optional; nil (or all-zero fields) means unlimited.
+func (c *SPDKClient) EngineCreate(name, volumeName, frontend string, specSize uint64, replicaAddressMap map[string]string, portCount int32, salvageRequested bool, snapshotMaxCount int32, qosLimits *spdkrpc.QosLimits) (*api.Engine, error) {
 	if name == "" {
 		return nil, fmt.Errorf("failed to start engine: missing required parameter name")
 	}
@@ -38,6 +39,7 @@ func (c *SPDKClient) EngineCreate(name, volumeName, frontend string, specSize ui
 		PortCount:         portCount,
 		SalvageRequested:  salvageRequested,
 		SnapshotMaxCount:  snapshotMaxCount,
+		QosLimits:         qosLimits,
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to start engine")
@@ -489,4 +491,25 @@ func (c *SPDKClient) EngineRestoreStatus(engineName string) (*spdkrpc.RestoreSta
 	return client.EngineRestoreStatus(ctx, &spdkrpc.RestoreStatusRequest{
 		EngineName: engineName,
 	})
+}
+
+// EngineSetQosLimit applies new QoS limits to a running engine's raid bdev.
+// An all-zero qosLimits removes the cap (unlimited).
+func (c *SPDKClient) EngineSetQosLimit(name string, qosLimits *spdkrpc.QosLimits) error {
+	if name == "" {
+		return fmt.Errorf("failed to set engine QoS: missing required parameter name")
+	}
+	if qosLimits == nil {
+		return fmt.Errorf("failed to set engine QoS: missing required parameter qosLimits (use all-zero fields for unlimited)")
+	}
+
+	client := c.getSPDKServiceClient()
+	ctx, cancel := context.WithTimeout(context.Background(), GRPCServiceTimeout)
+	defer cancel()
+
+	_, err := client.EngineSetQosLimit(ctx, &spdkrpc.EngineSetQosLimitRequest{
+		Name:      name,
+		QosLimits: qosLimits,
+	})
+	return errors.Wrapf(err, "failed to set QoS on engine %v", name)
 }

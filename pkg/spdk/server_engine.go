@@ -40,6 +40,14 @@ func (s *Server) EngineCreate(ctx context.Context, req *spdkrpc.EngineCreateRequ
 	if e == nil {
 		s.engineMap[req.Name] = NewEngine(req.Name, req.VolumeName, req.Frontend, req.SpecSize, s.updateChs[types.InstanceTypeEngine], req.SnapshotMaxCount, s.newServiceClient)
 		e = s.engineMap[req.Name]
+		if req.QosLimits != nil {
+			e.QosLimits = QosLimits{
+				RwIOsPerSec: req.QosLimits.RwIosPerSec,
+				RwMBPerSec:  req.QosLimits.RwMbPerSec,
+				RMBPerSec:   req.QosLimits.RMbPerSec,
+				WMBPerSec:   req.QosLimits.WMbPerSec,
+			}
+		}
 	}
 
 	spdkClient := s.spdkClient
@@ -648,4 +656,36 @@ func (s *Server) EngineRestoreStatus(ctx context.Context, req *spdkrpc.RestoreSt
 		return nil, grpcstatus.Errorf(grpccodes.Internal, "%v", err)
 	}
 	return resp, nil
+}
+
+// EngineSetQosLimit applies new QoS limits to a running engine's raid bdev
+// at runtime. Used by longhorn-manager to push QoS changes onto attached
+// volumes without re-creating them.
+func (s *Server) EngineSetQosLimit(ctx context.Context, req *spdkrpc.EngineSetQosLimitRequest) (*emptypb.Empty, error) {
+	if req.Name == "" {
+		return nil, grpcstatus.Error(grpccodes.InvalidArgument, "engine name is required")
+	}
+	if req.QosLimits == nil {
+		return nil, grpcstatus.Error(grpccodes.InvalidArgument, "qos_limits is required (use all-zero fields for unlimited)")
+	}
+
+	s.RLock()
+	e := s.engineMap[req.Name]
+	spdkClient := s.spdkClient
+	s.RUnlock()
+
+	if e == nil {
+		return nil, grpcstatus.Errorf(grpccodes.NotFound, "cannot find engine %v", req.Name)
+	}
+
+	limits := QosLimits{
+		RwIOsPerSec: req.QosLimits.RwIosPerSec,
+		RwMBPerSec:  req.QosLimits.RwMbPerSec,
+		RMBPerSec:   req.QosLimits.RMbPerSec,
+		WMBPerSec:   req.QosLimits.WMbPerSec,
+	}
+	if err := e.SetQosLimit(spdkClient, limits); err != nil {
+		return nil, grpcstatus.Errorf(grpccodes.Internal, "failed to set QoS for engine %v: %v", req.Name, err)
+	}
+	return &emptypb.Empty{}, nil
 }
