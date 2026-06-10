@@ -117,6 +117,11 @@ type Replica struct {
 	// UpdateCh should not be protected by the replica lock
 	UpdateCh chan interface{}
 
+	// metadataDir, when non-empty, enables on-disk persistence of replica port
+	// state to <metadataDir>/replicas/<name>/replica.json, so a reconnect after
+	// an IM restart reuses the same ports instead of reallocating.
+	metadataDir string
+
 	log *safelog.SafeLogger
 
 	// TODO: Record error message
@@ -338,6 +343,10 @@ func (r *Replica) prepareIPAndPorts(portCount int32, superiorPortAllocator *comm
 	r.portAllocator = bitmap
 
 	r.log.Infof("Prepared IP %s and Ports [%d, %d] for replica", r.IP, r.PortStart, r.PortEnd)
+
+	if err := saveReplicaRecord(r.metadataDir, r); err != nil {
+		r.log.WithError(err).Warn("Failed to persist replica port record; reconnect-after-restart may reallocate ports")
+	}
 
 	return nil
 }
@@ -1319,6 +1328,8 @@ func (r *Replica) Delete(spdkClient *spdkclient.Client, cleanupRequired bool, su
 		updateRequired = true
 	}
 
+	r.finishDeleteRecord(cleanupRequired)
+
 	if !cleanupRequired {
 		return nil
 	}
@@ -1339,6 +1350,18 @@ func (r *Replica) Delete(spdkClient *spdkclient.Client, cleanupRequired bool, su
 	r.log.Info("Deleted replica with all possible lvols")
 
 	return nil
+}
+
+// finishDeleteRecord drops the persisted replica record when, and only when,
+// the delete is a real cleanup. A cleanly-stopped replica (cleanupRequired=
+// false) keeps its record so a later restart can restore its port state.
+func (r *Replica) finishDeleteRecord(cleanupRequired bool) {
+	if !cleanupRequired {
+		return
+	}
+	if err := removeReplicaRecord(r.metadataDir, r.Name); err != nil {
+		r.log.WithError(err).Warn("Failed to remove persisted replica record during cleanup delete")
+	}
 }
 
 func (r *Replica) Get() (pReplica *spdkrpc.Replica) {
@@ -4458,5 +4481,27 @@ func (r *Replica) addTCPFallbackListener(spdkClient *spdkclient.Client, nqn, ip 
 	); err != nil {
 		return errors.Wrapf(err, "failed to add TCP fallback listener on %s:%s for nqn %s", ip, fallbackPort, nqn)
 	}
+	return nil
+}
+
+// restoreFromRecord rehydrates the replica's IP/port state from a persisted
+// record after an IM restart, seeding the local rebuild/clone port allocator
+// with the same listener-port reservations prepareIPAndPorts applies on a
+// fresh create (PortStart+1 on TCP nodes, PortStart+2 on dual-listener RDMA
+// nodes).
+func (r *Replica) restoreFromRecord(rec *ReplicaRecord) error {
+	if rec == nil {
+		return nil
+	}
+	r.IP = rec.IP
+	r.PortStart = rec.PortStart
+	r.PortEnd = rec.PortEnd
+	bitmap, err := commonbitmap.NewBitmap(r.rebuildPortAllocatorStart(), r.PortEnd)
+	if err != nil {
+		r.PortStart, r.PortEnd = 0, 0
+		return err
+	}
+	r.portAllocator = bitmap
+	r.log.Infof("Restored replica port range [%d, %d] from persisted record", rec.PortStart, rec.PortEnd)
 	return nil
 }
