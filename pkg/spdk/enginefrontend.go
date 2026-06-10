@@ -1138,6 +1138,7 @@ func (ef *EngineFrontend) getProtoNvmeTCPPathsWithoutLock() []*spdkrpc.EngineFro
 			Nqn:        path.Nqn,
 			Nguid:      path.Nguid,
 			AnaState:   string(path.ANAState),
+			Transport:  string(path.Transport),
 		})
 	}
 

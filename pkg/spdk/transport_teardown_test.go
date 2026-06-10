@@ -228,3 +228,20 @@ func (s *TestSuite) TestTeardownRemoteRDMAPathIfNeededAggregatesErrors(c *C) {
 	c.Assert(strings.Contains(err.Error(), "qp teardown failed"), Equals, true)
 	c.Assert(strings.Contains(err.Error(), "listener removal failed"), Equals, true)
 }
+
+// The per-path transport must reach the proto report: the manager publishes it
+// on the EngineFrontend CRD status, and operators key on it to see whether a
+// frontend path is attached over TCP or RDMA.
+func (s *TestSuite) TestProtoNvmeTCPPathsCarryTransport(c *C) {
+	for _, rdma := range []bool{false, true} {
+		ef := newRDMAEngineFrontend(rdma)
+		paths := ef.getProtoNvmeTCPPathsWithoutLock()
+		c.Assert(paths, HasLen, 1)
+		want := string(NvmfTransportTCP)
+		if rdma {
+			want = string(NvmfTransportRDMA)
+		}
+		c.Check(paths[0].Transport, Equals, want)
+		c.Check(paths[0].AnaState, Equals, string(ef.NvmeTCPPathMap["10.0.0.1:2000"].ANAState))
+	}
+}
