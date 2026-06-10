@@ -126,6 +126,14 @@ type BdevNvmeSetOptionsRequest struct {
 	FastIOFailTimeoutSec int32 `json:"fast_io_fail_timeout_sec"`
 	TransportAckTimeout  int32 `json:"transport_ack_timeout"`
 	KeepAliveTimeoutMs   int32 `json:"keep_alive_timeout_ms"`
+	// TransportTos sets the IPv4 ToS / IPv6 traffic class byte on outbound
+	// NVMe-oF connections. For RoCEv2 with PFC, set to 26 (DSCP AF31, IP
+	// precedence 3) so the NIC tags these packets into the lossless traffic
+	// class. 0 = use SPDK default (the field is omitted from the wire via
+	// omitempty). Valid range 0..255: SPDK decodes transport_tos as a uint8,
+	// so any other value (including -1) makes the whole bdev_nvme_set_options
+	// RPC fail. Note SPDK applies transport_tos to the RDMA transport only.
+	TransportTos int32 `json:"transport_tos,omitempty"`
 }
 
 type BdevNvmeGetControllersRequest struct {

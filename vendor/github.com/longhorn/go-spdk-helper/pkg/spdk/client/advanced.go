@@ -3,6 +3,7 @@ package client
 import (
 	"net"
 	"path/filepath"
+	"strings"
 
 	"github.com/sirupsen/logrus"
 
@@ -19,7 +20,9 @@ func (c *Client) AddDevice(devicePath, name string, clusterSize uint32) (bdevAio
 		name = filepath.Base(devicePath)
 	}
 
-	if _, err := c.BdevAioCreate(devicePath, name, 4096); err != nil {
+	// nil nowait keeps SPDK's built-in default, matching the previous wire
+	// behavior (the old `false` was dropped by omitempty and never sent).
+	if _, err := c.BdevAioCreate(devicePath, name, 4096, nil); err != nil {
 		return "", "", "", err
 	}
 
@@ -77,21 +80,28 @@ func DetectAddressFamily(ip string) spdktypes.NvmeAddressFamily {
 	return spdktypes.NvmeAddressFamilyIPv4
 }
 
-// StartExposeBdev exposes the bdev with the given nqn, bdevName, nguid, ip, and port.
+// StartExposeBdev exposes the bdev with the given nqn, bdevName, nguid, ip,
+// and port over NVMe-oF TCP. For RDMA or mixed listeners use
+// StartExposeBdevWithTransport.
 func (c *Client) StartExposeBdev(nqn, bdevName, nguid, ip, port string) error {
-	ip = spdkutil.NormalizeNvmeAddr(ip)
+	return c.StartExposeBdevWithTransport(nqn, bdevName, nguid, ip, port, spdktypes.NvmeTransportTypeTCP)
+}
 
-	logrus.Infof("Exposing bdev with nqn %v, bdevName %v, nguid %v, ip %v, port %v", nqn, bdevName, nguid, ip, port)
-
-	nvmfTransportList, err := c.NvmfGetTransports("", "")
-	if err != nil {
-		return err
+// StartExposeBdevWithTransport exposes a bdev on the given transport ("tcp"
+// or "rdma"). Selecting RDMA requires the SPDK target process to have been
+// started with `--rdma` or equivalent transport support; the call will fail
+// if nvmf_create_transport rejects the type.
+//
+// Empty transport defaults to TCP for backward compat.
+func (c *Client) StartExposeBdevWithTransport(nqn, bdevName, nguid, ip, port string, transport spdktypes.NvmeTransportType) error {
+	if transport == "" {
+		transport = spdktypes.NvmeTransportTypeTCP
 	}
-	if nvmfTransportList != nil && len(nvmfTransportList) == 0 {
-		logrus.Infof("Creating transport with type %v", spdktypes.NvmeTransportTypeTCP)
-		if _, err := c.NvmfCreateTransport(spdktypes.NvmeTransportTypeTCP); err != nil && !jsonrpc.IsJSONRPCRespErrorTransportTypeAlreadyExists(err) {
-			return err
-		}
+	ip = spdkutil.NormalizeNvmeAddr(ip)
+	logrus.Infof("Exposing bdev with nqn %v, bdevName %v, nguid %v, ip %v, port %v, transport %v", nqn, bdevName, nguid, ip, port, transport)
+
+	if err := c.ensureNvmfTransport(transport); err != nil {
+		return err
 	}
 
 	logrus.Infof("Creating subsystem with nqn %v", nqn)
@@ -105,12 +115,45 @@ func (c *Client) StartExposeBdev(nqn, bdevName, nguid, ip, port string) error {
 	}
 
 	adrfam := DetectAddressFamily(ip)
-
-	logrus.Infof("Adding listener with transport address %v, transport service id %v, transport type %v, address family %v to subsystem with nqn %v", ip, port, spdktypes.NvmeTransportTypeTCP, adrfam, nqn)
-	if _, err := c.NvmfSubsystemAddListener(nqn, ip, port, spdktypes.NvmeTransportTypeTCP, adrfam); err != nil {
+	logrus.Infof("Adding listener with transport address %v, transport service id %v, transport type %v, address family %v to subsystem with nqn %v", ip, port, transport, adrfam, nqn)
+	if _, err := c.NvmfSubsystemAddListener(nqn, ip, port, transport, adrfam); err != nil {
 		return err
 	}
 
+	return nil
+}
+
+// EnsureNvmfTransport creates the given nvmf transport on the SPDK target if
+// it is not already registered. Safe to call repeatedly; returns nil both when
+// the transport was newly created and when it already existed.
+func (c *Client) EnsureNvmfTransport(transport spdktypes.NvmeTransportType) error {
+	return c.ensureNvmfTransport(transport)
+}
+
+// transportTypesEqual reports whether two NVMe-oF transport types refer to
+// the same transport. SPDK reports trtype uppercase ("TCP", "RDMA") in
+// nvmf_get_transports responses while this package's constants are lowercase
+// ("tcp", "rdma"), so the comparison must be case-insensitive.
+func transportTypesEqual(a, b spdktypes.NvmeTransportType) bool {
+	return strings.EqualFold(string(a), string(b))
+}
+
+// ensureNvmfTransport creates the requested NVMf transport in SPDK if it is
+// not already present. "Already exists" errors are swallowed (idempotent).
+func (c *Client) ensureNvmfTransport(transport spdktypes.NvmeTransportType) error {
+	existing, err := c.NvmfGetTransports("", "")
+	if err != nil {
+		return err
+	}
+	for _, t := range existing {
+		if transportTypesEqual(t.Trtype, transport) {
+			return nil
+		}
+	}
+	logrus.Infof("Creating NVMf transport with type %v", transport)
+	if _, err := c.NvmfCreateTransport(transport); err != nil && !jsonrpc.IsJSONRPCRespErrorTransportTypeAlreadyExists(err) {
+		return err
+	}
 	return nil
 }
 
@@ -121,20 +164,24 @@ func (c *Client) StartExposeBdev(nqn, bdevName, nguid, ip, port string) error {
 // a unique controller-ID range per engine to avoid "Duplicate cntlid" errors
 // when multiple targets share one subsystem NQN. Pass 0 for defaults.
 func (c *Client) StartExposeBdevWithANAState(nqn, bdevName, nguid, nsUUID, ip, port string, anaState spdktypes.NvmfSubsystemListenerAnaState, minCntlid, maxCntlid uint16) error {
-	ip = spdkutil.NormalizeNvmeAddr(ip)
+	return c.StartExposeBdevWithANAStateAndTransport(nqn, bdevName, nguid, nsUUID, ip, port, spdktypes.NvmeTransportTypeTCP, anaState, minCntlid, maxCntlid)
+}
 
-	logrus.Infof("Exposing bdev with nqn %v, bdevName %v, nguid %v, nsUUID %v, ip %v, port %v, anaState %v, minCntlid %v, maxCntlid %v",
-		nqn, bdevName, nguid, nsUUID, ip, port, anaState, minCntlid, maxCntlid)
-
-	nvmfTransportList, err := c.NvmfGetTransports("", "")
-	if err != nil {
-		return err
+// StartExposeBdevWithANAStateAndTransport is the transport-aware variant of
+// StartExposeBdevWithANAState. See that function for a description of the
+// nsUUID / cntlid parameters. RDMA requires the SPDK target process to have
+// transport support compiled in and configured. An empty transport defaults
+// to TCP.
+func (c *Client) StartExposeBdevWithANAStateAndTransport(nqn, bdevName, nguid, nsUUID, ip, port string, transport spdktypes.NvmeTransportType, anaState spdktypes.NvmfSubsystemListenerAnaState, minCntlid, maxCntlid uint16) error {
+	if transport == "" {
+		transport = spdktypes.NvmeTransportTypeTCP
 	}
-	if nvmfTransportList != nil && len(nvmfTransportList) == 0 {
-		logrus.Infof("Creating transport with type %v", spdktypes.NvmeTransportTypeTCP)
-		if _, err := c.NvmfCreateTransport(spdktypes.NvmeTransportTypeTCP); err != nil && !jsonrpc.IsJSONRPCRespErrorTransportTypeAlreadyExists(err) {
-			return err
-		}
+	ip = spdkutil.NormalizeNvmeAddr(ip)
+	logrus.Infof("Exposing bdev with nqn %v, bdevName %v, nguid %v, nsUUID %v, ip %v, port %v, transport %v, anaState %v, minCntlid %v, maxCntlid %v",
+		nqn, bdevName, nguid, nsUUID, ip, port, transport, anaState, minCntlid, maxCntlid)
+
+	if err := c.ensureNvmfTransport(transport); err != nil {
+		return err
 	}
 
 	logrus.Infof("Creating subsystem with nqn %v, minCntlid %v, maxCntlid %v", nqn, minCntlid, maxCntlid)
@@ -148,14 +195,13 @@ func (c *Client) StartExposeBdevWithANAState(nqn, bdevName, nguid, nsUUID, ip, p
 	}
 
 	adrfam := DetectAddressFamily(ip)
-
-	logrus.Infof("Adding listener with transport address %v, transport service id %v, transport type %v, address family %v to subsystem with nqn %v", ip, port, spdktypes.NvmeTransportTypeTCP, adrfam, nqn)
-	if _, err := c.NvmfSubsystemAddListener(nqn, ip, port, spdktypes.NvmeTransportTypeTCP, adrfam); err != nil {
+	logrus.Infof("Adding listener with transport address %v, transport service id %v, transport type %v, address family %v to subsystem with nqn %v", ip, port, transport, adrfam, nqn)
+	if _, err := c.NvmfSubsystemAddListener(nqn, ip, port, transport, adrfam); err != nil {
 		return err
 	}
 
 	logrus.Infof("Setting listener ANA state to %v for subsystem with nqn %v", anaState, nqn)
-	if _, err := c.NvmfSubsystemListenerSetANAState(nqn, ip, port, spdktypes.NvmeTransportTypeTCP,
+	if _, err := c.NvmfSubsystemListenerSetANAState(nqn, ip, port, transport,
 		adrfam, anaState, spdktypes.DefaultNvmfANAGroupID); err != nil {
 		return err
 	}

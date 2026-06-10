@@ -31,7 +31,9 @@ func (d *DiskDriverAio) DiskCreate(spdkClient *spdkclient.Client, diskName, disk
 		return "", errors.Wrap(err, "failed to validate disk creation")
 	}
 
-	return spdkClient.BdevAioCreate(diskPath, diskName, blockSize)
+	// nowait is left unset (nil): the wire request omits it and SPDK applies
+	// its default behavior.
+	return spdkClient.BdevAioCreate(diskPath, diskName, blockSize, nil)
 }
 
 func (d *DiskDriverAio) DiskDelete(spdkClient *spdkclient.Client, diskName, diskPath string) (deleted bool, err error) {

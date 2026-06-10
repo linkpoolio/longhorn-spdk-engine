@@ -92,6 +92,12 @@ type NVMeTCPInfo struct {
 	TransportServiceID string
 	ControllerName     string
 	NamespaceName      string
+
+	// Transport is the NVMe-oF transport for this initiator connection.
+	// Empty string means TCP (legacy behavior). Set to "rdma" to use
+	// NVMe-oF RDMA. The name NVMeTCPInfo is retained for backward
+	// compatibility with callers that predate RDMA support.
+	Transport string
 }
 
 type UblkInfo struct {
@@ -182,7 +188,17 @@ func (lock *initiatorLock) Unlock() {
 	lock.lock.Unlock()
 }
 
-// DiscoverNVMeTCPTarget discovers a target
+// transport returns the NVMe-oF transport configured on NVMeTCPInfo, falling
+// back to DefaultTransportType (TCP) when the info or the field is unset.
+func (i *Initiator) transport() string {
+	if i.NVMeTCPInfo != nil && i.NVMeTCPInfo.Transport != "" {
+		return i.NVMeTCPInfo.Transport
+	}
+	return DefaultTransportType
+}
+
+// DiscoverNVMeTCPTarget discovers a target over the transport configured on
+// NVMeTCPInfo (TCP when unset).
 func (i *Initiator) DiscoverNVMeTCPTarget(ip, port string) (string, error) {
 	if i.hostProc != "" {
 		lock, err := i.newLock("DiscoverNVMeTCPTarget")
@@ -192,10 +208,11 @@ func (i *Initiator) DiscoverNVMeTCPTarget(ip, port string) (string, error) {
 		defer lock.Unlock()
 	}
 
-	return DiscoverTarget(ip, port, i.executor)
+	return DiscoverTargetWithTransport(i.transport(), ip, port, i.executor)
 }
 
-// ConnectNVMeTCPTarget connects to a target
+// ConnectNVMeTCPTarget connects to a target over the transport configured on
+// NVMeTCPInfo (TCP when unset).
 func (i *Initiator) ConnectNVMeTCPTarget(ip, port, nqn string) (string, error) {
 	if i.hostProc != "" {
 		lock, err := i.newLock("ConnectNVMeTCPTarget")
@@ -205,7 +222,7 @@ func (i *Initiator) ConnectNVMeTCPTarget(ip, port, nqn string) (string, error) {
 		defer lock.Unlock()
 	}
 
-	return ConnectTarget(ip, port, nqn, i.executor)
+	return ConnectTargetWithTransport(i.transport(), ip, port, nqn, i.executor)
 }
 
 // executeNVMeTCPPathOp validates initiator state, acquires the file lock, and
@@ -848,20 +865,21 @@ func (i *Initiator) discoverAndConnectNVMeTCPTarget(transportAddress, transportS
 			// This avoids "failed to add controller" errors from nvme-cli 2.x
 			// when the kernel already has NVMe-oF connections to the same
 			// target address with the same hostNQN/hostID.
+			transport := i.transport()
 			if i.NVMeTCPInfo.SubsystemNQN != "" {
 				subsystemNQN = i.NVMeTCPInfo.SubsystemNQN
-				i.logger.Infof("Using pre-configured SubsystemNQN %s for target %s:%s, skipping discovery",
-					subsystemNQN, transportAddress, transportServiceID)
+				i.logger.Infof("Using pre-configured SubsystemNQN %s for target %s:%s (transport=%s), skipping discovery",
+					subsystemNQN, transportAddress, transportServiceID, transport)
 			} else {
-				i.logger.Infof("Discovering NVMe/TCP target %s:%s", transportAddress, transportServiceID)
-				subsystemNQN, e = DiscoverTarget(transportAddress, transportServiceID, i.executor)
+				i.logger.Infof("Discovering NVMe-oF target %s:%s (transport=%s)", transportAddress, transportServiceID, transport)
+				subsystemNQN, e = DiscoverTargetWithTransport(transport, transportAddress, transportServiceID, i.executor)
 				if e != nil {
-					return errors.Wrapf(e, "discover NVMe/TCP target %s:%s failed", transportAddress, transportServiceID)
+					return errors.Wrapf(e, "discover NVMe-oF target %s:%s (transport=%s) failed", transportAddress, transportServiceID, transport)
 				}
 			}
 
-			i.logger.Infof("Connecting to NVMe/TCP target %s:%s with subsystemNQN %s", transportAddress, transportServiceID, subsystemNQN)
-			controllerName, e = ConnectTarget(transportAddress, transportServiceID, subsystemNQN, i.executor)
+			i.logger.Infof("Connecting to NVMe-oF target %s:%s with subsystemNQN %s (transport=%s)", transportAddress, transportServiceID, subsystemNQN, transport)
+			controllerName, e = ConnectTargetWithTransport(transport, transportAddress, transportServiceID, subsystemNQN, i.executor)
 			if e != nil {
 				// "already connected" means the path is present in the kernel
 				// but GetDevices() couldn't find a namespace device yet (e.g.
@@ -1038,6 +1056,40 @@ func (i *Initiator) GetEndpoint() string {
 		return i.Endpoint
 	}
 	return ""
+}
+
+// GetExecutor exposes the underlying namespace executor so callers that
+// already hold an Initiator can reuse its nsenter setup for nvme-cli
+// operations without constructing a new one. Needed by transport-specific
+// teardown paths (e.g. explicit RDMA controller disconnect during
+// switchover).
+//
+// Concurrency contract: anything run through the returned executor bypasses
+// the per-volume file lock that Initiator methods take. Callers must not use
+// it concurrently with other Initiator operations on the same volume; prefer
+// a locked convenience method (e.g. DisconnectNVMeController) where one
+// exists.
+func (i *Initiator) GetExecutor() *commonns.Executor {
+	return i.executor
+}
+
+// DisconnectNVMeController disconnects the single NVMe controller matching
+// the given NQN, IP, and port while holding the per-volume file lock. It is
+// the locked equivalent of DisconnectController(nqn, ip, port, GetExecutor())
+// and should be preferred by teardown paths (e.g. explicit RDMA controller
+// disconnect during switchover) so they cannot race other Initiator
+// operations on the same volume. Returns nil when no matching controller is
+// found (already disconnected).
+func (i *Initiator) DisconnectNVMeController(nqn, ip, port string) error {
+	if i.hostProc != "" {
+		lock, err := i.newLock("DisconnectNVMeController")
+		if err != nil {
+			return err
+		}
+		defer lock.Unlock()
+	}
+
+	return DisconnectController(nqn, ip, port, i.executor)
 }
 
 // WaitForControllerLive waits for the NVMe controller at the given address to
