@@ -83,6 +83,12 @@ type Server struct {
 	// (e.g. /var/lib/longhorn). If empty, persistence is disabled.
 	metadataDir string
 
+	// nodeTransport is this IM node's negotiated NVMe-oF transport (TCP or
+	// RDMA), detected once at startup from SPDK's available transports. It
+	// is propagated to every Engine/Replica/EngineFrontend created here so
+	// they expose/dial the matching transport.
+	nodeTransport NvmfTransportType
+
 	newServiceClient ServiceClientFactory
 }
 
@@ -109,6 +115,12 @@ func NewServer(ctx context.Context, portStart, portEnd int32, newServiceClient S
 		replicaKeepAliveTimeoutMs); err != nil {
 		return nil, errors.Wrap(err, "failed to set NVMe options")
 	}
+
+	// Detect this node's NVMe-oF transport capability once at startup and
+	// negotiate the matching SPDK transports. Engines and replicas created by
+	// this server inherit the negotiated transport.
+	nodeTransport := NegotiateNodeTransport(cli)
+	StartTransportReprobe(ctx, cli, nodeTransport)
 
 	broadcasters := map[types.InstanceType]*broadcaster.Broadcaster{}
 	broadcastChs := map[types.InstanceType]chan interface{}{}
@@ -144,6 +156,7 @@ func NewServer(ctx context.Context, portStart, portEnd int32, newServiceClient S
 		volumeHostLocks: map[string]*volumeHostLockEntry{},
 
 		metadataDir:      types.MetadataDir,
+		nodeTransport:    nodeTransport,
 		newServiceClient: newServiceClient,
 	}
 	s.hotplugActive.Store(true)
@@ -464,7 +477,7 @@ func (s *Server) rebuildCachedLvolObjects(state *verifyState) error {
 			lvsUUID := bdevLvol.DriverSpecific.Lvol.LvolStoreUUID
 			specSize := bdevLvol.NumBlocks * uint64(bdevLvol.BlockSize)
 			actualSize := bdevLvol.DriverSpecific.Lvol.NumAllocatedClusters * uint64(defaultClusterSize)
-			state.replicaMap[lvolName] = NewReplica(s.ctx, lvolName, lvsUUIDNameMap[lvsUUID], lvsUUID, specSize, true, s.updateChs[types.InstanceTypeReplica], s.newServiceClient)
+			state.replicaMap[lvolName] = NewReplica(s.ctx, lvolName, lvsUUIDNameMap[lvsUUID], lvsUUID, specSize, true, s.nodeTransport, s.updateChs[types.InstanceTypeReplica], s.newServiceClient)
 			state.replicaMapForSync[lvolName] = state.replicaMap[lvolName]
 			logrus.Infof("Detected one possible existing replica %s(%s) with disk %s(%s), spec size %d, actual size %d", bdevLvol.Aliases[0], bdevLvol.UUID, lvsUUIDNameMap[lvsUUID], lvsUUID, specSize, actualSize)
 		}
@@ -639,7 +652,7 @@ func (s *Server) newReplica(req *spdkrpc.ReplicaCreateRequest) (*Replica, error)
 	if !exists {
 		return nil, fmt.Errorf("lvstore %v(%v) does not exist for replica %v creation", req.LvsName, req.LvsUuid, req.Name)
 	}
-	return NewReplica(s.ctx, req.Name, req.LvsName, req.LvsUuid, req.SpecSize, true, s.updateChs[types.InstanceTypeReplica], s.newServiceClient), nil
+	return NewReplica(s.ctx, req.Name, req.LvsName, req.LvsUuid, req.SpecSize, true, s.nodeTransport, s.updateChs[types.InstanceTypeReplica], s.newServiceClient), nil
 }
 
 func (s *Server) getBackingImage(backingImageName, lvsUUID string) (backingImage *BackingImage, err error) {
@@ -1035,6 +1048,10 @@ func (s *Server) recoverEngineFrontends(ctx context.Context) {
 		ef := NewEngineFrontend(record.Name, record.EngineName, record.VolumeName,
 			record.Frontend, record.SpecSize, 0, 0, s.updateChs[types.InstanceTypeEngineFrontend], s.newServiceClient)
 		ef.metadataDir = s.metadataDir
+		// Tag with the engine target's actual transport (TCP; see
+		// EngineFrontendCreate). RDMA-specific teardown at switchover keys on
+		// the transport observed on the live controller, not on this tag.
+		ef.NvmeTcpFrontend.Transport = engineFrontendTargetTransport()
 		ef.VolumeNQN = record.VolumeNQN
 		ef.VolumeNGUID = record.VolumeNGUID
 		ef.ActivePath = record.ActivePath
