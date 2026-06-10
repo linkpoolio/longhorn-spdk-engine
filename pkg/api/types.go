@@ -230,6 +230,7 @@ type EngineFrontendNvmeTCPPath struct {
 	NQN        string `json:"nqn"`
 	NGUID      string `json:"nguid"`
 	ANAState   string `json:"ana_state"`
+	Transport  string `json:"transport"`
 }
 
 func ProtoEngineFrontendToEngineFrontend(ef *spdkrpc.EngineFrontend) *EngineFrontend {
@@ -266,6 +267,7 @@ func ProtoEngineFrontendToEngineFrontend(ef *spdkrpc.EngineFrontend) *EngineFron
 			NQN:        path.Nqn,
 			NGUID:      path.Nguid,
 			ANAState:   path.AnaState,
+			Transport:  path.Transport,
 		})
 	}
 

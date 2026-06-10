@@ -80,4 +80,4 @@ require (
 
 replace github.com/longhorn/go-spdk-helper => github.com/linkpoolio/go-spdk-helper v0.6.1-0.20260609184748-8002e3abaf32
 
-replace github.com/longhorn/types => github.com/linkpoolio/types v0.0.0-20260605112727-fca1f6d8519d
+replace github.com/longhorn/types => github.com/linkpoolio/types v0.0.0-20260610091928-a08cb4ff0b7a
