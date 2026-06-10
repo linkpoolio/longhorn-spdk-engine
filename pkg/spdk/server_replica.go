@@ -17,10 +17,12 @@ import (
 	grpcstatus "google.golang.org/grpc/status"
 
 	"github.com/longhorn/backupstore"
+	"github.com/longhorn/go-spdk-helper/pkg/jsonrpc"
 	"github.com/longhorn/types/pkg/generated/spdkrpc"
 
 	btypes "github.com/longhorn/backupstore/types"
 	butil "github.com/longhorn/backupstore/util"
+	spdktypes "github.com/longhorn/go-spdk-helper/pkg/spdk/types"
 
 	"github.com/longhorn/longhorn-spdk-engine/pkg/api"
 	"github.com/longhorn/longhorn-spdk-engine/pkg/types"
@@ -95,15 +97,31 @@ func (s *Server) ReplicaDelete(ctx context.Context, req *spdkrpc.ReplicaDeleteRe
 
 // ReplicaGet returns a specific replica
 func (s *Server) ReplicaGet(ctx context.Context, req *spdkrpc.ReplicaGetRequest) (ret *spdkrpc.Replica, err error) {
-	s.RLock()
-	r := s.replicaMap[req.Name]
-	s.RUnlock()
-
-	if r == nil {
+	// Read path goes through the observer — no s.replicaMap lookup. The
+	// persisted record is the source of identity; SPDK is the source of
+	// runtime state. The cached *Replica in s.replicaMap is owned by
+	// mutating handlers for per-replica mutex serialisation only.
+	if s.metadataDir == "" {
+		return nil, grpcstatus.Errorf(grpccodes.FailedPrecondition, "ReplicaGet: persistence disabled")
+	}
+	record, err := loadReplicaRecord(s.metadataDir, req.Name)
+	if err != nil {
+		return nil, grpcstatus.Errorf(grpccodes.Internal, "ReplicaGet: load record: %v", err)
+	}
+	if record == nil {
 		return nil, grpcstatus.Errorf(grpccodes.NotFound, "cannot find replica %v", req.Name)
 	}
 
-	return r.Get(), nil
+	s.RLock()
+	spdkClient := s.spdkClient
+	nodeTransport := s.nodeTransport
+	s.RUnlock()
+
+	r, err := BuildReplicaFromRecord(spdkClient, record, nodeTransport)
+	if err != nil {
+		return nil, grpcstatus.Errorf(grpccodes.Internal, "ReplicaGet: build from SPDK: %v", err)
+	}
+	return ServiceReplicaToProtoReplica(r), nil
 }
 
 // ReplicaExpand expands a replica
@@ -126,17 +144,57 @@ func (s *Server) ReplicaExpand(ctx context.Context, req *spdkrpc.ReplicaExpandRe
 
 // ReplicaList returns all replicas
 func (s *Server) ReplicaList(ctx context.Context, req *emptypb.Empty) (*spdkrpc.ReplicaListResponse, error) {
-	replicaMap := map[string]*Replica{}
 	res := map[string]*spdkrpc.Replica{}
 
-	s.RLock()
-	for k, v := range s.replicaMap {
-		replicaMap[k] = v
+	if s.metadataDir == "" {
+		return &spdkrpc.ReplicaListResponse{Replicas: res}, nil
 	}
+	records, err := loadReplicaRecords(s.metadataDir)
+	if err != nil {
+		return nil, grpcstatus.Errorf(grpccodes.Internal, "ReplicaList: load records: %v", err)
+	}
+
+	s.RLock()
+	spdkClient := s.spdkClient
+	nodeTransport := s.nodeTransport
 	s.RUnlock()
 
-	for replicaName, r := range replicaMap {
-		res[replicaName] = r.Get()
+	// Fetch the SPDK state once for the whole list (one bdev dump + one
+	// subsystem dump) and feed every record through the pure derivation;
+	// previously each replica issued its own full unfiltered BdevGetBdevs,
+	// i.e. N full dumps per manager poll.
+	bdevList, bdevErr := spdkClient.BdevGetBdevs("", 0)
+	var subsystems []spdktypes.NvmfSubsystem
+	var subsysErr error
+	if bdevErr == nil {
+		subsystems, subsysErr = spdkClient.NvmfGetSubsystems("", "")
+		if subsysErr != nil && jsonrpc.IsJSONRPCRespErrorNoSuchDevice(subsysErr) {
+			subsystems, subsysErr = nil, nil
+		}
+	}
+
+	for name, record := range records {
+		var r *Replica
+		switch {
+		case bdevErr != nil:
+			// Mirror BuildReplicaFromRecord's probe-failure semantics: return
+			// a coherent Error-state replica instead of a server error.
+			r = newReplicaSkeletonFromRecord(record, nodeTransport)
+			r.State = types.InstanceStateError
+			r.ErrorMsg = "ReplicaList: BdevGetBdevs: " + bdevErr.Error()
+		case subsysErr != nil:
+			r = newReplicaSkeletonFromRecord(record, nodeTransport)
+			r.State = types.InstanceStateError
+			r.ErrorMsg = "ReplicaList: NvmfGetSubsystems: " + subsysErr.Error()
+		default:
+			var err error
+			r, err = buildReplicaFromObservation(record, nodeTransport, bdevList, subsystems)
+			if err != nil {
+				logrus.WithError(err).Warnf("ReplicaList: failed to derive %s; skipping", name)
+				continue
+			}
+		}
+		res[name] = ServiceReplicaToProtoReplica(r)
 	}
 
 	return &spdkrpc.ReplicaListResponse{Replicas: res}, nil
