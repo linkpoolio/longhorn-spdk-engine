@@ -102,7 +102,21 @@ func NewServer(ctx context.Context, portStart, portEnd int32, newServiceClient S
 		return nil, err
 	}
 
-	bitmap, err := commonbitmap.NewBitmap(portStart, portEnd)
+	// Seed the port allocator with the port ranges persisted by replicas and
+	// engine targets that survived an spdk_tgt/IM restart. Restored replicas
+	// reuse their persisted ranges (Replica.restoreFromRecord) and restored
+	// engine targets keep their listener port without re-allocating, so the
+	// allocator must consider those ranges taken before any create can run;
+	// otherwise a fresh create could collide with a restored instance.
+	replicaRecords, recErr := loadReplicaRecords(types.MetadataDir)
+	if recErr != nil {
+		logrus.WithError(recErr).Warn("Failed to load replica records for port reservation seeding; continuing without replica reservations")
+	}
+	engineRecords, recErr := loadEngineRecords(types.MetadataDir)
+	if recErr != nil {
+		logrus.WithError(recErr).Warn("Failed to load engine records for port reservation seeding; continuing without engine reservations")
+	}
+	bitmap, err := newPortAllocatorWithReservations(portStart, portEnd, collectReservedPortRanges(replicaRecords, engineRecords))
 	if err != nil {
 		return nil, err
 	}
@@ -178,11 +192,16 @@ func NewServer(ctx context.Context, portStart, portEnd int32, newServiceClient S
 	// RecoverFromHost do not block on the unbuffered channel.
 	go s.broadcasting()
 
-	// Run engine frontend recovery asynchronously so that gRPC servers can
-	// start listening immediately. This prevents the liveness probe from
-	// killing the pod when recovery takes longer than the probe threshold
-	// (e.g. when persisted targets are unreachable).
-	go s.recoverEngineFrontends(ctx)
+	// Run engine + engine frontend recovery asynchronously so that gRPC
+	// servers can start listening immediately. This prevents the liveness
+	// probe from killing the pod when recovery takes longer than the probe
+	// threshold (e.g. when persisted targets are unreachable). Engines are
+	// rehydrated before frontends since a frontend reconciles against its
+	// engine's state.
+	go func() {
+		s.recoverEngines()
+		s.recoverEngineFrontends(ctx)
+	}()
 
 	// TODO: There is no need to maintain the replica map in cache when we can use one SPDK JSON API call to fetch the Lvol tree/chain info
 	go s.monitoring()
@@ -414,6 +433,10 @@ func (s *Server) rebuildCachedLvolObjects(state *verifyState) error {
 	}
 	lvsUUIDNameMap := buildLvsUUIDNameMap(lvsList)
 
+	// Load persisted replica port records once so reconstructed replicas can
+	// reuse their original ports after an IM restart instead of reallocating.
+	replicaRecords, _ := loadReplicaRecords(s.metadataDir)
+
 	// Detect if the lvol bdev is an uncached replica or backing image.
 	for lvolName, bdevLvol := range bdevLvolMap {
 		if bdevLvol.DriverSpecific.Lvol.Snapshot && !types.IsBackingImageSnapLvolName(lvolName) {
@@ -477,8 +500,15 @@ func (s *Server) rebuildCachedLvolObjects(state *verifyState) error {
 			lvsUUID := bdevLvol.DriverSpecific.Lvol.LvolStoreUUID
 			specSize := bdevLvol.NumBlocks * uint64(bdevLvol.BlockSize)
 			actualSize := bdevLvol.DriverSpecific.Lvol.NumAllocatedClusters * uint64(defaultClusterSize)
-			state.replicaMap[lvolName] = NewReplica(s.ctx, lvolName, lvsUUIDNameMap[lvsUUID], lvsUUID, specSize, true, s.nodeTransport, s.updateChs[types.InstanceTypeReplica], s.newServiceClient)
-			state.replicaMapForSync[lvolName] = state.replicaMap[lvolName]
+			r := NewReplica(s.ctx, lvolName, lvsUUIDNameMap[lvsUUID], lvsUUID, specSize, true, s.nodeTransport, s.updateChs[types.InstanceTypeReplica], s.newServiceClient)
+			r.metadataDir = s.metadataDir
+			if rec, ok := replicaRecords[lvolName]; ok {
+				if err := r.restoreFromRecord(rec); err != nil {
+					logrus.WithError(err).Warnf("Failed to restore persisted state for replica %s; will use fresh port allocation", lvolName)
+				}
+			}
+			state.replicaMap[lvolName] = r
+			state.replicaMapForSync[lvolName] = r
 			logrus.Infof("Detected one possible existing replica %s(%s) with disk %s(%s), spec size %d, actual size %d", bdevLvol.Aliases[0], bdevLvol.UUID, lvsUUIDNameMap[lvsUUID], lvsUUID, specSize, actualSize)
 		}
 	}
@@ -652,7 +682,9 @@ func (s *Server) newReplica(req *spdkrpc.ReplicaCreateRequest) (*Replica, error)
 	if !exists {
 		return nil, fmt.Errorf("lvstore %v(%v) does not exist for replica %v creation", req.LvsName, req.LvsUuid, req.Name)
 	}
-	return NewReplica(s.ctx, req.Name, req.LvsName, req.LvsUuid, req.SpecSize, true, s.nodeTransport, s.updateChs[types.InstanceTypeReplica], s.newServiceClient), nil
+	r = NewReplica(s.ctx, req.Name, req.LvsName, req.LvsUuid, req.SpecSize, true, s.nodeTransport, s.updateChs[types.InstanceTypeReplica], s.newServiceClient)
+	r.metadataDir = s.metadataDir
+	return r, nil
 }
 
 func (s *Server) getBackingImage(backingImageName, lvsUUID string) (backingImage *BackingImage, err error) {
@@ -998,6 +1030,67 @@ func (s *Server) GetReplicaStruct(name string) *Replica {
 	s.RLock()
 	defer s.RUnlock()
 	return s.replicaMap[name]
+}
+
+// recoverEngines loads persisted engine records from disk and rehydrates
+// s.engineMap before the first monitoring tick runs. After an IM restart
+// the SPDK RAID bdev, base bdev_nvme controllers, and NVMe-oF target all
+// survive (they are re-established when SPDK replays blobstore + reconnects),
+// but the in-memory Engine struct is gone. Without this rehydration step,
+// the manager's first EngineGet returns NotFound and the manager falls back
+// to EngineCreate, which re-runs replica-attach against already-attached
+// bdev_nvme controllers and can fail mid-recovery.
+//
+// Engines reloaded here are placeholder state. The next verify() tick calls
+// ValidateAndUpdate which reconciles the record against live SPDK bdev state
+// and marks the engine Running or Error based on what actually exists.
+func (s *Server) recoverEngines() {
+	if s.metadataDir == "" {
+		return
+	}
+
+	records, err := loadEngineRecords(s.metadataDir)
+	if err != nil {
+		logrus.WithError(err).Error("Failed to load engine records for recovery")
+		return
+	}
+	if len(records) == 0 {
+		return
+	}
+
+	logrus.Infof("Recovering %d engine(s) from persisted records", len(records))
+
+	s.Lock()
+	defer s.Unlock()
+	for name, rec := range records {
+		if _, exists := s.engineMap[name]; exists {
+			continue
+		}
+		// Upgrade TCP to RDMA when the node has negotiated RDMA since the
+		// record was written. Engines created on pre-RDMA builds persist
+		// replicaTransport=tcp; without this, an instance-manager upgrade to
+		// an RDMA-capable build leaves those engines dialing TCP to the
+		// replica's primary port (which exposes RDMA), burning the full
+		// attach-retry budget per replica before falling back to the TCP
+		// secondary. Downgrade is left alone so a deliberate TCP pin survives.
+		transport := rec.ReplicaTransport
+		if transport == "" || (transport == NvmfTransportTCP && s.nodeTransport == NvmfTransportRDMA) {
+			transport = s.nodeTransport
+		}
+		// SnapshotMaxCount is not persisted in the record; pass 0 and let the
+		// next verify() tick reconcile it from the manager-supplied spec.
+		e := NewEngine(rec.Name, rec.VolumeName, rec.Frontend, rec.SpecSize, transport, s.updateChs[types.InstanceTypeEngine], 0, s.newServiceClient)
+		e.metadataDir = s.metadataDir
+		e.restoreFromRecord(rec)
+		// Mark Running before any validation has happened. This is an
+		// accepted tradeoff: the manager's first EngineGet must not see
+		// NotFound (it would fall back to EngineCreate mid-recovery), and a
+		// stale Running is corrected by the next verify() tick, whose
+		// ValidateAndUpdate reconciles the record against live SPDK state and
+		// demotes the engine to Error if the RAID/base bdevs are gone.
+		e.State = types.InstanceStateRunning
+		s.engineMap[name] = e
+	}
 }
 
 // recoverEngineFrontends loads persisted engine frontend records from disk
