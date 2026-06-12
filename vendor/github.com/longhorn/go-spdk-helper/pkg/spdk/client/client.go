@@ -40,6 +40,17 @@ func NewClientWithDefaultTimeout(ctx context.Context, defaultTimeout time.Durati
 	}, nil
 }
 
+// NewClientWithConn builds a Client over an already-established connection
+// instead of dialing the default SPDK unix socket. Intended for tests that
+// drive the client against a fake JSON-RPC server (e.g. over net.Pipe), so
+// call sites can be exercised without a running spdk_tgt.
+func NewClientWithConn(ctx context.Context, conn net.Conn) *Client {
+	return &Client{
+		conn:    conn,
+		jsonCli: jsonrpc.NewClient(ctx, conn),
+	}
+}
+
 func (c *Client) Close() error {
 	if c.conn == nil {
 		return nil
