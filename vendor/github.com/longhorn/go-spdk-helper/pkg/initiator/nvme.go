@@ -105,29 +105,29 @@ func DisconnectController(nqn, ip, port string, executor *commonns.Executor) err
 	return nil
 }
 
-// GetDevices returns all devices
-func GetDevices(ip, port, nqn string, executor *commonns.Executor) (devices []Device, err error) {
-	defer func() {
-		err = errors.Wrapf(err, "failed to get devices for address %s:%s and nqn %s", ip, port, nqn)
-	}()
-
-	devices = []Device{}
-
-	nvmeDevices, err := listRecognizedNvmeDevices(executor)
-	if err != nil {
-		return nil, err
-	}
+// collectDevices builds Device entries for the recognized NVMe devices.
+// A device whose subsystem lookup fails, returns no subsystem, or returns
+// multiple subsystems is skipped rather than failing the whole enumeration:
+// such a device is typically a sibling volume mid-teardown (block device
+// still present while its subsystem has already left sysfs) and cannot be
+// the device the caller is looking for. Failing the entire lookup here made
+// every concurrent detach on the node poison the periodic validation of
+// unrelated healthy volumes.
+func collectDevices(nvmeDevices []CliDevice, listSubsys func(devicePath string) ([]Subsystem, error)) []Device {
+	devices := []Device{}
 	for _, d := range nvmeDevices {
-		subsystems, err := listSubsystems(d.DevicePath, executor)
+		subsystems, err := listSubsys(d.DevicePath)
 		if err != nil {
 			logrus.WithError(err).Warnf("failed to list subsystems for NVMe device %s", d.DevicePath)
 			continue
 		}
 		if len(subsystems) == 0 {
-			return nil, fmt.Errorf("no subsystem found for NVMe device %s", d.DevicePath)
+			logrus.Warnf("Skipping NVMe device %s with no subsystem during device enumeration", d.DevicePath)
+			continue
 		}
 		if len(subsystems) > 1 {
-			return nil, fmt.Errorf("multiple subsystems found for NVMe device %s", d.DevicePath)
+			logrus.Warnf("Skipping NVMe device %s with %d subsystems during device enumeration", d.DevicePath, len(subsystems))
+			continue
 		}
 		sys := subsystems[0]
 
@@ -161,6 +161,24 @@ func GetDevices(ip, port, nqn string, executor *commonns.Executor) (devices []De
 
 		devices = append(devices, device)
 	}
+	return devices
+}
+
+// GetDevices returns all devices
+func GetDevices(ip, port, nqn string, executor *commonns.Executor) (devices []Device, err error) {
+	defer func() {
+		err = errors.Wrapf(err, "failed to get devices for address %s:%s and nqn %s", ip, port, nqn)
+	}()
+
+	devices = []Device{}
+
+	nvmeDevices, err := listRecognizedNvmeDevices(executor)
+	if err != nil {
+		return nil, err
+	}
+	devices = collectDevices(nvmeDevices, func(devicePath string) ([]Subsystem, error) {
+		return listSubsystems(devicePath, executor)
+	})
 
 	if nqn == "" {
 		return devices, err

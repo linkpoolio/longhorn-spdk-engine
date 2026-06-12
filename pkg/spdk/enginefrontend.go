@@ -16,6 +16,7 @@ import (
 	"go.uber.org/multierr"
 
 	"github.com/longhorn/go-spdk-helper/pkg/initiator"
+	"github.com/longhorn/go-spdk-helper/pkg/jsonrpc"
 	"github.com/longhorn/types/pkg/generated/spdkrpc"
 
 	commonbitmap "github.com/longhorn/go-common-libs/bitmap"
@@ -69,6 +70,13 @@ type EngineFrontend struct {
 	isExpanding           bool
 	lastExpansionFailedAt string
 	lastExpansionError    string
+
+	// consecutiveValidationFailures counts back-to-back ValidateAndUpdate
+	// failures. The frontend is only marked Error after
+	// maxConsecutiveValidationFailures of them, so a transient host-level
+	// glitch (e.g. the kernel NVMe device list churning while a sibling
+	// volume detaches) does not fault a healthy volume.
+	consecutiveValidationFailures int
 
 	// UpdateCh should not be protected by the engine lock
 	UpdateCh chan interface{}
@@ -151,6 +159,14 @@ const (
 	// to the recovery path — normal creation and switchover paths use the
 	// full retry loop in the initiator package.
 	recoveryTargetReachabilityTimeout = 5 * time.Second
+
+	// maxConsecutiveValidationFailures is how many back-to-back
+	// ValidateAndUpdate failures are tolerated before the engine frontend is
+	// marked Error. At the server's 3s verify cadence this gives ~6s of grace
+	// for transient host-level glitches (kernel NVMe device churn while a
+	// sibling volume detaches) without materially delaying detection of real
+	// failures, which persist across ticks.
+	maxConsecutiveValidationFailures = 3
 )
 
 type NvmeTCPPath struct {
@@ -2591,12 +2607,29 @@ func (ef *EngineFrontend) ValidateAndUpdate(spdkClient *spdkclient.Client) (err 
 	ef.Lock()
 	defer func() {
 		if err != nil {
-			if ef.State != types.InstanceStateError {
-				ef.log.WithError(err).Error("Setting engine frontend to error state due to validation failure")
-				ef.State = types.InstanceStateError
-				updateRequired = true
+			ef.consecutiveValidationFailures++
+			// Broken pipe means the SPDK service itself is gone; that is not
+			// a transient glitch, so it bypasses the failure tolerance (the
+			// server verify loop also aborts on it).
+			if !jsonrpc.IsJSONRPCRespErrorBrokenPipe(err) && ef.consecutiveValidationFailures < maxConsecutiveValidationFailures {
+				// Tolerate transient host-level glitches (e.g. kernel NVMe
+				// device churn while a sibling volume detaches): faulting on
+				// the first failure cascaded one detach into faults on every
+				// other volume on the node. Real failures persist across
+				// verify ticks and still fault below.
+				ef.log.WithError(err).Warnf("Engine frontend validation failed (%d/%d consecutive), deferring error state",
+					ef.consecutiveValidationFailures, maxConsecutiveValidationFailures)
+				err = nil
+			} else {
+				if ef.State != types.InstanceStateError {
+					ef.log.WithError(err).Error("Setting engine frontend to error state due to validation failure")
+					ef.State = types.InstanceStateError
+					updateRequired = true
+				}
+				ef.ErrorMsg = err.Error()
 			}
-			ef.ErrorMsg = err.Error()
+		} else {
+			ef.consecutiveValidationFailures = 0
 		}
 		ef.Unlock()
 
