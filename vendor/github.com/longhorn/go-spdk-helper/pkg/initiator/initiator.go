@@ -1321,11 +1321,32 @@ func (i *Initiator) removeEndpoint() error {
 func (i *Initiator) removeLinearDmDevice(force, deferred bool) error {
 	dmDevPath := getDmDevicePath(i.Name)
 	if _, err := os.Stat(dmDevPath); err != nil {
+		if os.IsNotExist(err) {
+			// Already removed -- the goal state of this function.
+			return nil
+		}
 		return err
 	}
 
 	i.logger.Info("Removing linear dm device")
-	return util.DmsetupRemove(i.Name, force, deferred, i.executor)
+	if err := util.DmsetupRemove(i.Name, force, deferred, i.executor); err != nil {
+		// A crash can leave a stale /dev/mapper node behind without a
+		// backing dm device; the remove ioctl then fails with ENXIO ("No
+		// such device or address"). Treating that as fatal wedges every
+		// initiator restart on the volume (observed as engine frontends
+		// flapping forever after an spdk_tgt crash). The device is
+		// already gone: clean up the stale node and succeed.
+		if dmsetupRemoveErrIsAlreadyGone(err) {
+			i.logger.WithError(err).Warn("dm device already gone; removing stale device node")
+			if rmErr := os.Remove(dmDevPath); rmErr != nil && !os.IsNotExist(rmErr) {
+				return errors.Wrapf(rmErr, "failed to remove stale dm device node %s", dmDevPath)
+			}
+			return nil
+		}
+		return err
+	}
+
+	return nil
 }
 
 func (i *Initiator) createLinearDmDevice() error {
@@ -1527,4 +1548,12 @@ func (i *Initiator) reloadLinearDmDevice() error {
 
 func getDmDevicePath(name string) string {
 	return filepath.Join("/dev/mapper", name)
+}
+
+// dmsetupRemoveErrIsAlreadyGone reports whether a dmsetup remove failure means
+// the dm device no longer exists (ENXIO from the remove ioctl) -- e.g. a crash
+// left a stale /dev/mapper node behind without a backing device. That state is
+// the removal's goal and must not be treated as fatal.
+func dmsetupRemoveErrIsAlreadyGone(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "No such device")
 }
