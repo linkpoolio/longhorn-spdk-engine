@@ -2,6 +2,8 @@ package spdk
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 
 	lhtypes "github.com/longhorn/longhorn-spdk-engine/pkg/types"
 
@@ -282,6 +284,31 @@ func (s *TestSuite) TestBoolsToBitmap(c *C) {
 	c.Check(boolsToBitmap(true, false, false, false), Equals, 0b1000)
 	c.Check(boolsToBitmap(false, false, false, true), Equals, 0b0001)
 	c.Check(boolsToBitmap(true, false, true, false), Equals, 0b1010)
+}
+
+// dmLinearIsLive is the dm-linear liveness probe that keeps the observer from
+// reporting a stale-positive Running for a dead-but-present device file (which
+// would pin reconcileOnce's heal counter at zero). os.Stat success is not
+// enough — only a real open distinguishes a live mapping from an orphaned mknod
+// inode. A live device opens cleanly (/dev/null stands in as a real char
+// device); a regular file is rejected by the ModeDevice guard; a missing path
+// returns false.
+func (s *TestSuite) TestDmLinearIsLive(c *C) {
+	fmt.Println("Testing dmLinearIsLive: device opens => true; regular file / missing => false")
+
+	// A live device node opens cleanly. /dev/null is a real char device
+	// present in every linux test environment and carries ModeDevice.
+	c.Check(dmLinearIsLive("/dev/null"), Equals, true)
+
+	// A regular file exists and stats fine but is not a device — the
+	// ModeDevice guard must reject it (this is the stray-file case the bare
+	// os.Stat used to mis-classify as present).
+	regular := filepath.Join(c.MkDir(), "not-a-device")
+	c.Assert(os.WriteFile(regular, []byte("x"), 0600), IsNil)
+	c.Check(dmLinearIsLive(regular), Equals, false)
+
+	// A missing path returns false rather than erroring.
+	c.Check(dmLinearIsLive(filepath.Join(c.MkDir(), "absent")), Equals, false)
 }
 
 // Heal must not race a deletion: Delete closes stopCh and marks the EF
