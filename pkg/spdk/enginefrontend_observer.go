@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -207,6 +208,29 @@ func boolsToBitmap(bs ...bool) int {
 	return out
 }
 
+// dmLinearIsLive reports whether the longhorn device file at devPath backs a
+// live dm-linear mapping. os.Stat success is not enough: after `dmsetup remove`
+// the mknod inode can survive (or not yet be re-cleaned by the IM) while the
+// mapping is gone, and stat keeps succeeding on the orphaned file. The kernel
+// only admits the table is gone when the device is opened — a torn-down
+// dm-linear returns ENXIO. A non-blocking open is the cheapest race-free probe
+// and matches what any real I/O consumer would observe. Returns false (rather
+// than a stale-positive) for a dead device so deriveLiveState derives Error and
+// reconcileOnce can heal it. Guards on ModeDevice first so a stray regular file
+// at the path is never mistaken for a live mapping.
+func dmLinearIsLive(devPath string) bool {
+	statInfo, err := os.Stat(devPath)
+	if err != nil || statInfo.Mode()&os.ModeDevice == 0 {
+		return false
+	}
+	f, err := os.OpenFile(devPath, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return false
+	}
+	_ = f.Close()
+	return true
+}
+
 // ObserveEngineFrontend builds a fresh EngineFrontendLive view from the
 // canonical sources (SPDK + host kernel + dm-linear / device file). Pure
 // observation — no mutation of any in-memory cache, no persistence write.
@@ -358,12 +382,7 @@ func ObserveEngineFrontend(ctx context.Context, spdkClient *spdkclient.Client, r
 	raw.DevicePath = devPath
 	if _, statErr := os.Stat(devPath); statErr == nil {
 		raw.DevicePathExists = true
-		// In our deployment, the longhorn device path /dev/longhorn/<vol>
-		// IS the dm-linear device. If the kernel ctrlr is also present,
-		// that confirms the dm stack is intact. Distinguishing a "dm
-		// exists but pointing at dead nvme" case is covered by the
-		// KernelControllerPresent=false branch in deriveLiveState.
-		raw.DMDevicePresent = true
+		raw.DMDevicePresent = dmLinearIsLive(devPath)
 	} else if !os.IsNotExist(statErr) {
 		// Unexpected stat error (permission, EIO, etc.) — surface but
 		// don't bail; the partial Raw still produces a correct Error
