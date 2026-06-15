@@ -198,11 +198,24 @@ func disconnectNVMfBdev(spdkClient *spdkclient.Client, bdevName string, maxRetri
 
 	controllerName := helperutil.GetNvmeControllerNameFromNamespaceName(bdevName)
 
+	peerGone := false
 	if err := retry.Do(
 		func() error {
 			_, err := spdkClient.BdevNvmeDetachController(controllerName)
 			if err != nil {
 				if jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
+					return nil
+				}
+				if jsonrpc.IsJSONRPCRespErrorConnectionTimeout(err) {
+					// -110 (ETIMEDOUT): the peer is unreachable/stalled, so the
+					// connection is already broken and the detach is effectively
+					// done. Stop retrying — it will not recover, retrying just
+					// blocks teardown for maxRetries*retryInterval (per replica,
+					// times rebuild concurrency), and a repeated detach against
+					// a dead peer can break the SPDK JSONRPC socket. Treat as
+					// gone and skip the confirm-wait below (we can't confirm
+					// namespace removal against an unreachable peer).
+					peerGone = true
 					return nil
 				}
 				return err
@@ -221,6 +234,11 @@ func disconnectNVMfBdev(spdkClient *spdkclient.Client, bdevName string, maxRetri
 		}),
 	); err != nil {
 		return err
+	}
+
+	if peerGone {
+		logrus.Warnf("NVMe bdev detach for controller=%s timed out against an unreachable peer; treating as detached and proceeding with cleanup", controllerName)
+		return nil
 	}
 
 	// BdevNvmeDetachController returning success only means SPDK accepted the detach

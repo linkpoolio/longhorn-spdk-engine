@@ -236,6 +236,15 @@ type EngineReplicaStatus struct {
 	// Transport is the NVMe-oF transport this replica's bdev_nvme controller
 	// was attached over (TCP or RDMA) — i.e. the transport of DialedAddress.
 	Transport NvmfTransportType
+	// validationFailures counts consecutive ValidateAndUpdate NVMe-validation
+	// failures for a currently-RW (healthy) replica. A healthy replica is only
+	// downgraded to ERR after maxReplicaValidationFailures consecutive failures,
+	// so a single transient glitch — e.g. the shared SPDK socket briefly busy
+	// while a sibling rebuild replica tears down — cannot fault a healthy
+	// replica (and, when it is the volume's only healthy copy, the whole
+	// volume). Reset to 0 on any successful validation. Not persisted
+	// (transient; resets to 0 on engine-record restore).
+	validationFailures int
 }
 
 // transportOrDefault returns the per-replica Transport if set, otherwise the
@@ -3518,12 +3527,31 @@ func (e *Engine) validateReplicaStatusMapNoLock(bdevMap map[string]*spdktypes.Bd
 			e.log.Debugf("Engine validating replica %s with bdev name %s and address %s during ValidateAndUpdate", replicaName, replicaStatus.BdevName, replicaStatus.Address)
 			mode, err := e.validateAndUpdateReplicaNvme(replicaName, bdevMap[replicaStatus.BdevName])
 			if err != nil {
-				e.log.WithError(err).Errorf("Engine found valid NVMe for replica %v, will update the mode from %s to ERR during ValidateAndUpdate", replicaName, replicaStatus.Mode)
-				replicaStatus.Mode = types.ModeERR
-				*updateRequired = true
-			} else if replicaStatus.Mode != mode {
-				replicaStatus.Mode = mode
-				*updateRequired = true
+				// A currently-RW (healthy, serving) replica is only failed after
+				// maxReplicaValidationFailures consecutive validation failures.
+				// A single transient failure — e.g. the shared SPDK socket briefly
+				// busy while a sibling rebuild replica tears down — must not fault
+				// a healthy replica; on 2026-06-15 that turned a rebuild-dst
+				// cleanup glitch into a faulted source and a faulted volume. A
+				// genuinely dead replica keeps failing across the 3s verify loop
+				// and still reaches ERR within ~maxReplicaValidationFailures ticks.
+				// WO (rebuilding) and other non-RW replicas fail immediately as
+				// before — failing a mid-rebuild replica is cheap (it restarts).
+				if replicaStatus.Mode == types.ModeRW && replicaStatus.validationFailures+1 < maxReplicaValidationFailures {
+					replicaStatus.validationFailures++
+					e.log.WithError(err).Warnf("Engine deferring ERR for healthy replica %v (validation failure %d/%d) during ValidateAndUpdate", replicaName, replicaStatus.validationFailures, maxReplicaValidationFailures)
+				} else {
+					e.log.WithError(err).Errorf("Engine found invalid NVMe for replica %v, will update the mode from %s to ERR during ValidateAndUpdate", replicaName, replicaStatus.Mode)
+					replicaStatus.Mode = types.ModeERR
+					replicaStatus.validationFailures = 0
+					*updateRequired = true
+				}
+			} else {
+				replicaStatus.validationFailures = 0
+				if replicaStatus.Mode != mode {
+					replicaStatus.Mode = mode
+					*updateRequired = true
+				}
 			}
 		}
 

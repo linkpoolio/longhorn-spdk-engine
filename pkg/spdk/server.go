@@ -30,6 +30,15 @@ import (
 
 const (
 	MonitorInterval = 3 * time.Second
+
+	// maxReplicaValidationFailures is how many consecutive ValidateAndUpdate
+	// NVMe-validation failures a currently-RW (healthy) engine replica tolerates
+	// before being downgraded to ERR. At the MonitorInterval cadence this gives
+	// ~2 verify ticks of grace so a single transient glitch (e.g. the shared
+	// SPDK socket briefly busy while a sibling rebuild replica tears down) does
+	// not fault a healthy replica. A genuinely dead replica still reaches ERR
+	// within ~maxReplicaValidationFailures ticks.
+	maxReplicaValidationFailures = 3
 )
 
 type Server struct {
