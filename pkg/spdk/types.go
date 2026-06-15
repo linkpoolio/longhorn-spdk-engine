@@ -92,12 +92,19 @@ var (
 	// crc32c but can't back that many PSVs. 64/core scales with the pinned cores.
 	accelMlx5MkeysPerCore uint32 = 64
 
-	// Rebuild-path bdev_nvme timeouts. (2,1,2) caps retry exposure at 2s — at
-	// the upstream (15,2,10) defaults a dying peer can spam failover fast enough
-	// to saturate the reactor and break its JSONRPC socket. Rebuild is restartable.
-	rebuildCtrlrLossTimeoutSec  = 2
-	rebuildReconnectDelaySec    = 1
-	rebuildFastIOFailTimeoutSec = 2
+	// Rebuild-path bdev_nvme timeouts. Previously (2,1,2) to cap reactor-
+	// saturation exposure from failover spam against a dying peer. That made a
+	// SLOW-but-alive rebuild source (e.g. a multi-TiB pre-rebase node feeding
+	// ~96 concurrent rebuilds) get declared dead at 2s, and since the rebuild
+	// source is often the volume's only healthy replica, the connection failure
+	// cascaded into a faulted volume (incident 2026-06-15). The reactor-
+	// saturation concern is now handled at the SPDK layer (bdev_nvme failover
+	// re-drive is rate-limited to ~1 Hz, linkpool.23), so these can be generous
+	// enough to ride out a slow source without declaring it dead. Override via
+	// the LONGHORN_V2_REBUILD_* env vars below.
+	rebuildCtrlrLossTimeoutSec  = 30
+	rebuildReconnectDelaySec    = 5
+	rebuildFastIOFailTimeoutSec = 15
 
 	// defaultLvolClearMethod is the clear_method passed to bdev_lvol_create[_lvstore].
 	// "" = SPDK default (unmap). Installs where UNMAP issues synchronous
