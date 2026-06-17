@@ -1560,21 +1560,26 @@ func (ef *EngineFrontend) Suspend(_ *spdkclient.Client) (err error) {
 
 		// Default: suspend with flush + fs-freeze for a clean quiesce of a live
 		// device. But if the backing dm-linear mapping is CONFIRMED DEAD, a
-		// flushing suspend blocks forever in the kernel waiting for I/O that can
-		// never complete, leaving an uninterruptible D-state task that wedges the
-		// IM container so kubelet cannot kill or restart it. On a dead device
-		// there is no valid in-flight I/O to preserve, so suspend without flush
-		// or fs-freeze to avoid the hang. The probe is conservative (non-blocking
-		// open + 1-byte read; confirmed dead ONLY on ENXIO/EIO), so a healthy or
-		// merely-busy device still takes the safe flushing path.
-		noflush, nolockfs := false, false
+		// suspend blocks forever in the kernel (dm_suspend) waiting for in-flight
+		// I/O to a target that can never complete it, leaving an uninterruptible
+		// D-state task that wedges the IM container so kubelet cannot kill or
+		// restart it. --noflush/--nolockfs does NOT avoid this: dm_suspend still
+		// waits on already-dispatched I/O, so a noflush suspend hangs just the
+		// same (observed in production as hundreds of piled-up D-state
+		// `dmsetup suspend --noflush` tasks, each a longhorn-manager Suspend
+		// retry). There is nothing to quiesce on a dead device, so skip the
+		// dmsetup suspend entirely and report the frontend suspended; the
+		// EngineFrontend observer faults/recovers the dead device separately.
+		// The probe is conservative (non-blocking open + 1-byte read; confirmed
+		// dead ONLY on ENXIO/EIO), so a healthy or merely-busy device still
+		// takes the safe flushing suspend below.
 		devPath := helperutil.GetLonghornDevicePath(ef.VolumeName)
 		if dead, reason := suspendDeviceConfirmedDead(devPath); dead {
-			ef.log.Warnf("Suspending engine frontend without flush: backing device %s confirmed dead (%s); a flushing suspend would hang in D-state", devPath, reason)
-			noflush, nolockfs = true, true
+			ef.log.Warnf("Skipping dmsetup suspend for engine frontend: backing device %s confirmed dead (%s); a suspend (even --noflush) would hang in D-state", devPath, reason)
+			return nil
 		}
 
-		return i.Suspend(noflush, nolockfs)
+		return i.Suspend(false, false)
 	default:
 		// TODO: support ublk frontend suspend
 		return errors.Wrapf(ErrEngineFrontendLifecycleUnimplemented, "suspend frontend %s is unimplemented", ef.Frontend)
