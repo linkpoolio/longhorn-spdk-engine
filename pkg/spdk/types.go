@@ -65,6 +65,14 @@ const (
 // upstream 15s the SPDK reactor can saturate enough to break its own JSONRPC
 // socket. 3s trims the spam window below the liveness threshold.
 //
+// SPDK requires reconnect_delay_sec <= fast_io_fail_timeout_sec <= ctrlr_loss_timeout_sec
+// (rpc_bdev_nvme_attach_controller validation in bdev_nvme.c); an out-of-order
+// tuple is rejected at attach time. fast_io_fail must therefore track the 3s
+// loss timeout. It was previously 10 — invalid against loss=3, and only ever
+// worked because longhorn-manager's env override below replaced all three with a
+// consistent (but unintentionally 15s) tuple from the Setting CRs. With the
+// override absent or partial, loss=3/fast_io_fail=10 fails every replica attach.
+//
 // rebuildCtrlrLossTimeoutSec / rebuildFastIOFailTimeoutSec apply only to the
 // rebuild-path bdev_nvme attachments in replica.go. Rebuild is inherently
 // restartable, so sub-second failover is safe and makes teardown-during-rebuild
@@ -72,7 +80,7 @@ const (
 var (
 	replicaCtrlrLossTimeoutSec  = 3
 	replicaReconnectDelaySec    = 2
-	replicaFastIOFailTimeoutSec = 10
+	replicaFastIOFailTimeoutSec = 2
 	replicaTransportAckTimeout  = 10
 	replicaKeepAliveTimeoutMs   = 10000
 	// replicaTransportTos tags outbound NVMe-oF packets with DSCP. SPDK passes
@@ -156,6 +164,48 @@ func init() {
 			defaultThinProvision = true
 		}
 	}
+
+	// longhorn-manager sets each timeout from a separate Setting CR, so a partial
+	// change (e.g. lowering ctrlr_loss without lowering fast_io_fail) can yield a
+	// tuple SPDK rejects at attach (reconnect_delay <= fast_io_fail <= ctrlr_loss),
+	// failing every replica/rebuild attach. Clamp to the ordering as a safety net.
+	replicaCtrlrLossTimeoutSec, replicaReconnectDelaySec, replicaFastIOFailTimeoutSec =
+		enforceAttachTimeoutOrder("replica", replicaCtrlrLossTimeoutSec, replicaReconnectDelaySec, replicaFastIOFailTimeoutSec)
+	rebuildCtrlrLossTimeoutSec, rebuildReconnectDelaySec, rebuildFastIOFailTimeoutSec =
+		enforceAttachTimeoutOrder("rebuild", rebuildCtrlrLossTimeoutSec, rebuildReconnectDelaySec, rebuildFastIOFailTimeoutSec)
+}
+
+// enforceAttachTimeoutOrder clamps an NVMe-oF reconnect tuple to SPDK's
+// rpc_bdev_nvme_attach_controller constraint
+// reconnect_delay_sec <= fast_io_fail_timeout_sec <= ctrlr_loss_timeout_sec.
+// Only a finite positive ctrlr_loss is bounded this way; loss == -1 (retry
+// forever) and loss == 0 follow other SPDK rules and are returned untouched.
+// A clamp means a Setting was misconfigured, so warn loudly (to stderr, since
+// this runs at package init before logging is wired up).
+func enforceAttachTimeoutOrder(name string, loss, reconnect, fastfail int) (int, int, int) {
+	if loss <= 0 {
+		return loss, reconnect, fastfail
+	}
+	origReconnect, origFastfail := reconnect, fastfail
+	if fastfail > loss {
+		fastfail = loss
+	}
+	if fastfail > 0 && reconnect > fastfail {
+		reconnect = fastfail
+	}
+	if reconnect > loss {
+		reconnect = loss
+	}
+	if reconnect < 1 {
+		reconnect = 1
+	}
+	if reconnect != origReconnect || fastfail != origFastfail {
+		fmt.Fprintf(os.Stderr, "spdk: clamped %s NVMe-oF timeouts to SPDK attach ordering: "+
+			"ctrlr_loss_timeout_sec=%d reconnect_delay_sec=%d fast_io_fail_timeout_sec=%d "+
+			"(was reconnect_delay_sec=%d fast_io_fail_timeout_sec=%d)\n",
+			name, loss, reconnect, fastfail, origReconnect, origFastfail)
+	}
+	return loss, reconnect, fastfail
 }
 
 // accelMlx5NumRequests sizes the per-device mkey pool for the accel_mlx5 scan.
