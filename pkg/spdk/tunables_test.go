@@ -184,3 +184,49 @@ func TestGetEngineCntlidRange(t *testing.T) {
 		}
 	}
 }
+
+func TestEnforceAttachTimeoutOrder(t *testing.T) {
+	cases := []struct {
+		name                                  string
+		loss, reconnect, fastfail             int
+		wantLoss, wantReconnect, wantFastfail int
+	}{
+		// Already valid: returned unchanged.
+		{"valid replica tuple", 3, 2, 2, 3, 2, 2},
+		{"valid rebuild tuple", 30, 5, 15, 30, 5, 15},
+		{"reconnect==fastfail==loss", 3, 3, 3, 3, 3, 3},
+		// The bug this fix prevents: fast_io_fail above loss is clamped down to loss.
+		{"fastfail above loss clamped", 3, 2, 10, 3, 2, 3},
+		// fast_io_fail clamped, then reconnect clamped to the new fast_io_fail.
+		{"reconnect above clamped fastfail", 3, 8, 10, 3, 3, 3},
+		{"reconnect above loss clamped", 5, 9, 4, 5, 4, 4},
+		// reconnect floored to 1 (SPDK forbids 0 when loss != 0).
+		{"reconnect floored to one", 5, 0, 4, 5, 1, 4},
+		// loss <= 0 (infinite / disabled): left untouched, other SPDK rules apply.
+		{"infinite loss untouched", -1, 9, 99, -1, 9, 99},
+		{"zero loss untouched", 0, 0, 0, 0, 0, 0},
+		// fast_io_fail disabled (0): not used as a reconnect ceiling.
+		{"fastfail disabled keeps reconnect", 10, 5, 0, 10, 5, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotLoss, gotReconnect, gotFastfail := enforceAttachTimeoutOrder(tc.name, tc.loss, tc.reconnect, tc.fastfail)
+			if gotLoss != tc.wantLoss || gotReconnect != tc.wantReconnect || gotFastfail != tc.wantFastfail {
+				t.Errorf("got (loss=%d reconnect=%d fastfail=%d), want (loss=%d reconnect=%d fastfail=%d)",
+					gotLoss, gotReconnect, gotFastfail, tc.wantLoss, tc.wantReconnect, tc.wantFastfail)
+			}
+			// Post-condition: for finite positive loss the SPDK ordering must hold.
+			if gotLoss > 0 {
+				if !(gotReconnect >= 1 && gotReconnect <= gotLoss) {
+					t.Errorf("reconnect_delay=%d violates 1<=rd<=loss=%d", gotReconnect, gotLoss)
+				}
+				if gotFastfail > gotLoss {
+					t.Errorf("fast_io_fail=%d exceeds loss=%d", gotFastfail, gotLoss)
+				}
+				if gotFastfail > 0 && gotReconnect > gotFastfail {
+					t.Errorf("reconnect_delay=%d exceeds fast_io_fail=%d", gotReconnect, gotFastfail)
+				}
+			}
+		})
+	}
+}
