@@ -753,13 +753,18 @@ func (e *Engine) ensureRaidBdev(spdkClient raidBdevManager, replicaBdevList []st
 			return err
 		}
 
+		// The File-exists from BdevRaidCreate is authoritative: a raid with this
+		// name is registered in the raid subsystem. We inspect it only to decide
+		// whether it can be adopted as-is. Crucially, a stale leftover raid is
+		// usually OFFLINE/degraded (e.g. a rebuild-teardown race left it missing a
+		// base bdev), and BdevRaidGet -> bdev_get_bdevs does NOT return an offline
+		// raid: it replies -19 "No such device" even though the name is taken. So
+		// a NoSuchDevice here must NOT be treated as "the raid raced away, just
+		// retry the create" -- that retry hits File-exists again and loops forever
+		// (the bug this replaces). Instead fall through to delete-and-rebuild: the
+		// raid exists, we just can't read its details, so it cannot be adopted.
 		existing, getErr := spdkClient.BdevRaidGet(e.Name, 0)
-		if getErr != nil {
-			if jsonrpc.IsJSONRPCRespErrorNoSuchDevice(getErr) {
-				// Raced away between the create and the get; just retry the create.
-				_, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, "", e.deltaBitmapEnabled)
-				return err
-			}
+		if getErr != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(getErr) {
 			return errors.Wrapf(getErr, "failed to inspect pre-existing raid bdev %v during engine creation", e.Name)
 		}
 

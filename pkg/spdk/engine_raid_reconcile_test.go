@@ -169,18 +169,35 @@ func (s *TestSuite) TestEnsureRaidBdevDeleteNoSuchDeviceProceedsToRebuild(c *C) 
 	c.Assert(f.createCalls, Equals, 2)
 }
 
-// EEXIST + the raid raced away between the create and the get (get returns
-// NoSuchDevice) => just retry the create, no delete.
-func (s *TestSuite) TestEnsureRaidBdevGetNoSuchDeviceRetriesCreate(c *C) {
+// Regression: EEXIST on create, but the leftover raid is OFFLINE/degraded, so
+// BdevRaidGet (bdev_get_bdevs) replies NoSuchDevice even though the name is
+// taken. The File-exists is authoritative -> we must DELETE the stale raid and
+// rebuild, NOT retry the create (the old behavior looped on EEXIST forever).
+func (s *TestSuite) TestEnsureRaidBdevOfflineLeftoverDeletedAndRebuilt(c *C) {
 	f := &fakeRaidBdevManager{
-		createErrs: []error{eexistErr(), nil},
-		getErr:     noSuchDeviceErr(),
+		createErrs: []error{eexistErr(), nil}, // first EEXIST, recreate ok after delete
+		getErr:     noSuchDeviceErr(),         // offline raid invisible to bdev_get_bdevs
 	}
 	e := newReconcileTestEngine()
 	c.Assert(e.ensureRaidBdev(f, []string{"r1"}), IsNil)
 	c.Assert(f.getCalls, Equals, 1)
-	c.Assert(f.deleteCalls, Equals, 0)
-	c.Assert(f.createCalls, Equals, 2)
+	c.Assert(f.deleteCalls, Equals, 1) // MUST delete the offline leftover...
+	c.Assert(f.createCalls, Equals, 2) // ...then rebuild
+}
+
+// If the offline leftover can't be deleted yet (base controller still stuck,
+// delete returns -110), surface the error so the next reconcile retries -- do
+// not loop silently on the create.
+func (s *TestSuite) TestEnsureRaidBdevOfflineLeftoverDeleteStuckReturnsError(c *C) {
+	f := &fakeRaidBdevManager{
+		createErrs: []error{eexistErr()},
+		getErr:     noSuchDeviceErr(),
+		deleteErr:  timeoutErr(),
+	}
+	e := newReconcileTestEngine()
+	c.Assert(e.ensureRaidBdev(f, []string{"r1"}), NotNil)
+	c.Assert(f.deleteCalls, Equals, 1)
+	c.Assert(f.createCalls, Equals, 1) // did NOT recreate over a still-present raid
 }
 
 // EEXIST + an unexpected error inspecting the raid => propagate, don't blindly
