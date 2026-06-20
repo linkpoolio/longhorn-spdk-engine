@@ -400,7 +400,7 @@ func (e *Engine) Create(spdkClient *spdkclient.Client, replicaAddressMap map[str
 	e.checkAndUpdateInfoFromReplicasNoLock()
 
 	e.log.Infof("Connected all available replicas %+v, then launching raid during engine creation", e.ReplicaStatusMap)
-	if _, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, "", e.deltaBitmapEnabled); err != nil {
+	if err := e.ensureRaidBdev(spdkClient, replicaBdevList); err != nil {
 		return nil, err
 	}
 
@@ -716,6 +716,106 @@ func (e *Engine) connectReplicas(spdkClient *spdkclient.Client, replicaAddressMa
 	return replicaBdevList
 }
 
+// raidBdevManager is the minimal slice of the SPDK client used by
+// ensureRaidBdev. It is an interface purely so the raid-reconcile orchestration
+// can be unit-tested with a fake; the production *spdkclient.Client satisfies it.
+type raidBdevManager interface {
+	BdevRaidCreate(name string, raidLevel spdktypes.BdevRaidLevel, stripSizeKb uint32, baseBdevs []string, uuid string, deltaBitmap bool) (bool, error)
+	BdevRaidGet(name string, timeout uint64) ([]spdktypes.BdevInfo, error)
+	BdevRaidDelete(name string) (bool, error)
+}
+
+// ensureRaidBdev creates the engine's raid1 bdev over the freshly connected
+// replica bdevs, tolerating a pre-existing raid left behind by an incomplete
+// teardown (the v2 rebuild-teardown race).
+//
+// When a teardown overlaps a replica rebuild, a wedged target subsystem and/or a
+// base bdev_nvme controller stuck in "deleting" can leave the raid bdev behind:
+// the best-effort Delete proceeds (the controller's detach returns -110 and is
+// treated as "peer gone"), but the raid is not actually removed, and no graceful
+// RPC can clear it until ctrl_loss_tmo finally dissolves the stuck controller.
+// Previously BdevRaidCreate then failed with EEXIST on every subsequent engine
+// (re)create, pinning the engine in stopped/desire=running indefinitely — the
+// only recovery was an instance-manager restart (which drops every volume the IM
+// hosts). Here we reconcile instead:
+//
+//   - if the existing raid is online and its base bdev set already matches the
+//     current replicas, adopt it as-is (no data-path disruption); otherwise
+//   - delete the stale raid and rebuild it over the current replicas.
+//
+// If the stale raid still cannot be deleted yet (its base controller is still
+// stuck "deleting"), the delete error is returned so the next engine reconcile
+// retries. Once ctrl_loss_tmo elapses the controller dies, the delete succeeds,
+// and the engine self-heals without an instance-manager restart.
+func (e *Engine) ensureRaidBdev(spdkClient raidBdevManager, replicaBdevList []string) error {
+	if _, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, "", e.deltaBitmapEnabled); err != nil {
+		if !jsonrpc.IsJSONRPCRespErrorFileExists(err) {
+			return err
+		}
+
+		existing, getErr := spdkClient.BdevRaidGet(e.Name, 0)
+		if getErr != nil {
+			if jsonrpc.IsJSONRPCRespErrorNoSuchDevice(getErr) {
+				// Raced away between the create and the get; just retry the create.
+				_, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, "", e.deltaBitmapEnabled)
+				return err
+			}
+			return errors.Wrapf(getErr, "failed to inspect pre-existing raid bdev %v during engine creation", e.Name)
+		}
+
+		if len(existing) > 0 && raidBaseBdevsMatch(&existing[0], replicaBdevList) {
+			e.log.Infof("Adopting pre-existing online raid bdev %v whose base bdevs already match the current replicas", e.Name)
+			return nil
+		}
+
+		e.log.Warnf("Raid bdev %v already exists but is stale (leftover from an incomplete teardown); deleting and rebuilding over the current replicas", e.Name)
+		if _, delErr := spdkClient.BdevRaidDelete(e.Name); delErr != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(delErr) {
+			return errors.Wrapf(delErr, "failed to delete stale raid bdev %v before rebuild during engine creation (will retry on next reconcile once the stuck base controller dissolves)", e.Name)
+		}
+		if _, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, "", e.deltaBitmapEnabled); err != nil {
+			return errors.Wrapf(err, "failed to rebuild raid bdev %v after deleting stale leftover during engine creation", e.Name)
+		}
+	}
+	return nil
+}
+
+// raidBaseBdevsMatch reports whether an existing raid bdev is online and its set
+// of base bdevs is exactly want (order-independent). Used to decide whether a
+// pre-existing raid can be adopted as-is rather than deleted and rebuilt.
+func raidBaseBdevsMatch(info *spdktypes.BdevInfo, want []string) bool {
+	if info == nil || info.DriverSpecific == nil || info.DriverSpecific.Raid == nil {
+		return false
+	}
+	raid := info.DriverSpecific.Raid
+	if !strings.EqualFold(raid.State, "online") {
+		return false
+	}
+	got := make([]string, 0, len(raid.BaseBdevsList))
+	for _, b := range raid.BaseBdevsList {
+		got = append(got, b.Name)
+	}
+	return equalStringSet(got, want)
+}
+
+// equalStringSet reports whether a and b contain the same multiset of strings,
+// independent of order.
+func equalStringSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	counts := make(map[string]int, len(a))
+	for _, s := range a {
+		counts[s]++
+	}
+	for _, s := range b {
+		counts[s]--
+		if counts[s] < 0 {
+			return false
+		}
+	}
+	return true
+}
+
 func (e *Engine) SetTargetListenerANAState(spdkClient *spdkclient.Client, anaState NvmeTCPANAState) error {
 	if e == nil {
 		return fmt.Errorf("engine is nil")
@@ -1028,20 +1128,27 @@ func (e *Engine) Delete(spdkClient *spdkclient.Client, superiorPortAllocator *co
 }
 
 func (e *Engine) disconnectReplicas(spdkClient *spdkclient.Client) (requireUpdate bool, err error) {
+	var firstErr error
 	for replicaName, replicaStatus := range e.ReplicaStatusMap {
-		if err := disconnectNVMfBdev(spdkClient, replicaStatus.BdevName, disconnectMaxRetries, disconnectRetryInterval); err != nil {
+		if dErr := disconnectNVMfBdev(spdkClient, replicaStatus.BdevName, disconnectMaxRetries, disconnectRetryInterval); dErr != nil {
 			if replicaStatus.Mode != types.ModeERR {
-				e.log.WithError(err).Errorf("Engine failed to disconnect replica %s with bdev %s during deletion, will update the mode from %v to ERR", replicaName, replicaStatus.BdevName, replicaStatus.Mode)
+				e.log.WithError(dErr).Errorf("Engine failed to disconnect replica %s with bdev %s during deletion, will update the mode from %v to ERR and continue with the remaining replicas", replicaName, replicaStatus.BdevName, replicaStatus.Mode)
 				replicaStatus.Mode = types.ModeERR
 				requireUpdate = true
 			}
-			return requireUpdate, err
+			// Best-effort: a single stuck replica must not strand the others.
+			// Continue disconnecting the rest and surface the first error to the
+			// caller (Delete treats it as best-effort).
+			if firstErr == nil {
+				firstErr = dErr
+			}
+			continue
 		}
 		delete(e.ReplicaStatusMap, replicaName)
 		requireUpdate = true
 	}
 
-	return requireUpdate, nil
+	return requireUpdate, firstErr
 }
 
 func (e *Engine) releasePorts(superiorPortAllocator *commonbitmap.Bitmap) error {
