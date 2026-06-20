@@ -1086,6 +1086,28 @@ func (e *Engine) Delete(spdkClient *spdkclient.Client, superiorPortAllocator *co
 		// timeouts. So proceed with deletion regardless — the orphaned
 		// subsystem is reclaimed when the instance-manager / spdk_tgt restarts.
 		// (Expand() intentionally keeps this fatal; only deletion is best-effort.)
+		//
+		// Containment for the teardown-deadlock churn: remove the listener FIRST,
+		// addressed by the (IP, port, transport) the engine already knows, before
+		// the StopExposeBdev below. StopExposeBdev derives the listener via
+		// nvmf_subsystem_get_listeners, which is itself a per-subsystem RPC that
+		// hangs (until the client timeout) on a wedged subsystem -- so it never
+		// reaches its own remove-listener step, leaving the listener up. While the
+		// listener is up, a dead/flapping EngineFrontend host reconnects through
+		// it (allow_any_host) and floods the target with keep-alive timeouts,
+		// which can escalate to wedge the whole IM. Dropping the listener here
+		// first means that even if the subsequent teardown hangs, the failing host
+		// can no longer reconnect and the churn stops. Best-effort and addressed
+		// directly (no get_listeners), so it does not depend on the wedged read;
+		// if it errors we fall through to StopExposeBdev exactly as before. The
+		// engine target listener is always TCP (see createNVMeTCPTarget).
+		if e.NvmeTcpTarget.IP != "" && e.NvmeTcpTarget.Port != 0 {
+			if _, err := spdkClient.NvmfSubsystemRemoveListener(e.NvmeTcpTarget.Nqn, e.NvmeTcpTarget.IP,
+				strconv.Itoa(int(e.NvmeTcpTarget.Port)), spdktypes.NvmeTransportTypeTCP,
+				spdkclient.DetectAddressFamily(e.NvmeTcpTarget.IP)); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
+				e.log.WithError(err).Warnf("Best-effort: failed to remove listener for engine %s before subsystem teardown; proceeding to StopExposeBdev", e.Name)
+			}
+		}
 		if err := spdkClient.StopExposeBdev(e.NvmeTcpTarget.Nqn); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
 			e.log.WithError(err).Warnf("Failed to stop exposing bdev for engine %s during deletion; proceeding so the engine can be removed (subsystem %s may leak until the instance-manager restarts)", e.Name, e.NvmeTcpTarget.Nqn)
 		}
