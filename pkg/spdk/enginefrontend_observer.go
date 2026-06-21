@@ -2,9 +2,9 @@ package spdk
 
 import (
 	"context"
+	"io"
 	"net"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -495,46 +495,37 @@ func (s *Server) reconcileOnce() {
 			continue
 		}
 
-		// Threshold met. Before tearing host state down, check whether a
-		// userspace consumer has /dev/longhorn/<vol> open or mounted.
-		// Heal recreates dm-linear and the device file, swapping the
-		// underlying NVMe namespace; any filesystem mounted on top sees
-		// its block device disappear and goes into shutdown. Skip heal
-		// while a consumer is using the device — the consumer's
-		// continuing I/O is the strongest evidence the probe is over-
-		// eager. If the consumer is genuinely broken it will surface
-		// errors and eventually release the device, at which point a
-		// later tick finds no consumer and heal runs safely.
+		// Threshold met. Heal recreates dm-linear and the device file, swapping
+		// the underlying NVMe namespace; a filesystem mounted on a LIVE device
+		// would see its block device disappear and go into shutdown — so we must
+		// NOT heal a volume that is genuinely serving I/O (a sustained false
+		// Error). The discriminator is the device's ACTUAL health right now, NOT
+		// whether it is mounted.
 		//
-		// The consumer device path MUST be derived from the record, not
-		// from live.Endpoint: this block is only reached when live.State
-		// is Error, and deriveLiveState only ever populates Endpoint for
-		// Running states — every Error arm leaves it empty. Keying the
-		// guard on live.Endpoint (as the original code did) made it dead
-		// code: the condition was never true at heal time, so heal tore
-		// down dm-linear + /dev/longhorn/<vol> WITHOUT ever checking for a
-		// mounted filesystem — exactly the partial-state case (e.g. a
-		// transiently-misprobed kernel controller while the device is up
-		// and mounted) where an over-eager heal corrupts a live volume.
-		// GetLonghornDevicePath is the same path the observer stats, and
-		// devicePathInUse tolerates a missing path (a genuinely-gone
-		// device simply has no mounts and heal proceeds).
+		// The previous guard (devicePathInUse, a substring scan of
+		// /host/proc/*/mountinfo) was presence-based and deferred heal FOREVER in
+		// the exact case we need to fix: after an IM rollout the EngineFrontend's
+		// kernel NVMe controller is gone and /dev/longhorn/<vol> is dead (EIO),
+		// but the consumer's STALE globalmount is still mounted, so the scan
+		// reported "live consumer on device" and skipped heal indefinitely (the
+		// mode-J EF-stale-positive — observed downing ~20 volumes after the
+		// .101/.102 rolls). A stale EIO mount is mounted but doing no successful
+		// I/O, so mount-presence is the wrong signal.
+		//
+		// Re-probe the device instead (conservative open + 1-byte read): if it is
+		// confirmed live (reads succeed), the Error was transient / it recovered,
+		// so defer — do not heal a live volume out from under its consumer. If it
+		// is dead or absent (heal is only reached after 3 sustained dead probes
+		// anyway), any mount on it is already a stale, fs-shutdown mount, so
+		// recreating the device corrupts nothing and IS the recovery — proceed.
 		if record.Frontend == types.FrontendSPDKTCPBlockdev {
 			devicePath := helperutil.GetLonghornDevicePath(record.VolumeName)
-			inUse, why, checkErr := devicePathInUse(devicePath)
-			if checkErr != nil {
-				logrus.WithError(checkErr).Warnf(
-					"EngineFrontend reconciler: failed to check consumer for %s; deferring heal",
-					record.Name)
-				continue
-			}
-			if inUse {
+			if deviceReadsLive(devicePath) {
 				logrus.WithFields(logrus.Fields{
 					"name":       record.Name,
 					"devicePath": devicePath,
 					"reason":     live.ErrorMsg,
-					"consumer":   why,
-				}).Warn("EngineFrontend reconciler: heal deferred — live consumer on device")
+				}).Warn("EngineFrontend reconciler: heal deferred — device reads live now (transient Error / recovered); not healing a live volume")
 				continue
 			}
 		}
@@ -571,54 +562,31 @@ func (s *Server) reconcileOnce() {
 	s.Unlock()
 }
 
-// devicePathInUse returns true if any process on the host has the given
-// device path open or has a filesystem mounted with it as the source.
-// Errors from individual probes are not fatal — we OR all signals; any
-// positive evidence of use returns true. The IM container has /host
-// bind-mounted from the node, so /host/proc and /host/proc/*/mountinfo
-// reflect the host's process state.
-func devicePathInUse(devicePath string) (bool, string, error) {
-	// Mount check: scan /host/proc/*/mountinfo. A process whose mount
-	// namespace has devicePath as a mount source means the device is
-	// actively serving a filesystem.
-	procDir := "/host/proc"
-	entries, err := os.ReadDir(procDir)
+// deviceReadsLive reports whether devPath is a present block device that can be
+// opened non-blocking AND returns data (or a clean EOF) on a 1-byte read — i.e.
+// it is genuinely serving I/O right now. A missing path, a non-device file, an
+// ENXIO/EIO (or any) open failure, or an EIO/ENXIO read all report false. It is
+// the inverse discriminator the heal guard needs: heal proceeds UNLESS the device
+// is confirmed live, so a stale EIO mount on a dead/absent backing (the mode-J
+// EF-stale-positive) no longer blocks heal, while a genuinely live volume (real
+// reads succeed) is never healed out from under its consumer. Mirrors the
+// conservative probe in suspendDeviceConfirmedDead, but as a positive
+// liveness check that also treats an absent device as not-live.
+func deviceReadsLive(devPath string) bool {
+	statInfo, err := os.Stat(devPath)
+	if err != nil || statInfo.Mode()&os.ModeDevice == 0 {
+		return false
+	}
+	f, err := os.OpenFile(devPath, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		return false, "", errors.Wrap(err, "devicePathInUse: read /host/proc")
+		return false
 	}
-	// Resolve the device to its canonical path before comparing — the
-	// probe path may be /dev/longhorn/<vol> (a dm-linear device) and
-	// mountinfo may report it as either /dev/longhorn/<vol> directly or
-	// as /dev/dm-N. Stat to follow the symlink if present, then we'll
-	// match on both forms.
-	canonical := devicePath
-	if resolved, resolveErr := filepath.EvalSymlinks(devicePath); resolveErr == nil {
-		canonical = resolved
+	defer func() { _ = f.Close() }()
+	buf := make([]byte, 1)
+	if _, readErr := f.Read(buf); readErr != nil && !errors.Is(readErr, io.EOF) {
+		return false
 	}
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		// Skip non-numeric pid entries cheaply.
-		if _, convErr := strconv.Atoi(e.Name()); convErr != nil {
-			continue
-		}
-		miPath := procDir + "/" + e.Name() + "/mountinfo"
-		data, readErr := os.ReadFile(miPath)
-		if readErr != nil {
-			// /proc entries can race — process exited mid-scan. Ignore.
-			continue
-		}
-		// mountinfo line format includes the mount source as field 10
-		// (1-indexed). Cheap substring check is sufficient — false
-		// positives are tolerable here (we'd just defer heal once more
-		// and recheck next tick).
-		text := string(data)
-		if strings.Contains(text, " "+devicePath+" ") || strings.Contains(text, " "+canonical+" ") {
-			return true, "mounted in pid " + e.Name(), nil
-		}
-	}
-	return false, "", nil
+	return true
 }
 
 // Heal drives an EngineFrontend whose host-side state has desynced from its

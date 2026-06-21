@@ -311,6 +311,28 @@ func (s *TestSuite) TestDmLinearIsLive(c *C) {
 	c.Check(dmLinearIsLive(filepath.Join(c.MkDir(), "absent")), Equals, false)
 }
 
+// deviceReadsLive is the heal-time discriminator that replaced the presence-based
+// devicePathInUse guard (which deferred heal forever on a stale EIO mount — the
+// mode-J EF-stale-positive). The reconciler heals UNLESS the device is confirmed
+// live, so this must return true ONLY for a present device that actually serves a
+// read, and false for absent / non-device / unreadable paths.
+func (s *TestSuite) TestDeviceReadsLive(c *C) {
+	fmt.Println("Testing deviceReadsLive: present readable device => true; missing / regular file => false")
+
+	// /dev/zero is a live char device that returns data on read in every linux
+	// test env — confirmed live, so heal would DEFER (don't touch a live volume).
+	c.Check(deviceReadsLive("/dev/zero"), Equals, true)
+
+	// A regular file is not a device (ModeDevice guard) — heal proceeds.
+	regular := filepath.Join(c.MkDir(), "not-a-device")
+	c.Assert(os.WriteFile(regular, []byte("x"), 0600), IsNil)
+	c.Check(deviceReadsLive(regular), Equals, false)
+
+	// A missing device path (e.g. /dev/longhorn/<vol> gone after rollout) is
+	// not live — heal proceeds to rebuild it.
+	c.Check(deviceReadsLive(filepath.Join(c.MkDir(), "absent")), Equals, false)
+}
+
 // Heal must not race a deletion: Delete closes stopCh and marks the EF
 // Terminating, and a heal firing in that window would resurrect host state
 // (kernel NVMe session, dm device) for a frontend the manager is tearing
