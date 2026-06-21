@@ -1108,6 +1108,24 @@ func (e *Engine) Delete(spdkClient *spdkclient.Client, superiorPortAllocator *co
 				e.log.WithError(err).Warnf("Best-effort: failed to remove listener for engine %s before subsystem teardown; proceeding to StopExposeBdev", e.Name)
 			}
 		}
+		// Prevention for the IM-wide teardown wedge: before deleting the target
+		// subsystem, cleanly disconnect this node's local initiator controller
+		// for THIS engine's target address. StopExposeBdev's nvmf_delete_subsystem
+		// must tear down any controller still connected to the subsystem, and a
+		// controller whose host vanished uncleanly (a dead/migrated EngineFrontend)
+		// becomes a ghost the target can never finish disconnecting -- so
+		// delete_subsystem (and every other per-subsystem RPC) hangs to the client
+		// timeout, permanently wedging the IM's RPC path until spdk_tgt restarts.
+		// Engine teardown runs as part of a controlled detach while the local
+		// controller is still live, so dropping it here -- a clean, host-initiated
+		// nvme disconnect, targeted by the exact ip:port so a re-homed EngineFrontend
+		// on a new address is never touched -- means no ghost can form and
+		// delete_subsystem completes. Host-side and best-effort: it cannot hang on
+		// the wedged RPC path, and on failure we fall through to StopExposeBdev as
+		// before.
+		if err := disconnectLocalTargetController(e.NvmeTcpTarget.Nqn, e.NvmeTcpTarget.IP, e.NvmeTcpTarget.Port); err != nil {
+			e.log.WithError(err).Warnf("Best-effort: failed to disconnect local target controller for engine %s before subsystem teardown; proceeding to StopExposeBdev", e.Name)
+		}
 		if err := spdkClient.StopExposeBdev(e.NvmeTcpTarget.Nqn); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
 			e.log.WithError(err).Warnf("Failed to stop exposing bdev for engine %s during deletion; proceeding so the engine can be removed (subsystem %s may leak until the instance-manager restarts)", e.Name, e.NvmeTcpTarget.Nqn)
 		}

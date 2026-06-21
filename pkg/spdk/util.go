@@ -450,3 +450,24 @@ func attemptTCPFallback(spdkClient *spdkclient.Client, controllerName, ip, port 
 	}
 	return list, net.JoinHostPort(ip, fallbackPort), nil
 }
+
+// disconnectLocalTargetController cleanly disconnects this node's local NVMe-oF
+// initiator controller (the co-located EngineFrontend's kernel connection) to a
+// specific engine target address (nqn + ip:port). It is targeted by the exact
+// ip:port, NOT the whole NQN: the volume NQN is stable across attaches, so a
+// disconnect-by-NQN (initiator.DisconnectTarget) would also drop a freshly
+// re-homed EngineFrontend that connected to a NEW target address for the same
+// volume. DisconnectController matches only the controller at this engine's
+// address and is a no-op when nothing is connected there. The work is host-side
+// (nvme list-subsys + nvme disconnect), so it does not touch -- and cannot hang
+// on -- a wedged spdk_tgt RPC path.
+func disconnectLocalTargetController(nqn, ip string, port int32) error {
+	if nqn == "" || ip == "" || port == 0 {
+		return nil
+	}
+	executor, err := engineNewExecutor(commontypes.ProcDirectory)
+	if err != nil {
+		return errors.Wrapf(err, "failed to create executor for local target controller disconnect")
+	}
+	return engineDisconnectController(nqn, ip, strconv.Itoa(int(port)), executor)
+}
