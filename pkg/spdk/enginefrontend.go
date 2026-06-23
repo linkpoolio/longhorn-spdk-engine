@@ -1506,6 +1506,18 @@ func (ef *EngineFrontend) prepareExpansion() (engineFrontendSuspended bool, err 
 		return false, fmt.Errorf("not support ublk frontend for expansion for engine %s", ef.Name)
 	case types.FrontendSPDKTCPBlockdev:
 		if ef.Endpoint != "" {
+			// Same dead-device guard as Suspend(): a dmsetup suspend on a
+			// confirmed-dead dm-linear blocks forever in the kernel (dm_suspend
+			// waits on in-flight I/O to a dead target), leaving an
+			// uninterruptible D-state task that wedges the IM. There is nothing
+			// to quiesce on a dead device, so skip the suspend and let the
+			// EngineFrontend observer fault/recover the device; the expansion
+			// proceeds (engine-side resize) without the wedging quiesce.
+			devPath := helperutil.GetLonghornDevicePath(ef.VolumeName)
+			if dead, reason := suspendDeviceConfirmedDead(devPath); dead {
+				ef.log.Warnf("Skipping expansion suspend for engine frontend: backing device %s confirmed dead (%s); a suspend would hang in D-state", devPath, reason)
+				return false, nil
+			}
 			ef.log.Info("Suspending engine frontend")
 			if err := ef.initiator.Suspend(false, false); err != nil {
 				return false, errors.Wrapf(err, "failed to suspend engine frontend %s", ef.Name)
@@ -1593,7 +1605,11 @@ func (ef *EngineFrontend) Suspend(_ *spdkclient.Client) (err error) {
 // false (NOT confirmed dead) for a missing path, a non-device file, or any
 // other/ambiguous error -- so a healthy or busy device is never mistaken for
 // dead and always takes the safe flushing suspend path.
-func suspendDeviceConfirmedDead(devPath string) (dead bool, reason string) {
+//
+// It is a package-level var so tests can override it to exercise the
+// dead-device skip paths (Suspend, prepareExpansion) without a real dead
+// block device.
+var suspendDeviceConfirmedDead = func(devPath string) (dead bool, reason string) {
 	statInfo, err := os.Stat(devPath)
 	if err != nil || statInfo.Mode()&os.ModeDevice == 0 {
 		return false, ""
