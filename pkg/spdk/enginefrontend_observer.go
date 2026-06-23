@@ -424,6 +424,27 @@ func (s *Server) reconcileEngineFrontends() {
 	}
 }
 
+// bumpDesyncCountLocked increments the consecutive-Error-probe counter for the
+// given EngineFrontend and returns the new count. The caller MUST hold s.Lock
+// (reconcileOnce calls it under s.Lock). Extracted from reconcileOnce so the
+// counter state machine is unit-testable without device probing.
+func (s *Server) bumpDesyncCountLocked(name string) int {
+	s.engineFrontendDesyncCounts[name]++
+	return s.engineFrontendDesyncCounts[name]
+}
+
+// clearDesyncCountLocked resets the consecutive-Error-probe counter for the
+// given EngineFrontend (called when a probe returns a non-Error state, i.e. the
+// EF recovered). The caller MUST hold s.Lock. Logs the recovery if a non-zero
+// counter was cleared.
+func (s *Server) clearDesyncCountLocked(name string) {
+	if s.engineFrontendDesyncCounts[name] > 0 {
+		logrus.Infof("EngineFrontend reconciler: %s recovered after %d transient probe failures",
+			name, s.engineFrontendDesyncCounts[name])
+		delete(s.engineFrontendDesyncCounts, name)
+	}
+}
+
 func (s *Server) reconcileOnce() {
 	if s.metadataDir == "" {
 		return
@@ -459,11 +480,7 @@ func (s *Server) reconcileOnce() {
 		// also non-Error.
 		if live.State != types.InstanceStateError {
 			s.Lock()
-			if s.engineFrontendDesyncCounts[record.Name] > 0 {
-				logrus.Infof("EngineFrontend reconciler: %s recovered after %d transient probe failures",
-					record.Name, s.engineFrontendDesyncCounts[record.Name])
-				delete(s.engineFrontendDesyncCounts, record.Name)
-			}
+			s.clearDesyncCountLocked(record.Name)
 			s.Unlock()
 			continue
 		}
@@ -476,8 +493,7 @@ func (s *Server) reconcileOnce() {
 		}
 
 		s.Lock()
-		s.engineFrontendDesyncCounts[record.Name]++
-		count := s.engineFrontendDesyncCounts[record.Name]
+		count := s.bumpDesyncCountLocked(record.Name)
 		s.Unlock()
 
 		// Below the threshold: log the desync but don't tear anything down.

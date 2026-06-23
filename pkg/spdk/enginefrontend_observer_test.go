@@ -363,3 +363,63 @@ func (s *TestSuite) TestEngineFrontendHealSkipsDuringDeletion(c *C) {
 	c.Assert(ef2.Heal(nil, record), IsNil)
 	c.Check(string(ef2.State), Equals, lhtypes.InstanceStateTerminating)
 }
+
+// TestDesyncCountStateMachine pins the reconcileOnce counter orchestration
+// without needing a real device or SPDK client: the consecutive-failure counter
+// increments on each Error probe, resets to zero on a non-Error (recovered)
+// probe, and only reaches the heal threshold (EngineFrontendHealConsecutiveFailures)
+// after that many CONSECUTIVE Error probes. This is the self-heal heart that the
+// piece tests (deriveLiveState, deviceReadsLive, Heal) don't cover end-to-end.
+func (s *TestSuite) TestDesyncCountStateMachine(c *C) {
+	srv := &Server{engineFrontendDesyncCounts: map[string]int{}}
+	const name = "ef-desync"
+
+	// bump/clear mirror what reconcileOnce does under s.Lock on each tick.
+	bump := func() int {
+		srv.Lock()
+		defer srv.Unlock()
+		return srv.bumpDesyncCountLocked(name)
+	}
+	clear := func() {
+		srv.Lock()
+		defer srv.Unlock()
+		srv.clearDesyncCountLocked(name)
+	}
+	// eligible mirrors reconcileOnce's heal gate: only heal once the
+	// consecutive-failure count has reached the threshold.
+	eligible := func(count int) bool { return count >= EngineFrontendHealConsecutiveFailures }
+
+	// Two consecutive Error probes: count 1 then 2 — both below the threshold,
+	// so reconcileOnce logs + defers (does not heal).
+	c.Assert(eligible(bump()), Equals, false) // count 1
+	c.Assert(eligible(bump()), Equals, false) // count 2
+
+	// A non-Error (recovered) probe resets the counter to zero.
+	clear()
+	srv.Lock()
+	c.Assert(srv.engineFrontendDesyncCounts[name], Equals, 0)
+	srv.Unlock()
+
+	// A flapping EF (Error, Error, Running, Error, ...) never reaches the
+	// threshold because each recovery zeros it.
+	c.Assert(eligible(bump()), Equals, false) // 1
+	c.Assert(eligible(bump()), Equals, false) // 2
+	clear()                                    // recovered -> 0
+	c.Assert(eligible(bump()), Equals, false) // 1 again (not 3)
+
+	// Three CONSECUTIVE Error probes (no recovery between) reach the threshold.
+	clear()
+	c.Assert(bump(), Equals, 1)
+	c.Assert(bump(), Equals, 2)
+	c.Assert(bump(), Equals, 3) // == EngineFrontendHealConsecutiveFailures
+	c.Assert(eligible(3), Equals, true)
+	// A 4th would still be eligible (reconcileOnce heals and resets after).
+	c.Assert(eligible(bump()), Equals, true) // 4
+
+	// Clearing an absent/zero counter is a no-op (no panic, no spurious log).
+	clear()
+	clear()
+	srv.Lock()
+	c.Assert(srv.engineFrontendDesyncCounts[name], Equals, 0)
+	srv.Unlock()
+}
