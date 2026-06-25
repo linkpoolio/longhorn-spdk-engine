@@ -236,11 +236,18 @@ func getHostID(executor *commonns.Executor) (string, error) {
 }
 
 func discovery(hostID, hostNQN, ip, port string, executor *commonns.Executor) ([]DiscoveryPageEntry, error) {
+	return discoveryWithTransport(hostID, hostNQN, DefaultTransportType, ip, port, executor)
+}
+
+func discoveryWithTransport(hostID, hostNQN, transportType, ip, port string, executor *commonns.Executor) ([]DiscoveryPageEntry, error) {
+	if transportType == "" {
+		transportType = DefaultTransportType
+	}
 	ip = spdkutil.NormalizeNvmeAddr(ip)
 
 	opts := []string{
 		"discover",
-		"-t", DefaultTransportType,
+		"-t", transportType,
 		// nvme-cli -a accepts bare IPv6 (no brackets). net.SplitHostPort callers
 		// upstream strip brackets; util.NormalizeNvmeAddr is a safety net.
 		"-a", ip,

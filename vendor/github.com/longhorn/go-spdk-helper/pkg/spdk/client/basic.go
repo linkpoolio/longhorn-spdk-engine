@@ -41,12 +41,19 @@ func (c *Client) BdevGetBdevs(name string, timeout uint64) (bdevInfoList []spdkt
 	return bdevInfoList, json.Unmarshal(cmdOutput, &bdevInfoList)
 }
 
-// BdevAioCreate constructs Linux AIO bdev.
-func (c *Client) BdevAioCreate(filePath, name string, blockSize uint64) (bdevName string, err error) {
+// BdevAioCreate constructs Linux AIO bdev. nowait sets RWF_NOWAIT on iocb
+// read/write submissions (not on fallocate/UNMAP, which uses a separate
+// synchronous path). Requires the backing filename to be a block device;
+// the SPDK side fails bdev create if passed on a regular file. SPDK v26.01
+// flipped the default from on to off (commit 3a396cb) to dodge a kernel
+// bug where io_getevents could return -EAGAIN infinitely on some kernels;
+// upstream Longhorn v1.11.x pins SPDK v25.09 where it is still default-on.
+func (c *Client) BdevAioCreate(filePath, name string, blockSize uint64, nowait bool) (bdevName string, err error) {
 	req := spdktypes.BdevAioCreateRequest{
 		Name:      name,
 		Filename:  filePath,
 		BlockSize: blockSize,
+		NoWait:    nowait,
 	}
 
 	// Long blob recovery time might be needed if the spdk_tgt is not shutdown gracefully.
@@ -777,7 +784,9 @@ func (c *Client) BdevLvolRename(oldName, newName string) (renamed bool, err erro
 //		"baseBdevs": Required. The bdev list used as the underlying disk of the RAID.
 //
 //	 	"uuid": Optional. Create the raid bdev with specific uuid
-func (c *Client) BdevRaidCreate(name string, raidLevel spdktypes.BdevRaidLevel, stripSizeKb uint32, baseBdevs []string, uuid string) (created bool, err error) {
+//
+//	 	"deltaBitmap": Optional. Enables per-base-bdev dirty-region tracking on raid1 so a disconnected base bdev rebuilds incrementally. Ignored for non-raid1 levels.
+func (c *Client) BdevRaidCreate(name string, raidLevel spdktypes.BdevRaidLevel, stripSizeKb uint32, baseBdevs []string, uuid string, deltaBitmap bool) (created bool, err error) {
 	if raidLevel != spdktypes.BdevRaidLevel0 && raidLevel != spdktypes.BdevRaidLevelRaid0 && raidLevel != spdktypes.BdevRaidLevel5f && raidLevel != spdktypes.BdevRaidLevelRaid5f {
 		stripSizeKb = 0
 	}
@@ -786,6 +795,7 @@ func (c *Client) BdevRaidCreate(name string, raidLevel spdktypes.BdevRaidLevel, 
 		RaidLevel:   raidLevel,
 		StripSizeKb: stripSizeKb,
 		BaseBdevs:   baseBdevs,
+		DeltaBitmap: deltaBitmap,
 	}
 
 	if uuid != "" {
@@ -936,6 +946,57 @@ func (c *Client) BdevRaidGrowBaseBdev(raidName, baseBdevName string) (growed boo
 	return growed, json.Unmarshal(cmdOutput, &growed)
 }
 
+// BdevRaidStopBaseBdevDeltaBitmap stops recording dirty regions for a faulty
+// base bdev and aggregates per-channel bitmaps into a single base_info bitmap
+// that can be retrieved via BdevRaidGetBaseBdevDeltaBitmap. SPDK briefly
+// quiesces the raid bdev during this call. The base bdev transitions to the
+// FAULTY_STOPPED state; further writes no longer dirty the bitmap. A 600s
+// poller inside SPDK will auto-clear faulty state if the bitmap is not
+// reclaimed in time — callers should pair this with a timely Get + Clear.
+func (c *Client) BdevRaidStopBaseBdevDeltaBitmap(baseBdevName string) (stopped bool, err error) {
+	req := spdktypes.BdevRaidBaseBdevDeltaBitmapRequest{BaseBdevName: baseBdevName}
+
+	cmdOutput, err := c.jsonCli.SendCommand("bdev_raid_stop_base_bdev_delta_bitmap", req)
+	if err != nil {
+		return false, err
+	}
+
+	return stopped, json.Unmarshal(cmdOutput, &stopped)
+}
+
+// BdevRaidGetBaseBdevDeltaBitmap returns the aggregated dirty-region bitmap
+// for a base bdev that has previously been stopped via
+// BdevRaidStopBaseBdevDeltaBitmap. The bitmap is base64-encoded (one bit per
+// region); RegionSize is in bytes. Bit i set means the i-th region is dirty
+// and must be re-copied during reconnect.
+func (c *Client) BdevRaidGetBaseBdevDeltaBitmap(baseBdevName string) (*spdktypes.BdevRaidBaseBdevDeltaBitmapResponse, error) {
+	req := spdktypes.BdevRaidBaseBdevDeltaBitmapRequest{BaseBdevName: baseBdevName}
+
+	cmdOutput, err := c.jsonCli.SendCommand("bdev_raid_get_base_bdev_delta_bitmap", req)
+	if err != nil {
+		return nil, err
+	}
+
+	resp := &spdktypes.BdevRaidBaseBdevDeltaBitmapResponse{}
+	return resp, json.Unmarshal(cmdOutput, resp)
+}
+
+// BdevRaidClearBaseBdevFaultyState clears the FAULTY/FAULTY_STOPPED state on
+// a base bdev, tearing down the aggregated bitmap. Callers should invoke
+// this once the bitmap has been persisted and the base bdev is ready to be
+// re-added (or, if the base bdev is permanently gone, to free the tracking
+// state). Returns true on success.
+func (c *Client) BdevRaidClearBaseBdevFaultyState(baseBdevName string) (cleared bool, err error) {
+	req := spdktypes.BdevRaidBaseBdevDeltaBitmapRequest{BaseBdevName: baseBdevName}
+
+	cmdOutput, err := c.jsonCli.SendCommand("bdev_raid_clear_base_bdev_faulty_state", req)
+	if err != nil {
+		return false, err
+	}
+
+	return cleared, json.Unmarshal(cmdOutput, &cleared)
+}
+
 // BdevNvmeAttachController constructs NVMe bdev.
 //
 //	"name": Name of the NVMe controller. And the corresponding bdev nvme name are same as the nvme namespace name, which is `{ControllerName}n1`
@@ -1060,12 +1121,20 @@ func (c *Client) BdevNvmeGetControllerHealthInfo(name string) (healthInfo spdkty
 //
 // "keepAliveTimeoutMs": Keep alive timeout in milliseconds.
 func (c *Client) BdevNvmeSetOptions(ctrlrLossTimeoutSec, reconnectDelaySec, fastIOFailTimeoutSec, transportAckTimeout, keepAliveTimeoutMs int32) (result bool, err error) {
+	return c.BdevNvmeSetOptionsWithTos(ctrlrLossTimeoutSec, reconnectDelaySec, fastIOFailTimeoutSec, transportAckTimeout, keepAliveTimeoutMs, 0)
+}
+
+// BdevNvmeSetOptionsWithTos extends BdevNvmeSetOptions with transport_tos,
+// used to tag outbound NVMe-oF packets (DSCP 26 = AF31 for PFC / RoCEv2
+// lossless traffic class).
+func (c *Client) BdevNvmeSetOptionsWithTos(ctrlrLossTimeoutSec, reconnectDelaySec, fastIOFailTimeoutSec, transportAckTimeout, keepAliveTimeoutMs, transportTos int32) (result bool, err error) {
 	req := spdktypes.BdevNvmeSetOptionsRequest{
 		CtrlrLossTimeoutSec:  ctrlrLossTimeoutSec,
 		ReconnectDelaySec:    reconnectDelaySec,
 		FastIOFailTimeoutSec: fastIOFailTimeoutSec,
 		TransportAckTimeout:  transportAckTimeout,
 		KeepAliveTimeoutMs:   keepAliveTimeoutMs,
+		TransportTos:         transportTos,
 	}
 
 	cmdOutput, err := c.jsonCli.SendCommand("bdev_nvme_set_options", req)
@@ -1109,15 +1178,24 @@ func (c *Client) BdevNvmeGet(name string, timeout uint64) (bdevNvmeInfoList []sp
 	return bdevNvmeInfoList, nil
 }
 
-// NvmfCreateTransport initializes an NVMe-oF transport with the given options.
+// NvmfCreateTransport initializes an NVMe-oF transport with only a trtype.
+// Kept as-is for backwards compat and for callers that want SPDK defaults.
 //
 //	"trtype": Required. Transport type, "tcp" or "rdma". "tcp" by default.
 func (c *Client) NvmfCreateTransport(trtype spdktypes.NvmeTransportType) (created bool, err error) {
 	if trtype == "" {
 		trtype = spdktypes.NvmeTransportTypeTCP
 	}
-	req := spdktypes.NvmfCreateTransportRequest{
-		Trtype: trtype,
+	return c.NvmfCreateTransportWithOpts(spdktypes.NvmfCreateTransportRequest{Trtype: trtype})
+}
+
+// NvmfCreateTransportWithOpts creates an NVMe-oF transport with fully
+// specified opts. Use this for RDMA to set data_wr_pool_size, num_shared_buffers,
+// buf_cache_size etc. — the SPDK defaults for those are pathological on high
+// throughput NICs.
+func (c *Client) NvmfCreateTransportWithOpts(req spdktypes.NvmfCreateTransportRequest) (created bool, err error) {
+	if req.Trtype == "" {
+		req.Trtype = spdktypes.NvmeTransportTypeTCP
 	}
 
 	cmdOutput, err := c.jsonCli.SendCommand("nvmf_create_transport", req)
@@ -1126,6 +1204,92 @@ func (c *Client) NvmfCreateTransport(trtype spdktypes.NvmeTransportType) (create
 	}
 
 	return created, json.Unmarshal(cmdOutput, &created)
+}
+
+// FrameworkStartInit tells spdk_tgt (started with --wait-for-rpc) to proceed
+// with subsystem initialisation. The paired pattern is:
+//
+//  1. spdk_tgt --wait-for-rpc starts and exposes the RPC socket but doesn't
+//     init subsystems
+//  2. caller sends iobuf_set_options / bdev_nvme_set_options / ... to tune
+//     anything that must be configured before init
+//  3. caller sends framework_start_init — spdk_tgt initialises subsystems
+//     with the tuned opts
+//
+// Without --wait-for-rpc this RPC is a no-op (subsystems are already up).
+func (c *Client) FrameworkStartInit() (result bool, err error) {
+	cmdOutput, err := c.jsonCli.SendCommand("framework_start_init", nil)
+	if err != nil {
+		return false, err
+	}
+	return result, json.Unmarshal(cmdOutput, &result)
+}
+
+// FrameworkWaitInit blocks until SPDK reports subsystem init is complete.
+// Useful after FrameworkStartInit so callers don't race disk/bdev creation
+// against subsystem init.
+func (c *Client) FrameworkWaitInit() (result bool, err error) {
+	cmdOutput, err := c.jsonCli.SendCommand("framework_wait_init", nil)
+	if err != nil {
+		return false, err
+	}
+	return result, json.Unmarshal(cmdOutput, &result)
+}
+
+// IobufSetOptions configures the global SPDK iobuf pool used by all subsystems
+// (accel, bdev, nvmf, etc). Must be called before any iobuf consumer
+// initialises its channels; otherwise returns "option not permitted" or
+// leaves consumers with empty caches.
+//
+// Default SPDK sizes (large_pool_count=1024, small_pool_count=8192) are not
+// enough once nvmf transport opts are tuned — a single nvmf transport with
+// num_shared_buffers=4095 + buf_cache_size=64 per poll group exceeds the
+// large pool and accel fails to create its channel with -ENOMEM.
+func (c *Client) IobufSetOptions(smallPoolCount, largePoolCount uint64, smallBufsizeKB, largeBufsizeKB uint32) (result bool, err error) {
+	req := map[string]interface{}{}
+	if smallPoolCount > 0 {
+		req["small_pool_count"] = smallPoolCount
+	}
+	if largePoolCount > 0 {
+		req["large_pool_count"] = largePoolCount
+	}
+	if smallBufsizeKB > 0 {
+		req["small_bufsize"] = smallBufsizeKB * 1024
+	}
+	if largeBufsizeKB > 0 {
+		req["large_bufsize"] = largeBufsizeKB * 1024
+	}
+	cmdOutput, err := c.jsonCli.SendCommand("iobuf_set_options", req)
+	if err != nil {
+		return false, err
+	}
+	return result, json.Unmarshal(cmdOutput, &result)
+}
+
+// Mlx5ScanAccelModule registers the accel_mlx5 driver and assigns ops (copy,
+// crc32c, etc) to it instead of the software fallback. Must be called during
+// the --wait-for-rpc window (before framework_start_init); SPDK rejects it
+// later with "Method may only be called before framework is initialized".
+//
+// Without this, NVMe-RDMA's UMR-per-IO path (cec5ba284) that "expects accel
+// to register UMR for the data buffer" falls through to sw_accel CPU memcpy,
+// which serializes on the reactor and adds significant per-op latency over
+// RDMA. With it, accel_mlx5 registers UMRs via libmlx5 direct verbs.
+//
+// numRequests sizes the per-device mkey pool. Default in SPDK is 2047 which
+// can fail with ENOMEM during signature-mkey alloc on some firmware. Pass
+// a smaller value (e.g. 256, must be >= cores * 16) when the default fails.
+// 0 means "use SPDK default".
+func (c *Client) Mlx5ScanAccelModule(numRequests uint32) (result bool, err error) {
+	req := map[string]interface{}{}
+	if numRequests > 0 {
+		req["num_requests"] = numRequests
+	}
+	cmdOutput, err := c.jsonCli.SendCommand("mlx5_scan_accel_module", req)
+	if err != nil {
+		return false, err
+	}
+	return result, json.Unmarshal(cmdOutput, &result)
 }
 
 // NvmfGetTransports lists all transports if no parameters specified.
