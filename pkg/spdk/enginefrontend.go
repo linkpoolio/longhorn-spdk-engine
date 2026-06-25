@@ -3,12 +3,15 @@ package spdk
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
+	"os"
 	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -21,6 +24,7 @@ import (
 	commonbitmap "github.com/longhorn/go-common-libs/bitmap"
 	spdkclient "github.com/longhorn/go-spdk-helper/pkg/spdk/client"
 	helpertypes "github.com/longhorn/go-spdk-helper/pkg/types"
+	helperutil "github.com/longhorn/go-spdk-helper/pkg/util"
 
 	"github.com/longhorn/longhorn-spdk-engine/pkg/client"
 	"github.com/longhorn/longhorn-spdk-engine/pkg/types"
@@ -1372,11 +1376,59 @@ func (ef *EngineFrontend) Suspend(_ *spdkclient.Client) (err error) {
 			return errors.Wrapf(err, "failed to create initiator for suspending engine %s", ef.Name)
 		}
 
-		return i.Suspend(false, false)
+		// Default: suspend with flush + fs-freeze for a clean quiesce of a live
+		// device. But if the backing dm-linear mapping is CONFIRMED DEAD, a
+		// flushing suspend blocks forever in the kernel waiting for I/O that can
+		// never complete, leaving an uninterruptible D-state task that wedges the
+		// IM container so kubelet cannot kill or restart it. On a dead device
+		// there is no valid in-flight I/O to preserve, so suspend without flush
+		// or fs-freeze to avoid the hang. The probe is conservative (non-blocking
+		// open + 1-byte read; confirmed dead ONLY on ENXIO/EIO), so a healthy or
+		// merely-busy device still takes the safe flushing path.
+		noflush, nolockfs := false, false
+		devPath := helperutil.GetLonghornDevicePath(ef.VolumeName)
+		if dead, reason := suspendDeviceConfirmedDead(devPath); dead {
+			ef.log.Warnf("Suspending engine frontend without flush: backing device %s confirmed dead (%s); a flushing suspend would hang in D-state", devPath, reason)
+			noflush, nolockfs = true, true
+		}
+
+		return i.Suspend(noflush, nolockfs)
 	default:
 		// TODO: support ublk frontend suspend
 		return errors.Wrapf(ErrEngineFrontendLifecycleUnimplemented, "suspend frontend %s is unimplemented", ef.Frontend)
 	}
+}
+
+// suspendDeviceConfirmedDead reports whether the longhorn block device at
+// devPath has a dead dm-linear mapping: a non-blocking open returns ENXIO (the
+// table is gone) or the first read returns EIO/ENXIO (mapping present but the
+// underlying target is dead). It is deliberately conservative -- it returns
+// false (NOT confirmed dead) for a missing path, a non-device file, or any
+// other/ambiguous error -- so a healthy or busy device is never mistaken for
+// dead and always takes the safe flushing suspend path.
+func suspendDeviceConfirmedDead(devPath string) (dead bool, reason string) {
+	statInfo, err := os.Stat(devPath)
+	if err != nil || statInfo.Mode()&os.ModeDevice == 0 {
+		return false, ""
+	}
+
+	f, err := os.OpenFile(devPath, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		if errors.Is(err, syscall.ENXIO) || errors.Is(err, syscall.EIO) {
+			return true, "open: " + err.Error()
+		}
+		return false, ""
+	}
+	defer func() { _ = f.Close() }()
+
+	buf := make([]byte, 1)
+	if _, readErr := f.Read(buf); readErr != nil && !errors.Is(readErr, io.EOF) {
+		if errors.Is(readErr, syscall.EIO) || errors.Is(readErr, syscall.ENXIO) {
+			return true, "read: " + readErr.Error()
+		}
+		return false, ""
+	}
+	return false, ""
 }
 
 // ResumeFrontend resumes the engine frontend. IO operations will be resumed.
