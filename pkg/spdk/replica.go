@@ -3903,8 +3903,21 @@ func (r *Replica) RebuildingDstSnapshotCreate(spdkClient *spdkclient.Client, sna
 		if r.rebuildingDstCache.rebuildingSnapshotMap[snapshotName] == nil {
 			return fmt.Errorf("cannot find snapshot %s in the rebuilding snapshot list for rebuilding dst replica %s snapshot creation", snapshotName, r.Name)
 		}
+		// Do NOT hard-fail on an ActualSize mismatch. Under range shallow copy the
+		// rebuilt dst snapshot legitimately allocates a different number of clusters
+		// than the src snapshot -- thick provisioning, clear_method=unmap, and
+		// range-copy hole handling all make the allocated (ActualSize) footprint
+		// diverge even when the data is identical. The same rebuild path already
+		// acknowledges this at RebuildingDstShallowCopyStart's progress correction
+		// ("totalClusters * defaultClusterSize may be different from ActualSize"),
+		// and the intact-snapshot reuse check trusts SnapshotChecksum as the real
+		// integrity proof, using ActualSize only as a cheap, non-fatal pre-filter.
+		// The authoritative guarantees here are the shallow-copy completion check
+		// and the per-snapshot checksum -- NOT ActualSize equality. Returning an
+		// error on mismatch makes any large rebuild whose dst footprint differs loop
+		// forever (it can never match), so log the discrepancy and proceed.
 		if r.rebuildingDstCache.rebuildingSnapshotMap[snapshotName].ActualSize != snapSvcLvol.ActualSize {
-			return fmt.Errorf("newly rebuilt snapshot %s(%s) actual size %d does not match the corresponding rebuilding src snapshot %s(%s) actual size %d during rebuilding dst replica %s snapshot creation", snapSvcLvol.Name, snapSvcLvol.UUID, snapSvcLvol.ActualSize, r.rebuildingDstCache.rebuildingSnapshotMap[snapshotName].Name, r.rebuildingDstCache.rebuildingSnapshotMap[snapshotName].UUID, r.rebuildingDstCache.rebuildingSnapshotMap[snapshotName].ActualSize, r.Name)
+			r.log.Warnf("Newly rebuilt snapshot %s(%s) actual size %d differs from the corresponding rebuilding src snapshot %s(%s) actual size %d during rebuilding dst replica %s snapshot creation; this is expected under range shallow copy (thick/unmap allocation differences) and integrity is covered by the shallow-copy completion check and snapshot checksum, so proceeding", snapSvcLvol.Name, snapSvcLvol.UUID, snapSvcLvol.ActualSize, r.rebuildingDstCache.rebuildingSnapshotMap[snapshotName].Name, r.rebuildingDstCache.rebuildingSnapshotMap[snapshotName].UUID, r.rebuildingDstCache.rebuildingSnapshotMap[snapshotName].ActualSize, r.Name)
 		}
 		r.log.Infof("Rebuilding dst replica created a new snapshot %s(%s) with xattars %+v for rebuilding dst", snapSvcLvol.Alias, snapSvcLvol.UUID, xattrs)
 	}

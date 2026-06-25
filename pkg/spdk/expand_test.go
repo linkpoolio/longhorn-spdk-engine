@@ -395,3 +395,55 @@ func (s *TestSuite) TestCreateSetsEngineIPForBlockdevFrontend(c *C) {
 	c.Assert(ef.NvmeTcpFrontend.TargetIP, Equals, "")
 	c.Assert(ef.getEngineServiceAddress(), Equals, "10.0.0.4:8504")
 }
+
+// TestPrepareExpansionSkipsSuspendOnDeadDevice proves prepareExpansion does
+// NOT issue the dmsetup suspend when the backing dm-linear is confirmed dead.
+// A suspend on a dead device blocks forever in the kernel (dm_suspend waiting
+// on in-flight I/O to a dead target), wedging the IM in D-state. The dead
+// path must short-circuit before touching ef.initiator (which is nil here), so
+// reaching Suspend would panic -- the assertion of a clean (false, nil) return
+// proves the skip.
+func (s *TestSuite) TestPrepareExpansionSkipsSuspendOnDeadDevice(c *C) {
+	ef := NewEngineFrontend("ef-expand-dead", "engine-a", "vol-a",
+		lhtypes.FrontendSPDKTCPBlockdev, 1048576, 0, 0, make(chan interface{}, 1))
+	ef.Endpoint = "/dev/longhorn/vol-a" // a set Endpoint is what gates the suspend branch
+	// ef.initiator is intentionally left nil: the dead-device skip must return
+	// before Suspend is called.
+
+	origProbe := suspendDeviceConfirmedDead
+	defer func() { suspendDeviceConfirmedDead = origProbe }()
+	suspendDeviceConfirmedDead = func(devPath string) (bool, string) {
+		c.Assert(devPath, Equals, "/dev/longhorn/vol-a")
+		return true, "test: device confirmed dead"
+	}
+
+	suspended, err := ef.prepareExpansion()
+	c.Assert(err, IsNil)
+	c.Assert(suspended, Equals, false) // not suspended -> expansion proceeds without the wedging quiesce
+}
+
+// TestPrepareExpansionSuspendsOnLiveDevice is the negative case: a live device
+// must still take the suspend path. The probe returns not-dead, so
+// prepareExpansion must reach ef.initiator.Suspend; with a nil initiator that
+// surfaces as a panic, which we recover and assert -- proving the dead branch
+// was NOT taken.
+func (s *TestSuite) TestPrepareExpansionSuspendsOnLiveDevice(c *C) {
+	ef := NewEngineFrontend("ef-expand-live", "engine-a", "vol-a",
+		lhtypes.FrontendSPDKTCPBlockdev, 1048576, 0, 0, make(chan interface{}, 1))
+	ef.Endpoint = "/dev/longhorn/vol-a"
+
+	origProbe := suspendDeviceConfirmedDead
+	defer func() { suspendDeviceConfirmedDead = origProbe }()
+	suspendDeviceConfirmedDead = func(_ string) (bool, string) { return false, "" }
+
+	reachedSuspend := false
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				reachedSuspend = true // nil initiator deref => the live path was taken
+			}
+		}()
+		ef.prepareExpansion()
+	}()
+	c.Assert(reachedSuspend, Equals, true)
+}

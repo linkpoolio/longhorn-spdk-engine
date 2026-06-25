@@ -63,7 +63,12 @@ func discoverAndConnectNVMeTarget(srcIP string, srcPort int32, maxRetries int, r
 	return subsystemNQN, controllerName, nil
 }
 
-func exposeSnapshotLvolBdev(spdkClient *spdkclient.Client, lvsName, lvolName, ip string, port int32, executor *commonns.Executor) (subsystemNQN, controllerName string, err error) {
+func exposeSnapshotLvolBdev(spdkClient *spdkclient.Client, lvsName, lvolName, ip string, port int32, transport NvmfTransportType, executor *commonns.Executor) (subsystemNQN, controllerName string, err error) {
+	if transport == "" {
+		transport = DefaultNvmfTransport
+	}
+	spdkTransport := transport.ToSPDKTransportType()
+
 	bdevLvolList, err := spdkClient.BdevLvolGet(spdktypes.GetLvolAlias(lvsName, lvolName), 0)
 	if err != nil {
 		return "", "", err
@@ -73,20 +78,21 @@ func exposeSnapshotLvolBdev(spdkClient *spdkclient.Client, lvsName, lvolName, ip
 	}
 
 	portStr := strconv.Itoa(int(port))
-	err = spdkClient.StartExposeBdev(helpertypes.GetNQN(lvolName), bdevLvolList[0].UUID, generateNGUID(lvolName), ip, portStr)
+	err = spdkClient.StartExposeBdevWithTransport(helpertypes.GetNQN(lvolName), bdevLvolList[0].UUID, generateNGUID(lvolName), ip, portStr, spdkTransport)
 	if err != nil {
 		return "", "", errors.Wrapf(err, "failed to expose snapshot lvol bdev %v", lvolName)
 	}
 
+	transportStr := string(transport)
 	for r := 0; r < maxRetries; r++ {
-		subsystemNQN, err = initiator.DiscoverTarget(ip, portStr, executor)
+		subsystemNQN, err = initiator.DiscoverTargetWithTransport(transportStr, ip, portStr, executor)
 		if err != nil {
 			logrus.WithError(err).Errorf("Failed to discover target for snapshot lvol bdev %v", lvolName)
 			time.Sleep(retryInterval)
 			continue
 		}
 
-		controllerName, err = initiator.ConnectTarget(ip, portStr, subsystemNQN, executor)
+		controllerName, err = initiator.ConnectTargetWithTransport(transportStr, ip, portStr, subsystemNQN, executor)
 		if err != nil {
 			logrus.WithError(err).Errorf("Failed to connect target for snapshot lvol bdev %v", lvolName)
 			time.Sleep(retryInterval)
@@ -156,7 +162,7 @@ func connectNVMfBdev(spdkClient *spdkclient.Client, controllerName, address stri
 				spdktypes.NvmeTransportTypeTCP,
 				adrfam,
 				int32(ctrlrLossTimeout),
-				replicaReconnectDelaySec,
+				int32(replicaReconnectDelaySec),
 				int32(fastIOFailTimeoutSec),
 				replicaMultipath,
 			)
@@ -192,11 +198,24 @@ func disconnectNVMfBdev(spdkClient *spdkclient.Client, bdevName string, maxRetri
 
 	controllerName := helperutil.GetNvmeControllerNameFromNamespaceName(bdevName)
 
+	peerGone := false
 	if err := retry.Do(
 		func() error {
 			_, err := spdkClient.BdevNvmeDetachController(controllerName)
 			if err != nil {
 				if jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
+					return nil
+				}
+				if jsonrpc.IsJSONRPCRespErrorConnectionTimeout(err) {
+					// -110 (ETIMEDOUT): the peer is unreachable/stalled, so the
+					// connection is already broken and the detach is effectively
+					// done. Stop retrying — it will not recover, retrying just
+					// blocks teardown for maxRetries*retryInterval (per replica,
+					// times rebuild concurrency), and a repeated detach against
+					// a dead peer can break the SPDK JSONRPC socket. Treat as
+					// gone and skip the confirm-wait below (we can't confirm
+					// namespace removal against an unreachable peer).
+					peerGone = true
 					return nil
 				}
 				return err
@@ -215,6 +234,11 @@ func disconnectNVMfBdev(spdkClient *spdkclient.Client, bdevName string, maxRetri
 		}),
 	); err != nil {
 		return err
+	}
+
+	if peerGone {
+		logrus.Warnf("NVMe bdev detach for controller=%s timed out against an unreachable peer; treating as detached and proceeding with cleanup", controllerName)
+		return nil
 	}
 
 	// BdevNvmeDetachController returning success only means SPDK accepted the detach
@@ -293,4 +317,157 @@ func ExtractBackingImageAndDiskUUID(lvolName string) (string, string, error) {
 	diskUUID := matches[2]
 
 	return backingImageName, diskUUID, nil
+}
+
+// connectNVMfBdevWithTransport attaches the remote lvol over the given
+// transport and returns the bdev name plus the address/transport actually
+// dialed. They differ from the inputs only when the legacy TCP fallback at
+// primary port+1 was attempted (see shouldAttemptLegacyTCPFallback); callers
+// must record the returned values (EngineReplicaStatus.DialedAddress /
+// .Transport) so dial-address validation compares against what was attached.
+func connectNVMfBdevWithTransport(spdkClient *spdkclient.Client, controllerName, address string, transport NvmfTransportType, ctrlrLossTimeout, fastIOFailTimeoutSec int, maxRetries int, retryInterval time.Duration, allowLegacyTCPFallback bool) (bdevName, dialedAddress string, dialedTransport NvmfTransportType, err error) {
+	return connectNVMfBdevWithReconnect(spdkClient, controllerName, address, transport, ctrlrLossTimeout, replicaReconnectDelaySec, fastIOFailTimeoutSec, maxRetries, retryInterval, allowLegacyTCPFallback)
+}
+
+// shouldAttemptLegacyTCPFallback reports whether a failed primary attach may
+// retry the replica's conventional TCP fallback listener at primary port+1.
+// Only legacy-convention RDMA dials qualify:
+//   - addresses derived from the explicit transport map must not fall back —
+//     the map is the source of truth and tcp_address+1 has no defined listener;
+//   - a legacy-convention TCP dial already targets the fallback listener at
+//     primary+1, so another +1 would point at an arbitrary port.
+func shouldAttemptLegacyTCPFallback(legacyConvention bool, transport NvmfTransportType) bool {
+	return legacyConvention && transport.IsRDMA()
+}
+
+func connectNVMfBdevWithReconnect(spdkClient *spdkclient.Client, controllerName, address string, transport NvmfTransportType, ctrlrLossTimeout, reconnectDelay, fastIOFailTimeoutSec int, maxRetries int, retryInterval time.Duration, allowLegacyTCPFallback bool) (bdevName, dialedAddress string, dialedTransport NvmfTransportType, err error) {
+	if controllerName == "" || address == "" {
+		return "", "", "", fmt.Errorf("controllerName or address is empty")
+	}
+
+	defer func() {
+		if err != nil {
+			if _, detachErr := spdkClient.BdevNvmeDetachController(controllerName); detachErr != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(detachErr) {
+				logrus.WithError(detachErr).Errorf("Failed to detach NVMe controller %s after failing at attaching it", controllerName)
+			}
+		}
+	}()
+
+	ip, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return "", "", "", err
+	}
+
+	// Blindly detach the controller in case of the previous replica connection is not cleaned up correctly
+	if _, err := spdkClient.BdevNvmeDetachController(controllerName); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
+		return "", "", "", err
+	}
+
+	dialedAddress = address
+	dialedTransport = transport
+
+	nvmeBdevNameList := []string{}
+	spdkTransport := transport.ToSPDKTransportType()
+	err = retry.Do(
+		func() error {
+			var err error
+			nvmeBdevNameList, err = spdkClient.BdevNvmeAttachController(
+				controllerName,
+				helpertypes.GetNQN(controllerName),
+				ip,
+				port,
+				spdkTransport,
+				spdktypes.NvmeAddressFamilyIPv4,
+				int32(ctrlrLossTimeout),
+				int32(reconnectDelay),
+				int32(fastIOFailTimeoutSec),
+				replicaMultipath,
+			)
+			return err
+		},
+		retry.Attempts(uint(maxRetries)),
+		retry.Delay(retryInterval),
+		retry.DelayType(retry.FixedDelay),
+		retry.LastErrorOnly(true),
+		retry.OnRetry(func(n uint, err error) {
+			logrus.WithError(err).Warnf(
+				"Retrying NVMe bdev attach: controller=%s address=%s transport=%s attempt=%d/%d next_wait=%s",
+				controllerName, address, transport, n+1, maxRetries, retryInterval,
+			)
+		}),
+	)
+
+	if err != nil {
+		if !shouldAttemptLegacyTCPFallback(allowLegacyTCPFallback, transport) {
+			return "", "", "", fmt.Errorf("attach NVMe controller failed after %d attempts: %w", maxRetries, err)
+		}
+		var fallbackAddress string
+		nvmeBdevNameList, fallbackAddress, err = attemptTCPFallback(spdkClient, controllerName, ip, port, ctrlrLossTimeout, reconnectDelay, fastIOFailTimeoutSec, transport, err)
+		if err != nil {
+			return "", "", "", fmt.Errorf("attach NVMe controller failed after %d attempts: %w", maxRetries, err)
+		}
+		dialedAddress = fallbackAddress
+		dialedTransport = NvmfTransportTCP
+	}
+
+	if len(nvmeBdevNameList) != 1 {
+		return "", "", "", fmt.Errorf("got zero or multiple results when attaching lvol %s with address %s as a NVMe bdev: %+v", controllerName, address, nvmeBdevNameList)
+	}
+
+	return nvmeBdevNameList[0], dialedAddress, dialedTransport, nil
+}
+
+func attemptTCPFallback(spdkClient *spdkclient.Client, controllerName, ip, port string, ctrlrLossTimeout, reconnectDelay, fastIOFailTimeoutSec int, originalTransport NvmfTransportType, primaryErr error) ([]string, string, error) {
+	primaryPort, parseErr := strconv.Atoi(port)
+	if parseErr != nil {
+		return nil, "", primaryErr
+	}
+	fallbackPort := strconv.Itoa(primaryPort + 1)
+
+	if _, detachErr := spdkClient.BdevNvmeDetachController(controllerName); detachErr != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(detachErr) {
+		return nil, "", primaryErr
+	}
+
+	logrus.WithError(primaryErr).Warnf(
+		"Primary NVMe attach failed (controller=%s transport=%s address=%s:%s); trying TCP fallback on %s:%s",
+		controllerName, originalTransport, ip, port, ip, fallbackPort,
+	)
+
+	list, err := spdkClient.BdevNvmeAttachController(
+		controllerName,
+		helpertypes.GetNQN(controllerName),
+		ip,
+		fallbackPort,
+		spdktypes.NvmeTransportTypeTCP,
+		spdktypes.NvmeAddressFamilyIPv4,
+		int32(ctrlrLossTimeout),
+		int32(reconnectDelay),
+		int32(fastIOFailTimeoutSec),
+		replicaMultipath,
+	)
+	if err != nil {
+		return nil, "", fmt.Errorf("primary attach failed (%v) and TCP fallback to %s:%s also failed: %w", primaryErr, ip, fallbackPort, err)
+	}
+	return list, net.JoinHostPort(ip, fallbackPort), nil
+}
+
+// disconnectLocalTargetController cleanly disconnects this node's local NVMe-oF
+// initiator controller (the co-located EngineFrontend's kernel connection) to a
+// specific engine target address (nqn + ip:port). It is targeted by the exact
+// ip:port, NOT the whole NQN: the volume NQN is stable across attaches, so a
+// disconnect-by-NQN (initiator.DisconnectTarget) would also drop a freshly
+// re-homed EngineFrontend that connected to a NEW target address for the same
+// volume. DisconnectController matches only the controller at this engine's
+// address and is a no-op when nothing is connected there. The work is host-side
+// (nvme list-subsys + nvme disconnect), so it does not touch -- and cannot hang
+// on -- a wedged spdk_tgt RPC path.
+func disconnectLocalTargetController(nqn, ip string, port int32) error {
+	if nqn == "" || ip == "" || port == 0 {
+		return nil
+	}
+	executor, err := engineNewExecutor(commontypes.ProcDirectory)
+	if err != nil {
+		return errors.Wrapf(err, "failed to create executor for local target controller disconnect")
+	}
+	return engineDisconnectController(nqn, ip, strconv.Itoa(int(port)), executor)
 }

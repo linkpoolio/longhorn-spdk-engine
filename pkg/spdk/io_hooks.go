@@ -70,6 +70,14 @@ var (
 	backingImageExposeSnapshotLvolBdev       = exposeSnapshotLvolBdev
 	backingImageStopExposeBdev               = func(cli *spdkclient.Client, nqn string) error { return cli.StopExposeBdev(nqn) }
 	backingImageDiscoverAndConnectNVMeTarget = discoverAndConnectNVMeTarget
+
+	// Seams for disconnectLocalTargetController (engine teardown wedge
+	// prevention). engineDisconnectController is addressed by an exact
+	// (nqn, ip, port) -- deliberately NOT initiator.DisconnectTarget, which
+	// would broadcast-disconnect every controller on the (stable) volume NQN
+	// and so could drop a freshly re-homed EngineFrontend.
+	engineNewExecutor          = helperutil.NewExecutor
+	engineDisconnectController = initiator.DisconnectController
 )
 
 var _ backingImageServiceClient = (*lhclient.SPDKClient)(nil)

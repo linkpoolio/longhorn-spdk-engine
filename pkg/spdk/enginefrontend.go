@@ -3,12 +3,15 @@ package spdk
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
+	"os"
 	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -16,11 +19,13 @@ import (
 	"go.uber.org/multierr"
 
 	"github.com/longhorn/go-spdk-helper/pkg/initiator"
+	"github.com/longhorn/go-spdk-helper/pkg/jsonrpc"
 	"github.com/longhorn/types/pkg/generated/spdkrpc"
 
 	commonbitmap "github.com/longhorn/go-common-libs/bitmap"
 	spdkclient "github.com/longhorn/go-spdk-helper/pkg/spdk/client"
 	helpertypes "github.com/longhorn/go-spdk-helper/pkg/types"
+	helperutil "github.com/longhorn/go-spdk-helper/pkg/util"
 
 	"github.com/longhorn/longhorn-spdk-engine/pkg/client"
 	"github.com/longhorn/longhorn-spdk-engine/pkg/types"
@@ -70,6 +75,13 @@ type EngineFrontend struct {
 	lastExpansionFailedAt string
 	lastExpansionError    string
 
+	// consecutiveValidationFailures counts back-to-back ValidateAndUpdate
+	// failures. The frontend is only marked Error after
+	// maxConsecutiveValidationFailures of them, so a transient host-level
+	// glitch (e.g. the kernel NVMe device list churning while a sibling
+	// volume detaches) does not fault a healthy volume.
+	consecutiveValidationFailures int
+
 	// UpdateCh should not be protected by the engine lock
 	UpdateCh chan interface{}
 
@@ -97,14 +109,20 @@ type EngineFrontend struct {
 	setRemoteEngineTargetANAStateFn func(targetIP, engineName string, anaState NvmeTCPANAState) error
 	// Test hook for waiting for an NVMe-TCP controller to reach live state.
 	waitForNvmeTCPControllerLiveFn func(transportAddress string, transportPort int32) error
+	// Test hook for explicit RDMA controller disconnect during switchover.
+	teardownRemoteRDMAPathFn func(nqn, targetIP, targetPort string) error
+	// Test hook for remote SPDK listener removal during switchover.
+	removeRemoteTargetListenerFn func(targetIP, engineName string, transport NvmfTransportType) error
+	// Test hook for observing the transport of the kernel controller
+	// connected to a path (the remote listener's trtype as seen locally).
+	// Returns (transport, true) when observed; (_, false) when unobservable.
+	observePathTransportFn func(nqn, targetIP, targetPort string) (NvmfTransportType, bool)
 
 	// metadataDir is the base path for persisting engine frontend records.
 	// If empty, persistence is disabled.
 	metadataDir string
 
 	log *safelog.SafeLogger
-
-	newServiceClient ServiceClientFactory
 }
 
 type NvmeTcpFrontend struct {
@@ -113,6 +131,14 @@ type NvmeTcpFrontend struct {
 
 	Nqn   string
 	Nguid string
+
+	// Transport is the NVMe-oF transport of the engine target this frontend
+	// dials, propagated to each NvmeTCPPath. Set from the engine target's
+	// actual transport (engineFrontendTargetTransport — TCP today, the kernel
+	// initiator connects over nvme-tcp), NOT from the node's negotiated
+	// transport. RDMA-specific teardown at switchover keys on the transport
+	// observed on the live controller, with this tag as the fallback.
+	Transport NvmfTransportType
 }
 
 type NvmeTCPANAState string
@@ -137,6 +163,14 @@ const (
 	// to the recovery path — normal creation and switchover paths use the
 	// full retry loop in the initiator package.
 	recoveryTargetReachabilityTimeout = 5 * time.Second
+
+	// maxConsecutiveValidationFailures is how many back-to-back
+	// ValidateAndUpdate failures are tolerated before the engine frontend is
+	// marked Error. At the server's 3s verify cadence this gives ~6s of grace
+	// for transient host-level glitches (kernel NVMe device churn while a
+	// sibling volume detaches) without materially delaying detection of real
+	// failures, which persist across ticks.
+	maxConsecutiveValidationFailures = 3
 )
 
 type NvmeTCPPath struct {
@@ -146,6 +180,10 @@ type NvmeTCPPath struct {
 	Nqn        string
 	Nguid      string
 	ANAState   NvmeTCPANAState
+
+	// TCP relies on ctrl-loss-tmo for passive cleanup; RDMA needs an
+	// explicit disconnect or the HCA keeps the QP in error state.
+	Transport NvmfTransportType
 }
 
 type UblkFrontend struct {
@@ -188,11 +226,7 @@ func getUblkNumberOfQueue(ublkNumberOfQueue int32) int32 {
 }
 
 func NewEngineFrontend(engineFrontendName, engineName, volumeName, frontend string, specSize uint64, ublkQueueDepth, ublkNumberOfQueue int32,
-	engineFrontendUpdateCh chan interface{}, newServiceClient ServiceClientFactory) *EngineFrontend {
-	if newServiceClient == nil {
-		newServiceClient = GetServiceClient
-	}
-
+	engineFrontendUpdateCh chan interface{}) *EngineFrontend {
 	log := logrus.StandardLogger().WithFields(logrus.Fields{
 		"engineFrontendName": engineFrontendName,
 		"engineName":         engineName,
@@ -240,8 +274,6 @@ func NewEngineFrontend(engineFrontendName, engineName, volumeName, frontend stri
 		UpdateCh: engineFrontendUpdateCh,
 		stopCh:   make(chan struct{}),
 		log:      safelog.NewSafeLogger(log),
-
-		newServiceClient: newServiceClient,
 	}
 }
 
@@ -291,12 +323,15 @@ func (ef *EngineFrontend) clearNVMeTCPPathsLocked() {
 	ef.PreferredPath = ""
 }
 
-func (ef *EngineFrontend) upsertNVMeTCPPathLocked(targetIP string, targetPort int32, engineName, nqn, nguid string, anaState NvmeTCPANAState) string {
+func (ef *EngineFrontend) upsertNVMeTCPPathLocked(targetIP string, targetPort int32, engineName, nqn, nguid string, anaState NvmeTCPANAState, transport NvmfTransportType) string {
 	ef.ensureVolumeTargetIdentityLocked()
 
 	address := getNvmeTCPPathAddress(targetIP, targetPort)
 	if address == "" {
 		return ""
+	}
+	if transport == "" {
+		transport = DefaultNvmfTransport
 	}
 
 	path := ef.NvmeTCPPathMap[address]
@@ -310,6 +345,7 @@ func (ef *EngineFrontend) upsertNVMeTCPPathLocked(targetIP string, targetPort in
 	path.Nqn = nqn
 	path.Nguid = nguid
 	path.ANAState = anaState
+	path.Transport = transport
 
 	return address
 }
@@ -389,7 +425,8 @@ func (ef *EngineFrontend) syncCurrentNVMeTCPPathLocked() {
 	}
 
 	ef.upsertNVMeTCPPathLocked(ef.NvmeTcpFrontend.TargetIP, ef.NvmeTcpFrontend.TargetPort,
-		ef.EngineName, ef.NvmeTcpFrontend.Nqn, ef.NvmeTcpFrontend.Nguid, NvmeTCPANAStateOptimized)
+		ef.EngineName, ef.NvmeTcpFrontend.Nqn, ef.NvmeTcpFrontend.Nguid, NvmeTCPANAStateOptimized,
+		ef.NvmeTcpFrontend.Transport)
 	ef.promoteNVMeTCPPathLocked(address)
 }
 
@@ -403,7 +440,7 @@ func (ef *EngineFrontend) setRemoteEngineTargetANAState(targetIP, engineName str
 	}
 
 	engineAddress := net.JoinHostPort(targetIP, strconv.Itoa(types.SPDKServicePort))
-	engineClient, err := ef.newServiceClient(engineAddress)
+	engineClient, err := GetServiceClient(engineAddress)
 	if err != nil {
 		return errors.Wrapf(err, "failed to get SPDK client for engine %s at %s", engineName, engineAddress)
 	}
@@ -520,6 +557,21 @@ func (ef *EngineFrontend) syncRemoteEngineTargetANAStates(oldTargetIP, oldEngine
 		}
 	}
 
+	// RDMA QPs must be torn down explicitly — a dangling QP in error
+	// state occupies the HCA's QP table until both the initiator
+	// disconnects and the target releases the listener. TCP controllers
+	// are left to ctrl-loss-tmo. Best-effort: a failure here leaks a QP
+	// but must not abort the switchover, which has already demoted the old
+	// path to inaccessible.
+	if oldEngineName != newEngineName || oldTargetIP != newTargetIP {
+		if err := ef.teardownRemoteRDMAPathIfNeeded(oldTargetIP, oldEngineName); err != nil {
+			ef.log.WithError(err).WithFields(logrus.Fields{
+				"oldEngineName": oldEngineName,
+				"oldTargetIP":   oldTargetIP,
+			}).Warn("Best-effort RDMA teardown failed; continuing switchover")
+		}
+	}
+
 	// Phase 3: Promote new path to optimized.
 	if err := ef.setRemoteEngineTargetANAState(newTargetIP, newEngineName, NvmeTCPANAStateOptimized); err != nil {
 		syncErr = multierr.Append(syncErr, err)
@@ -534,6 +586,139 @@ func (ef *EngineFrontend) syncRemoteEngineTargetANAStates(oldTargetIP, oldEngine
 
 func isSubsystemNotFoundError(err error) bool {
 	return err != nil && strings.Contains(strings.ToLower(err.Error()), "unable to find subsystem")
+}
+
+// teardownRemoteRDMAPathIfNeeded releases the old RDMA path during switchover:
+// it removes the remote target's RDMA listener and disconnects the local
+// initiator controller, freeing the HCA queue pair that an ANA-inaccessible
+// transition alone leaves pinned. It is a no-op when the old path is not RDMA
+// (TCP controllers are reclaimed by ctrl-loss-tmo; force-disconnecting them
+// would leave an ANA rollback after a phase-3 failure with no path).
+//
+// Whether the old path is RDMA is decided by the transport observed on the
+// kernel controller connected to that listener (its trtype), falling back to
+// the recorded path tag when the controller is unobservable. The recorded tag
+// is derived from the engine target's transport at create time (TCP today)
+// and can be stale for legacy targets that exposed an RDMA listener — those
+// must still get the explicit RDMA teardown.
+func (ef *EngineFrontend) teardownRemoteRDMAPathIfNeeded(oldTargetIP, oldEngineName string) error {
+	if oldTargetIP == "" {
+		return nil
+	}
+
+	ef.RLock()
+	var (
+		matchedPort       int32
+		matchedNQN        string
+		recordedTransport NvmfTransportType
+		found             bool
+	)
+	for _, path := range ef.NvmeTCPPathMap {
+		if path == nil {
+			continue
+		}
+		if path.TargetIP == oldTargetIP {
+			matchedPort = path.TargetPort
+			matchedNQN = path.Nqn
+			recordedTransport = path.Transport
+			found = true
+			break
+		}
+	}
+	ef.RUnlock()
+
+	if !found {
+		return nil
+	}
+
+	portStr := strconv.Itoa(int(matchedPort))
+
+	isRDMA := recordedTransport.IsRDMA()
+	if observedTransport, observed := ef.observePathTransport(matchedNQN, oldTargetIP, portStr); observed {
+		isRDMA = observedTransport.IsRDMA()
+	}
+	if !isRDMA {
+		// TCP-observed path: leave the old controller to ctrl-loss-tmo.
+		return nil
+	}
+
+	var combinedErr error
+	if err := ef.removeRemoteTargetListener(oldTargetIP, oldEngineName, NvmfTransportRDMA); err != nil {
+		combinedErr = multierr.Append(combinedErr, errors.Wrap(err, "remove remote target listener"))
+	}
+
+	ef.log.WithFields(logrus.Fields{
+		"oldTargetIP":   oldTargetIP,
+		"oldTargetPort": matchedPort,
+		"nqn":           matchedNQN,
+	}).Info("Explicitly disconnecting old RDMA path to release HCA queue pair")
+
+	var disconnectErr error
+	if ef.teardownRemoteRDMAPathFn != nil {
+		disconnectErr = ef.teardownRemoteRDMAPathFn(matchedNQN, oldTargetIP, portStr)
+	} else if ef.initiator != nil {
+		disconnectErr = initiator.DisconnectController(matchedNQN, oldTargetIP, portStr, ef.initiator.GetExecutor())
+	}
+	if disconnectErr != nil {
+		combinedErr = multierr.Append(combinedErr, errors.Wrap(disconnectErr, "initiator disconnect"))
+	}
+
+	return combinedErr
+}
+
+// observePathTransport reports the transport of the kernel NVMe controller
+// connected to the given listener (i.e. the remote listener's trtype as the
+// connected initiator sees it). Returns false when the controller cannot be
+// observed (already disconnected, no initiator, transient nvme-cli failure);
+// callers then fall back to the recorded path tag.
+func (ef *EngineFrontend) observePathTransport(nqn, targetIP, targetPort string) (NvmfTransportType, bool) {
+	if ef.observePathTransportFn != nil {
+		return ef.observePathTransportFn(nqn, targetIP, targetPort)
+	}
+	if ef.initiator == nil || nqn == "" {
+		return "", false
+	}
+	devices, err := initiator.GetDevices(targetIP, targetPort, nqn, ef.initiator.GetExecutor())
+	if err != nil {
+		ef.log.WithError(err).Debugf("Failed to observe controller transport for nqn %s at %s:%s", nqn, targetIP, targetPort)
+		return "", false
+	}
+	for _, d := range devices {
+		for _, ctrl := range d.Controllers {
+			controllerIP, controllerPort := initiator.GetIPAndPortFromControllerAddress(ctrl.Address)
+			if controllerIP != targetIP || controllerPort != targetPort {
+				continue
+			}
+			if ctrl.Transport == "" {
+				continue
+			}
+			return NvmfTransportType(strings.ToLower(ctrl.Transport)), true
+		}
+	}
+	return "", false
+}
+
+// removeRemoteTargetListener asks the (possibly remote) engine SPDK service to
+// remove its target listener for the given transport.
+func (ef *EngineFrontend) removeRemoteTargetListener(targetIP, engineName string, transport NvmfTransportType) error {
+	if targetIP == "" || engineName == "" {
+		return nil
+	}
+	if ef.removeRemoteTargetListenerFn != nil {
+		return ef.removeRemoteTargetListenerFn(targetIP, engineName, transport)
+	}
+
+	engineAddress := net.JoinHostPort(targetIP, strconv.Itoa(types.SPDKServicePort))
+	engineClient, err := GetServiceClient(engineAddress)
+	if err != nil {
+		return errors.Wrapf(err, "failed to get SPDK client for engine %s at %s", engineName, engineAddress)
+	}
+	defer func() {
+		if errClose := engineClient.Close(); errClose != nil {
+			ef.log.WithError(errClose).Warnf("Failed to close engine SPDK client for listener removal on engine %s", engineName)
+		}
+	}()
+	return engineClient.EngineRemoveTargetListener(engineName, string(transport))
 }
 
 func (ef *EngineFrontend) syncRemoteEngineTargetANAStatesWithRetry(oldEngineName, newEngineName string, oldTargetIP string, oldTargetPort int32, targetIP string, targetPort int32) error {
@@ -748,7 +933,7 @@ func (ef *EngineFrontend) Delete(spdkClient *spdkclient.Client) (err error) {
 	ef.log.WithField("hasInitiator", ef.initiator != nil).Info("Deleting engine frontend")
 
 	if ef.initiator != nil {
-		if _, err := ef.initiator.Stop(spdkClient, true, false, false); err != nil {
+		if _, err := ef.initiator.Stop(spdkClient, true, true, true); err != nil {
 			return err
 		}
 		ef.initiator = nil
@@ -965,6 +1150,7 @@ func (ef *EngineFrontend) getProtoNvmeTCPPathsWithoutLock() []*spdkrpc.EngineFro
 			Nqn:        path.Nqn,
 			Nguid:      path.Nguid,
 			AnaState:   string(path.ANAState),
+			Transport:  string(path.Transport),
 		})
 	}
 
@@ -1101,7 +1287,7 @@ func (ef *EngineFrontend) Expand(ctx context.Context, spdkClient *spdkclient.Cli
 		targetAddress = net.JoinHostPort(ef.NvmeTcpFrontend.TargetIP, strconv.Itoa(int(ef.NvmeTcpFrontend.TargetPort)))
 	}
 
-	engineSpdkClient, err := ef.newServiceClient(ef.getEngineServiceAddress())
+	engineSpdkClient, err := GetServiceClient(ef.getEngineServiceAddress())
 	if err != nil {
 		ef.Unlock()
 		return errors.Wrapf(err, "failed to get SPDK client to expand engine frontend %v", ef.Name)
@@ -1320,6 +1506,18 @@ func (ef *EngineFrontend) prepareExpansion() (engineFrontendSuspended bool, err 
 		return false, fmt.Errorf("not support ublk frontend for expansion for engine %s", ef.Name)
 	case types.FrontendSPDKTCPBlockdev:
 		if ef.Endpoint != "" {
+			// Same dead-device guard as Suspend(): a dmsetup suspend on a
+			// confirmed-dead dm-linear blocks forever in the kernel (dm_suspend
+			// waits on in-flight I/O to a dead target), leaving an
+			// uninterruptible D-state task that wedges the IM. There is nothing
+			// to quiesce on a dead device, so skip the suspend and let the
+			// EngineFrontend observer fault/recover the device; the expansion
+			// proceeds (engine-side resize) without the wedging quiesce.
+			devPath := helperutil.GetLonghornDevicePath(ef.VolumeName)
+			if dead, reason := suspendDeviceConfirmedDead(devPath); dead {
+				ef.log.Warnf("Skipping expansion suspend for engine frontend: backing device %s confirmed dead (%s); a suspend would hang in D-state", devPath, reason)
+				return false, nil
+			}
 			ef.log.Info("Suspending engine frontend")
 			if err := ef.initiator.Suspend(false, false); err != nil {
 				return false, errors.Wrapf(err, "failed to suspend engine frontend %s", ef.Name)
@@ -1372,11 +1570,68 @@ func (ef *EngineFrontend) Suspend(_ *spdkclient.Client) (err error) {
 			return errors.Wrapf(err, "failed to create initiator for suspending engine %s", ef.Name)
 		}
 
+		// Default: suspend with flush + fs-freeze for a clean quiesce of a live
+		// device. But if the backing dm-linear mapping is CONFIRMED DEAD, a
+		// suspend blocks forever in the kernel (dm_suspend) waiting for in-flight
+		// I/O to a target that can never complete it, leaving an uninterruptible
+		// D-state task that wedges the IM container so kubelet cannot kill or
+		// restart it. --noflush/--nolockfs does NOT avoid this: dm_suspend still
+		// waits on already-dispatched I/O, so a noflush suspend hangs just the
+		// same (observed in production as hundreds of piled-up D-state
+		// `dmsetup suspend --noflush` tasks, each a longhorn-manager Suspend
+		// retry). There is nothing to quiesce on a dead device, so skip the
+		// dmsetup suspend entirely and report the frontend suspended; the
+		// EngineFrontend observer faults/recovers the dead device separately.
+		// The probe is conservative (non-blocking open + 1-byte read; confirmed
+		// dead ONLY on ENXIO/EIO), so a healthy or merely-busy device still
+		// takes the safe flushing suspend below.
+		devPath := helperutil.GetLonghornDevicePath(ef.VolumeName)
+		if dead, reason := suspendDeviceConfirmedDead(devPath); dead {
+			ef.log.Warnf("Skipping dmsetup suspend for engine frontend: backing device %s confirmed dead (%s); a suspend (even --noflush) would hang in D-state", devPath, reason)
+			return nil
+		}
+
 		return i.Suspend(false, false)
 	default:
 		// TODO: support ublk frontend suspend
 		return errors.Wrapf(ErrEngineFrontendLifecycleUnimplemented, "suspend frontend %s is unimplemented", ef.Frontend)
 	}
+}
+
+// suspendDeviceConfirmedDead reports whether the longhorn block device at
+// devPath has a dead dm-linear mapping: a non-blocking open returns ENXIO (the
+// table is gone) or the first read returns EIO/ENXIO (mapping present but the
+// underlying target is dead). It is deliberately conservative -- it returns
+// false (NOT confirmed dead) for a missing path, a non-device file, or any
+// other/ambiguous error -- so a healthy or busy device is never mistaken for
+// dead and always takes the safe flushing suspend path.
+//
+// It is a package-level var so tests can override it to exercise the
+// dead-device skip paths (Suspend, prepareExpansion) without a real dead
+// block device.
+var suspendDeviceConfirmedDead = func(devPath string) (dead bool, reason string) {
+	statInfo, err := os.Stat(devPath)
+	if err != nil || statInfo.Mode()&os.ModeDevice == 0 {
+		return false, ""
+	}
+
+	f, err := os.OpenFile(devPath, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		if errors.Is(err, syscall.ENXIO) || errors.Is(err, syscall.EIO) {
+			return true, "open: " + err.Error()
+		}
+		return false, ""
+	}
+	defer func() { _ = f.Close() }()
+
+	buf := make([]byte, 1)
+	if _, readErr := f.Read(buf); readErr != nil && !errors.Is(readErr, io.EOF) {
+		if errors.Is(readErr, syscall.EIO) || errors.Is(readErr, syscall.ENXIO) {
+			return true, "read: " + readErr.Error()
+		}
+		return false, ""
+	}
+	return false, ""
 }
 
 // ResumeFrontend resumes the engine frontend. IO operations will be resumed.
@@ -2255,7 +2510,7 @@ func (ef *EngineFrontend) resolveEngineNameByTargetAddress(targetAddress string)
 		return "", errors.Wrapf(ErrSwitchOverTargetInvalidInput, "invalid target address %s", targetAddress)
 	}
 
-	targetSpdkClient, err := ef.newServiceClient(targetAddress)
+	targetSpdkClient, err := GetServiceClient(targetAddress)
 	if err != nil {
 		return "", errors.Wrapf(ErrSwitchOverTargetInternal, "failed to get SPDK client for target address %s: %v", targetAddress, err)
 	}
@@ -2373,7 +2628,7 @@ func (ef *EngineFrontend) snapshotOperation(inputSnapshotName string, snapshotOp
 		}
 	}
 
-	engineSpdkClient, err := ef.newServiceClient(ef.getEngineServiceAddress())
+	engineSpdkClient, err := GetServiceClient(ef.getEngineServiceAddress())
 	if err != nil {
 		return "", errors.Wrapf(err, "failed to get SPDK client to perform snapshot operation %s for snapshot %q", snapshotOp, inputSnapshotName)
 	}
@@ -2425,12 +2680,29 @@ func (ef *EngineFrontend) ValidateAndUpdate(spdkClient *spdkclient.Client) (err 
 	ef.Lock()
 	defer func() {
 		if err != nil {
-			if ef.State != types.InstanceStateError {
-				ef.log.WithError(err).Error("Setting engine frontend to error state due to validation failure")
-				ef.State = types.InstanceStateError
-				updateRequired = true
+			ef.consecutiveValidationFailures++
+			// Broken pipe means the SPDK service itself is gone; that is not
+			// a transient glitch, so it bypasses the failure tolerance (the
+			// server verify loop also aborts on it).
+			if !jsonrpc.IsJSONRPCRespErrorBrokenPipe(err) && ef.consecutiveValidationFailures < maxConsecutiveValidationFailures {
+				// Tolerate transient host-level glitches (e.g. kernel NVMe
+				// device churn while a sibling volume detaches): faulting on
+				// the first failure cascaded one detach into faults on every
+				// other volume on the node. Real failures persist across
+				// verify ticks and still fault below.
+				ef.log.WithError(err).Warnf("Engine frontend validation failed (%d/%d consecutive), deferring error state",
+					ef.consecutiveValidationFailures, maxConsecutiveValidationFailures)
+				err = nil
+			} else {
+				if ef.State != types.InstanceStateError {
+					ef.log.WithError(err).Error("Setting engine frontend to error state due to validation failure")
+					ef.State = types.InstanceStateError
+					updateRequired = true
+				}
+				ef.ErrorMsg = err.Error()
 			}
-			ef.ErrorMsg = err.Error()
+		} else {
+			ef.consecutiveValidationFailures = 0
 		}
 		ef.Unlock()
 
