@@ -38,14 +38,25 @@ func (s *Server) EngineCreate(ctx context.Context, req *spdkrpc.EngineCreateRequ
 	}
 
 	if e == nil {
-		s.engineMap[req.Name] = NewEngine(req.Name, req.VolumeName, req.Frontend, req.SpecSize, s.updateChs[types.InstanceTypeEngine], req.SnapshotMaxCount, s.newServiceClient)
+		s.engineMap[req.Name] = NewEngine(req.Name, req.VolumeName, req.Frontend, req.SpecSize, s.nodeTransport, s.updateChs[types.InstanceTypeEngine], req.SnapshotMaxCount)
 		e = s.engineMap[req.Name]
+		// Wire on-disk persistence so engine state survives an IM restart,
+		// mirroring how EngineFrontendCreate sets ef.metadataDir.
+		e.metadataDir = s.metadataDir
+		if req.QosLimits != nil {
+			e.QosLimits = QosLimits{
+				RwIOsPerSec: req.QosLimits.RwIosPerSec,
+				RwMBPerSec:  req.QosLimits.RwMbPerSec,
+				RMBPerSec:   req.QosLimits.RMbPerSec,
+				WMBPerSec:   req.QosLimits.WMbPerSec,
+			}
+		}
 	}
 
 	spdkClient := s.spdkClient
 	s.Unlock()
 
-	return e.Create(spdkClient, req.ReplicaAddressMap, req.PortCount, s.portAllocator, req.SalvageRequested)
+	return e.Create(spdkClient, req.ReplicaAddressMap, req.ReplicaTransportAddressMap, req.PortCount, s.portAllocator, req.SalvageRequested)
 }
 
 func (s *Server) EngineSnapshotMaxCountSet(ctx context.Context, req *spdkrpc.EngineSnapshotMaxCountSetRequest) (ret *emptypb.Empty, err error) {
@@ -233,6 +244,29 @@ func (s *Server) EngineSetTargetListenerANAState(ctx context.Context, req *spdkr
 	return &emptypb.Empty{}, nil
 }
 
+// EngineRemoveTargetListener removes the target listener for the given transport
+// from an engine, releasing the HCA queue pair held by an old RDMA path during
+// switchover. A missing engine is treated as already-removed (no error).
+func (s *Server) EngineRemoveTargetListener(ctx context.Context, req *spdkrpc.EngineRemoveTargetListenerRequest) (ret *emptypb.Empty, err error) {
+	if req == nil || req.Name == "" {
+		return nil, grpcstatus.Error(grpccodes.InvalidArgument, "engine name is required")
+	}
+
+	s.RLock()
+	e := s.engineMap[req.Name]
+	spdkClient := s.spdkClient
+	s.RUnlock()
+
+	if e == nil {
+		return &emptypb.Empty{}, nil
+	}
+
+	if err := e.RemoveTargetListener(spdkClient, NvmfTransportType(req.Transport)); err != nil {
+		return nil, grpcstatus.Errorf(grpccodes.Internal, "failed to remove target listener for engine %s: %v", req.Name, err)
+	}
+	return &emptypb.Empty{}, nil
+}
+
 // EngineGet returns a specific engine
 func (s *Server) EngineGet(ctx context.Context, req *spdkrpc.EngineGetRequest) (ret *spdkrpc.Engine, err error) {
 	s.RLock()
@@ -332,7 +366,7 @@ func (s *Server) EngineReplicaAdd(ctx context.Context, req *spdkrpc.EngineReplic
 			"replicaName":    req.ReplicaName,
 			"engineFrontend": efName,
 		})
-		frontendSuspendResumeWrapper = buildGRPCReplicaAddFrontendSuspendResumeWrapper(efName, efAddress, log, s.newServiceClient)
+		frontendSuspendResumeWrapper = buildGRPCReplicaAddFrontendSuspendResumeWrapper(efName, efAddress, log)
 	}
 
 	if err := e.ReplicaAdd(spdkClient, req.ReplicaName, req.ReplicaAddress, req.FastSync, frontendSuspendResumeWrapper); err != nil {
@@ -618,7 +652,6 @@ func (s *Server) EngineBackupRestore(ctx context.Context, req *spdkrpc.EngineBac
 		types.DefaultUblkQueueDepth,
 		types.DefaultUblkNumberOfQueue,
 		throwawayUpdateCh,
-		s.newServiceClient,
 	)
 
 	logrus.WithFields(logrus.Fields{
@@ -648,4 +681,36 @@ func (s *Server) EngineRestoreStatus(ctx context.Context, req *spdkrpc.RestoreSt
 		return nil, grpcstatus.Errorf(grpccodes.Internal, "%v", err)
 	}
 	return resp, nil
+}
+
+// EngineSetQosLimit applies new QoS limits to a running engine's raid bdev
+// at runtime. Used by longhorn-manager to push StorageClass-derived QoS
+// changes onto attached volumes without re-creating them.
+func (s *Server) EngineSetQosLimit(ctx context.Context, req *spdkrpc.EngineSetQosLimitRequest) (*emptypb.Empty, error) {
+	if req.Name == "" {
+		return nil, grpcstatus.Error(grpccodes.InvalidArgument, "engine name is required")
+	}
+	if req.QosLimits == nil {
+		return nil, grpcstatus.Error(grpccodes.InvalidArgument, "qos_limits is required (use all-zero fields for unlimited)")
+	}
+
+	s.RLock()
+	e := s.engineMap[req.Name]
+	spdkClient := s.spdkClient
+	s.RUnlock()
+
+	if e == nil {
+		return nil, grpcstatus.Errorf(grpccodes.NotFound, "cannot find engine %v", req.Name)
+	}
+
+	limits := QosLimits{
+		RwIOsPerSec: req.QosLimits.RwIosPerSec,
+		RwMBPerSec:  req.QosLimits.RwMbPerSec,
+		RMBPerSec:   req.QosLimits.RMbPerSec,
+		WMBPerSec:   req.QosLimits.WMbPerSec,
+	}
+	if err := e.SetQosLimit(spdkClient, limits); err != nil {
+		return nil, grpcstatus.Errorf(grpccodes.Internal, "failed to set QoS for engine %v: %v", req.Name, err)
+	}
+	return &emptypb.Empty{}, nil
 }

@@ -3,7 +3,6 @@ package initiator
 import (
 	"fmt"
 	"path/filepath"
-	"strings"
 
 	"github.com/cockroachdb/errors"
 	"github.com/sirupsen/logrus"
@@ -13,8 +12,16 @@ import (
 	"github.com/longhorn/go-spdk-helper/pkg/types"
 )
 
-// DiscoverTarget discovers a target
+// DiscoverTarget discovers a target over TCP. For transport-aware discovery
+// use DiscoverTargetWithTransport.
 func DiscoverTarget(ip, port string, executor *commonns.Executor) (subnqn string, err error) {
+	return DiscoverTargetWithTransport(DefaultTransportType, ip, port, executor)
+}
+
+// DiscoverTargetWithTransport discovers a target over the given transport
+// ("tcp" or "rdma"). RDMA requires target-side transport support. An empty
+// transport defaults to TCP for backward compat.
+func DiscoverTargetWithTransport(transport, ip, port string, executor *commonns.Executor) (subnqn string, err error) {
 	hostID, err := getHostID(executor)
 	if err != nil {
 		return "", err
@@ -24,7 +31,7 @@ func DiscoverTarget(ip, port string, executor *commonns.Executor) (subnqn string
 		return "", err
 	}
 
-	entries, err := discovery(hostID, hostNQN, ip, port, executor)
+	entries, err := discoveryWithTransport(hostID, hostNQN, transport, ip, port, executor)
 	if err != nil {
 		return "", err
 	}
@@ -38,8 +45,20 @@ func DiscoverTarget(ip, port string, executor *commonns.Executor) (subnqn string
 	return "", fmt.Errorf("found empty subnqn after nvme discover for %s:%s", ip, port)
 }
 
-// ConnectTarget connects to a target
+// ConnectTarget connects to a target over TCP. For transport-aware connect
+// use ConnectTargetWithTransport.
 func ConnectTarget(ip, port, nqn string, executor *commonns.Executor) (controllerName string, err error) {
+	return ConnectTargetWithTransport(DefaultTransportType, ip, port, nqn, executor)
+}
+
+// ConnectTargetWithTransport connects to a target over the given transport
+// ("tcp" or "rdma"). RDMA requires target-side transport support. An empty
+// transport defaults to TCP for backward compat.
+func ConnectTargetWithTransport(transport, ip, port, nqn string, executor *commonns.Executor) (controllerName string, err error) {
+	if transport == "" {
+		transport = DefaultTransportType
+	}
+
 	// Trying to connect an existing subsystem will error out with exit code 114.
 	// Hence, it's better to check the existence first.
 	if devices, err := GetDevices(ip, port, nqn, executor); err == nil && len(devices) > 0 {
@@ -55,7 +74,7 @@ func ConnectTarget(ip, port, nqn string, executor *commonns.Executor) (controlle
 		return "", err
 	}
 
-	return connect(hostID, hostNQN, nqn, DefaultTransportType, ip, port, executor)
+	return connect(hostID, hostNQN, nqn, transport, ip, port, executor)
 }
 
 // DisconnectTarget disconnects from a target
@@ -86,50 +105,29 @@ func DisconnectController(nqn, ip, port string, executor *commonns.Executor) err
 	return nil
 }
 
-// GetDevices returns all devices
-func GetDevices(ip, port, nqn string, executor *commonns.Executor) (devices []Device, err error) {
-	defer func() {
-		err = errors.Wrapf(err, "failed to get devices for address %s:%s and nqn %s", ip, port, nqn)
-	}()
-
-	devices = []Device{}
-	skippedDevices := 0
-
-	nvmeDevices, err := listRecognizedNvmeDevices(executor)
-	if err != nil {
-		return nil, err
-	}
+// collectDevices builds Device entries for the recognized NVMe devices.
+// A device whose subsystem lookup fails, returns no subsystem, or returns
+// multiple subsystems is skipped rather than failing the whole enumeration:
+// such a device is typically a sibling volume mid-teardown (block device
+// still present while its subsystem has already left sysfs) and cannot be
+// the device the caller is looking for. Failing the entire lookup here made
+// every concurrent detach on the node poison the periodic validation of
+// unrelated healthy volumes.
+func collectDevices(nvmeDevices []CliDevice, listSubsys func(devicePath string) ([]Subsystem, error)) []Device {
+	devices := []Device{}
 	for _, d := range nvmeDevices {
-		subsystems, err := listSubsystems(d.DevicePath, executor)
+		subsystems, err := listSubsys(d.DevicePath)
 		if err != nil {
-			// Backup/snapshot flows may create a temporary NVMe/TCP device and tear
-			// it down shortly after use. To avoid falsely treating the live frontend
-			// as missing, skip this scanned device here and continue the full scan;
-			// the requested target must still be found before GetDevices() succeeds.
-			if isTransientNVMeScanError(err) {
-				skippedDevices++
-				logrus.WithFields(logrus.Fields{
-					"devicePath":       d.DevicePath,
-					"requestedAddress": fmt.Sprintf("%s:%s", ip, port),
-					"requestedNQN":     nqn,
-				}).WithError(err).Warn("Skipping NVMe device during scan because it appears to be in transient cleanup")
-				continue
-			}
 			logrus.WithError(err).Warnf("failed to list subsystems for NVMe device %s", d.DevicePath)
 			continue
 		}
 		if len(subsystems) == 0 {
-			// Similar to the transient error case above, skip this device.
-			skippedDevices++
-			logrus.WithFields(logrus.Fields{
-				"devicePath":       d.DevicePath,
-				"requestedAddress": fmt.Sprintf("%s:%s", ip, port),
-				"requestedNQN":     nqn,
-			}).Warn("Skipping NVMe device during scan because no subsystem was found; device may be in transient cleanup")
+			logrus.Warnf("Skipping NVMe device %s with no subsystem during device enumeration", d.DevicePath)
 			continue
 		}
 		if len(subsystems) > 1 {
-			return nil, fmt.Errorf("multiple subsystems found for NVMe device %s", d.DevicePath)
+			logrus.Warnf("Skipping NVMe device %s with %d subsystems during device enumeration", d.DevicePath, len(subsystems))
+			continue
 		}
 		sys := subsystems[0]
 
@@ -163,6 +161,24 @@ func GetDevices(ip, port, nqn string, executor *commonns.Executor) (devices []De
 
 		devices = append(devices, device)
 	}
+	return devices
+}
+
+// GetDevices returns all devices
+func GetDevices(ip, port, nqn string, executor *commonns.Executor) (devices []Device, err error) {
+	defer func() {
+		err = errors.Wrapf(err, "failed to get devices for address %s:%s and nqn %s", ip, port, nqn)
+	}()
+
+	devices = []Device{}
+
+	nvmeDevices, err := listRecognizedNvmeDevices(executor)
+	if err != nil {
+		return nil, err
+	}
+	devices = collectDevices(nvmeDevices, func(devicePath string) ([]Subsystem, error) {
+		return listSubsystems(devicePath, executor)
+	})
 
 	if nqn == "" {
 		return devices, err
@@ -264,15 +280,6 @@ func GetDevices(ip, port, nqn string, executor *commonns.Executor) (devices []De
 	}
 
 	if len(res) == 0 {
-		if skippedDevices > 0 {
-			logrus.WithFields(logrus.Fields{
-				"requestedAddress": fmt.Sprintf("%s:%s", ip, port),
-				"requestedNQN":     nqn,
-				"recognizedCount":  len(nvmeDevices),
-				"skippedCount":     skippedDevices,
-			}).Warn("Requested NVMe target was not found after skipping transient devices during scan")
-		}
-
 		subsystems, err := listSubsystems("", executor)
 		if err != nil {
 			return nil, err
@@ -295,14 +302,6 @@ func GetDevices(ip, port, nqn string, executor *commonns.Executor) (devices []De
 // GetSubsystems returns all devices
 func GetSubsystems(executor *commonns.Executor) (subsystems []Subsystem, err error) {
 	return listSubsystems("", executor)
-}
-
-func isTransientNVMeScanError(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "no such file or directory")
 }
 
 // Flush commits data and metadata associated with the specified namespace(s) to nonvolatile media.

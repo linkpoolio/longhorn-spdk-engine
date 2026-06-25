@@ -31,6 +31,14 @@ import (
 )
 
 const (
+	// defaultClusterSize is the legacy 1 MiB lvstore cluster size used for
+	// computing ActualSize = NumAllocatedClusters * defaultClusterSize on
+	// existing 1 MiB lvstores. New lvstores are created with
+	// defaultLvstoreClusterSize (see types.go), which may differ. Replicas
+	// on lvstores with a non-1-MiB cluster size currently report incorrect
+	// ActualSize in status until Replica is refactored to carry per-lvstore
+	// cluster size — tracked as a follow-up to the
+	// LONGHORN_V2_LVSTORE_CLUSTER_SIZE Setting.
 	defaultClusterSize = 1 * 1024 * 1024 // 1MB
 	defaultBlockSize   = 4096            // 4KB
 
@@ -443,7 +451,7 @@ func addBlockDevice(spdkClient *spdkclient.Client, diskName, diskUUID, originalD
 
 	if diskUUID == "" {
 		log.Infof("Creating a new lvstore %v", lvstoreName)
-		return spdkClient.BdevLvolCreateLvstore(bdev.Name, lvstoreName, defaultClusterSize)
+		return spdkClient.BdevLvolCreateLvstore(bdev.Name, lvstoreName, defaultLvstoreClusterSize)
 	}
 
 	// The lvstore should be created before, but it cannot be found now.

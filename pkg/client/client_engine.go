@@ -14,15 +14,29 @@ import (
 )
 
 // EngineCreate creates and starts an engine instance with the requested replicas.
-func (c *SPDKClient) EngineCreate(name, volumeName, frontend string, specSize uint64, replicaAddressMap map[string]string, portCount int32, salvageRequested bool, snapshotMaxCount int32) (*api.Engine, error) {
+// replicaTransportAddressMap is optional and carries transport-qualified
+// (tcp/rdma) addresses per replica; when populated the engine picks the
+// listener matching its own node transport, else it falls back to
+// replicaAddressMap dialed with the engine's default transport.
+func (c *SPDKClient) EngineCreate(name, volumeName, frontend string, specSize uint64, replicaAddressMap map[string]string, replicaTransportAddressMap map[string]*spdkrpc.ReplicaTransportAddresses, portCount int32, salvageRequested bool, snapshotMaxCount int32, qosLimits *spdkrpc.QosLimits) (*api.Engine, error) {
 	if name == "" {
 		return nil, fmt.Errorf("failed to start engine: missing required parameter name")
 	}
 	if volumeName == "" {
 		return nil, fmt.Errorf("failed to start engine: missing required parameter volumeName")
 	}
+	// replicaAddressMap is the authoritative replica set: Engine.Create
+	// iterates it and only consults replicaTransportAddressMap for the
+	// matching entries. A transport-map-only request would therefore create a
+	// zero-replica engine, and a transport-map key without an address-map
+	// entry would be silently ignored — reject both up front.
 	if len(replicaAddressMap) == 0 {
 		return nil, fmt.Errorf("failed to start engine: missing required parameter replicaAddressMap")
+	}
+	for replicaName := range replicaTransportAddressMap {
+		if _, ok := replicaAddressMap[replicaName]; !ok {
+			return nil, fmt.Errorf("failed to start engine: replica %s is present in replicaTransportAddressMap but missing from replicaAddressMap", replicaName)
+		}
 	}
 
 	client := c.getSPDKServiceClient()
@@ -30,14 +44,16 @@ func (c *SPDKClient) EngineCreate(name, volumeName, frontend string, specSize ui
 	defer cancel()
 
 	resp, err := client.EngineCreate(ctx, &spdkrpc.EngineCreateRequest{
-		Name:              name,
-		VolumeName:        volumeName,
-		Frontend:          frontend,
-		SpecSize:          specSize,
-		ReplicaAddressMap: replicaAddressMap,
-		PortCount:         portCount,
-		SalvageRequested:  salvageRequested,
-		SnapshotMaxCount:  snapshotMaxCount,
+		Name:                       name,
+		VolumeName:                 volumeName,
+		Frontend:                   frontend,
+		SpecSize:                   specSize,
+		ReplicaAddressMap:          replicaAddressMap,
+		ReplicaTransportAddressMap: replicaTransportAddressMap,
+		PortCount:                  portCount,
+		SalvageRequested:           salvageRequested,
+		SnapshotMaxCount:           snapshotMaxCount,
+		QosLimits:                  qosLimits,
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to start engine")
@@ -141,6 +157,28 @@ func (c *SPDKClient) EngineSetTargetListenerANAState(name, anaState string) erro
 		return errors.Wrapf(err, "failed to set target listener ANA state %s for engine %v", anaState, name)
 	}
 
+	return nil
+}
+
+// EngineRemoveTargetListener removes the NVMe-oF target listener for the given
+// transport from a (possibly remote) engine. Used during switchover to release
+// the old RDMA path's HCA queue pair, which an ANA state change alone does not free.
+func (c *SPDKClient) EngineRemoveTargetListener(name, transport string) error {
+	if name == "" {
+		return fmt.Errorf("failed to remove target listener for engine: missing required parameter name")
+	}
+
+	client := c.getSPDKServiceClient()
+	ctx, cancel := context.WithTimeout(context.Background(), GRPCServiceTimeout)
+	defer cancel()
+
+	_, err := client.EngineRemoveTargetListener(ctx, &spdkrpc.EngineRemoveTargetListenerRequest{
+		Name:      name,
+		Transport: transport,
+	})
+	if err != nil {
+		return errors.Wrapf(err, "failed to remove target listener for engine %v", name)
+	}
 	return nil
 }
 
@@ -489,4 +527,23 @@ func (c *SPDKClient) EngineRestoreStatus(engineName string) (*spdkrpc.RestoreSta
 	return client.EngineRestoreStatus(ctx, &spdkrpc.RestoreStatusRequest{
 		EngineName: engineName,
 	})
+}
+
+func (c *SPDKClient) EngineSetQosLimit(name string, qosLimits *spdkrpc.QosLimits) error {
+	if name == "" {
+		return fmt.Errorf("failed to set engine QoS: missing required parameter name")
+	}
+	if qosLimits == nil {
+		return fmt.Errorf("failed to set engine QoS: missing required parameter qosLimits (use all-zero fields for unlimited)")
+	}
+
+	client := c.getSPDKServiceClient()
+	ctx, cancel := context.WithTimeout(context.Background(), GRPCServiceTimeout)
+	defer cancel()
+
+	_, err := client.EngineSetQosLimit(ctx, &spdkrpc.EngineSetQosLimitRequest{
+		Name:      name,
+		QosLimits: qosLimits,
+	})
+	return errors.Wrapf(err, "failed to set QoS on engine %v", name)
 }
