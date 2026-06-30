@@ -29,7 +29,7 @@ func (s *TestSuite) TestRecoverFromHostDisconnectsStaleNVMeControllers(c *C) {
 	// Create an EF with a blockdev frontend
 	ef := NewEngineFrontend("ef-test", "engine-test", "vol-test",
 		lhtypes.FrontendSPDKTCPBlockdev, 1024*1024*1024, 0, 0,
-		make(chan interface{}, 4096), nil)
+		make(chan interface{}, 4096))
 	ef.State = lhtypes.InstanceStatePending
 
 	// RecoverFromHost will fail because newNvmeTcpInitiator tries to create
@@ -57,7 +57,7 @@ func (s *TestSuite) TestRecoverFromHostContinuesOnDisconnectError(c *C) {
 	// Create an EF with a blockdev frontend
 	ef := NewEngineFrontend("ef-test", "engine-test", "vol-test",
 		lhtypes.FrontendSPDKTCPBlockdev, 1024*1024*1024, 0, 0,
-		make(chan interface{}, 4096), nil)
+		make(chan interface{}, 4096))
 	ef.State = lhtypes.InstanceStatePending
 
 	// RecoverFromHost should not panic or hang — it should continue
@@ -88,7 +88,7 @@ func (s *TestSuite) TestRecoverFromHostSkipsDisconnectForEmptyFrontend(c *C) {
 	// Create an EF with an empty frontend (no initiator)
 	ef := NewEngineFrontend("ef-test", "engine-test", "vol-test",
 		lhtypes.FrontendEmpty, 1024*1024*1024, 0, 0,
-		make(chan interface{}, 4096), nil)
+		make(chan interface{}, 4096))
 	ef.State = lhtypes.InstanceStatePending
 
 	err := ef.RecoverFromHost(nil)

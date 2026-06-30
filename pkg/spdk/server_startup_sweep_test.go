@@ -24,16 +24,16 @@ func (s *TestSuite) TestGetReplicaNameFromRebuildController(c *C) {
 }
 
 func (s *TestSuite) TestHasChildren(c *C) {
-	bdevLvolMap := map[string]spdktypes.BdevLvol{
-		"replica-1": {},
+	bdevLvolMap := map[string]*spdktypes.BdevInfo{
+		"replica-1": {DriverSpecific: &spdktypes.BdevDriverSpecific{Lvol: &spdktypes.BdevDriverSpecificLvol{}}},
 		"replica-1-snap-abc": {
-			DriverSpecific: spdktypes.BdevLvolDriverSpecific{
-				Lvol: spdktypes.BdevLvolDriverSpecificLvol{
+			DriverSpecific: &spdktypes.BdevDriverSpecific{
+				Lvol: &spdktypes.BdevDriverSpecificLvol{
 					Clones: []string{"replica-1"},
 				},
 			},
 		},
-		"replica-2": {},
+		"replica-2": {DriverSpecific: &spdktypes.BdevDriverSpecific{Lvol: &spdktypes.BdevDriverSpecificLvol{}}},
 	}
 
 	// replica-1 has a snapshot that lists it as a clone
@@ -43,9 +43,9 @@ func (s *TestSuite) TestHasChildren(c *C) {
 }
 
 func (s *TestSuite) TestLvolType(c *C) {
-	c.Assert(lvolType("pvc-abc-r-123-rebuilding"), Equals, "rebuilding")
-	c.Assert(lvolType("pvc-abc-r-123-cloning"), Equals, "cloning")
-	c.Assert(lvolType("pvc-abc-r-123"), Equals, "replica")
+	c.Assert(lvolTypeStr("pvc-abc-r-123-rebuilding"), Equals, "rebuilding")
+	c.Assert(lvolTypeStr("pvc-abc-r-123-cloning"), Equals, "cloning")
+	c.Assert(lvolTypeStr("pvc-abc-r-123"), Equals, "replica")
 }
 
 func (s *TestSuite) TestStartupSweepDoneIsOneShot(c *C) {
