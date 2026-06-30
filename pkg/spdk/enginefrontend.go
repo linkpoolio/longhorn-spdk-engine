@@ -2862,6 +2862,31 @@ func (ef *EngineFrontend) RecoverFromHost(spdkClient *spdkclient.Client) error {
 			return recoverErr
 		}
 
+		// Disconnect any stale kernel NVMe controllers for this subsystem
+		// NQN before creating a new initiator. When the IM pod restarts,
+		// the old SPDK process dies and its NVMf subsystem listeners are
+		// removed, but the kernel NVMe driver on the host keeps the old
+		// /dev/nvmeXn1 devices with active reconnect timers. When the new
+		// SPDK re-exposes the engine target on the same port (the port
+		// allocator reserves the old port from persisted engine records),
+		// the stale kernel NVMe driver's reconnect timer fires and creates
+		// a duplicate controller on the same subsystem. This triggers
+		// SPDK's supersede-reap, which disconnects the old controller,
+		// causing the kernel NVMe driver to reconnect again — an infinite
+		// loop that generates thousands of TCP connections (128 per
+		// controller) and degrades I/O latency.
+		//
+		// By disconnecting all stale kernel NVMe controllers for this NQN
+		// before the new initiator is created, we ensure the kernel NVMe
+		// driver has no stale devices to reconnect with. The new initiator
+		// creates the only kernel NVMe controller for this subsystem.
+		staleNqn, _ := ef.getVolumeTargetIdentity()
+		if disconnectErr := disconnectStaleNVMeControllers(staleNqn); disconnectErr != nil {
+			ef.log.WithError(disconnectErr).Warnf("Failed to disconnect stale kernel NVMe controllers for NQN %s during recovery of engine frontend %s, continuing", staleNqn, ef.Name)
+		} else {
+			ef.log.Infof("Disconnected stale kernel NVMe controllers for NQN %s during recovery of engine frontend %s", staleNqn, ef.Name)
+		}
+
 		// Recover the NVMe-oF initiator (blockdev frontend with dm-device).
 		i, nqn, nguid, err := ef.newNvmeTcpInitiator()
 		if err != nil {
