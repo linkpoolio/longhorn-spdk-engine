@@ -899,7 +899,14 @@ func (r *Replica) prepareHead(spdkClient *spdkclient.Client, backingImage *Backi
 			}
 			r.log.Infof("Replica cloned a new head lvol from the parent lvol %s", headParentLvol.Name)
 		} else {
-			if _, err := spdkClient.BdevLvolCreate("", r.LvsUUID, r.Name, util.BytesToMiB(r.SpecSize), spdktypes.BdevLvolClearMethod(defaultLvolClearMethod), defaultThinProvision); err != nil {
+			// The head lvol is always thin-provisioned regardless of
+			// the defaultThinProvision setting. The head may need to
+			// become a copy-on-write child of a snapshot via
+			// bdev_lvol_set_parent (during clone finish, rebuild
+			// finish, or snapshot operations), which requires a thin
+			// lvol — a thick lvol is fully allocated with no CoW
+			// backing, so set_parent fails with EINVAL.
+			if _, err := spdkClient.BdevLvolCreate("", r.LvsUUID, r.Name, util.BytesToMiB(r.SpecSize), spdktypes.BdevLvolClearMethod(defaultLvolClearMethod), true); err != nil {
 				return err
 			}
 			r.log.Info("Replica created a new head lvol")
@@ -2111,10 +2118,17 @@ func (r *Replica) SnapshotCloneDstStart(spdkClient *spdkclient.Client, snapshotN
 			return errors.Wrapf(err, "failed to allocate a cloning port pair for dst replica %v snapshot clone start", r.Name)
 		}
 	}
-	// Create cloning lvol and expose it
+	// Create cloning lvol and expose it.
+	// The cloning lvol is always thin-provisioned regardless of the
+	// defaultThinProvision setting, because bdev_lvol_set_parent
+	// (used to reparent the clone-dst onto the source snapshot) requires
+	// a thin lvol — a thick lvol is fully allocated with no CoW backing,
+	// so set_parent fails with EINVAL. The cloning lvol is transient
+	// (deleted after the clone completes), so thin provisioning has no
+	// lasting performance impact.
 	cloningLvolName := GetReplicaCloningLvolName(r.Name)
 	if _, err = spdkClient.BdevLvolCreate("", r.LvsUUID, cloningLvolName, util.BytesToMiB(r.SpecSize),
-		spdktypes.BdevLvolClearMethod(defaultLvolClearMethod), defaultThinProvision); err != nil {
+		spdktypes.BdevLvolClearMethod(defaultLvolClearMethod), true); err != nil {
 		return err
 	}
 	cloningLvolAlias := spdktypes.GetLvolAlias(r.LvsName, cloningLvolName)
@@ -3639,7 +3653,11 @@ func (r *Replica) rebuildingDstShallowCopyPrepare(spdkClient *spdkclient.Client,
 				return "", false, err
 			}
 		} else {
-			if _, err = spdkClient.BdevLvolCreate("", r.LvsUUID, rebuildingLvolName, util.BytesToMiB(r.SpecSize), spdktypes.BdevLvolClearMethod(defaultLvolClearMethod), defaultThinProvision); err != nil {
+			// The rebuilding lvol is always thin-provisioned because
+			// bdev_lvol_set_parent is called on it during
+			// RebuildingDstFinish to reparent it onto the rebuild
+			// snapshot. A thick lvol would fail set_parent with EINVAL.
+			if _, err = spdkClient.BdevLvolCreate("", r.LvsUUID, rebuildingLvolName, util.BytesToMiB(r.SpecSize), spdktypes.BdevLvolClearMethod(defaultLvolClearMethod), true); err != nil {
 				return "", false, err
 			}
 		}
