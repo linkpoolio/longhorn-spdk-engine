@@ -3564,6 +3564,8 @@ func (e *Engine) ValidateAndUpdate(spdkClient *spdkclient.Client) (err error) {
 		return err
 	}
 
+	e.validateNvmeTcpTargetNoLock(spdkClient, &updateRequired)
+
 	previousModes := e.snapshotReplicaModesNoLock()
 	containValidReplica := e.validateReplicaStatusMapNoLock(bdevMap, &updateRequired)
 	// Capture the dirty bitmap of any replica that just transitioned to ERR,
@@ -3584,6 +3586,62 @@ func (e *Engine) ValidateAndUpdate(spdkClient *spdkclient.Client) (err error) {
 	e.checkAndUpdateInfoFromReplicasNoLock()
 
 	return nil
+}
+
+// validateNvmeTcpTargetNoLock reconciles the engine's recorded NVMe/TCP
+// target address against the live SPDK subsystem listener. The target
+// listener can be recreated on a different port than the one recorded (e.g.
+// when the engine is rebuilt from a persisted record and the port allocator
+// hands out a new range); the stale recorded port is then propagated to the
+// engine frontend, which connects to the wrong port and is rejected by the
+// target (nvmf_qpair_access_allowed). Best-effort: a missing subsystem or
+// listener is left to the raid/frontend error paths.
+func (e *Engine) validateNvmeTcpTargetNoLock(spdkClient *spdkclient.Client, updateRequired *bool) {
+	if e.NvmeTcpTarget == nil || e.NvmeTcpTarget.Nqn == "" || e.NvmeTcpTarget.IP == "" || e.NvmeTcpTarget.Port == 0 {
+		return
+	}
+
+	subsystemList, err := spdkClient.NvmfGetSubsystems(e.NvmeTcpTarget.Nqn, "")
+	if err != nil {
+		e.log.WithError(err).Warnf("Failed to get subsystem %s while validating the engine target listener", e.NvmeTcpTarget.Nqn)
+		return
+	}
+
+	var localPorts []int32
+	for _, subsystem := range subsystemList {
+		if subsystem.Nqn != e.NvmeTcpTarget.Nqn {
+			continue
+		}
+		for _, listenAddr := range subsystem.ListenAddresses {
+			if listenAddr.Traddr != e.NvmeTcpTarget.IP {
+				continue
+			}
+			port, err := strconv.Atoi(listenAddr.Trsvcid)
+			if err != nil {
+				continue
+			}
+			if int32(port) == e.NvmeTcpTarget.Port {
+				return
+			}
+			localPorts = append(localPorts, int32(port))
+		}
+	}
+
+	// Only adopt the live port when it is unambiguous: exactly one listener
+	// on this engine's IP. Zero listeners means the target is (temporarily)
+	// gone, which other paths handle; several listeners cannot be attributed
+	// to this engine safely.
+	if len(localPorts) != 1 {
+		return
+	}
+
+	e.log.Warnf("Engine target listener for %s is on port %d but the engine records port %d; adopting the live port",
+		e.NvmeTcpTarget.Nqn, localPorts[0], e.NvmeTcpTarget.Port)
+	e.NvmeTcpTarget.Port = localPorts[0]
+	if saveErr := saveEngineRecord(e.metadataDir, e); saveErr != nil {
+		e.log.WithError(saveErr).Warn("Failed to persist engine record after adopting the live target listener port")
+	}
+	*updateRequired = true
 }
 
 func (e *Engine) shouldSkipValidateAndUpdateNoLock() bool {
