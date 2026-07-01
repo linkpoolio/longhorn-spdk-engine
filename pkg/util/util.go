@@ -143,10 +143,10 @@ func stopSPDKTgtDaemon(timeout time.Duration, signal syscall.Signal) error {
 
 			select {
 			case <-time.After(timeout):
-				logrus.Warnf("spdk_tgt %v failed to exit in time, sending signal %v", process.Pid, signal)
-				err = process.Signal(signal)
+				logrus.Warnf("spdk_tgt %v failed to exit in time after SIGTERM, escalating to SIGKILL", process.Pid)
+				err = process.Signal(syscall.SIGKILL)
 				if err != nil {
-					errs = multierr.Append(errs, errors.Wrapf(err, "failed to send signal %v to spdk_tgt %v", signal, process.Pid))
+					errs = multierr.Append(errs, errors.Wrapf(err, "failed to send SIGKILL to spdk_tgt %v", process.Pid))
 				}
 			case err := <-done:
 				if err != nil {

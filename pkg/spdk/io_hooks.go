@@ -47,18 +47,6 @@ var (
 		return &realNVMeInitiator{Initiator: i}, nil
 	}
 
-	// disconnectStaleNVMeControllers disconnects all kernel NVMe controllers
-	// for a given subsystem NQN on the host. Used during EF recovery to clear
-	// stale kernel NVMe devices left by a previous IM pod before creating a
-	// new initiator. Overridden in tests.
-	disconnectStaleNVMeControllers = func(nqn string) error {
-		executor, err := helperutil.NewExecutor(initiator.HostProc)
-		if err != nil {
-			return err
-		}
-		return initiator.DisconnectTarget(nqn, executor)
-	}
-
 	backupNewFragmap = func(b *Backup) (*Fragmap, error) {
 		return b.newFragmap()
 	}
