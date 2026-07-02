@@ -19,6 +19,13 @@ type TestSuite struct{}
 
 var _ = Suite(&TestSuite{})
 
+// The port-allocation preflight test-binds on the instance's IP, which in
+// unit tests is a fabricated address that can never bind. Neutralize it by
+// default; TestAllocateUsablePortRange installs its own fake and restores.
+func (s *TestSuite) SetUpTest(c *C) {
+	testPortBindFn = func(string, int32) error { return nil }
+}
+
 const defaultTestSnapshotMaxCount int32 = 2
 
 func (s *TestSuite) TestSplitHostPort(c *C) {
