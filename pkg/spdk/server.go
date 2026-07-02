@@ -1361,6 +1361,13 @@ func (s *Server) recoverEngineFrontends(ctx context.Context) {
 	// NEW ef registered by a concurrent EngineFrontendCreate.
 	recoveryEfs := make(map[string]*EngineFrontend, len(records))
 
+	// Engines are rehydrated before frontends (see NewServer), so the local
+	// engine map is authoritative here: correct any record whose target still
+	// points at a pre-restart engine port before recovering from it.
+	for _, record := range records {
+		s.correctStaleEngineFrontendRecordTarget(record)
+	}
+
 	s.Lock()
 	for _, record := range records {
 		if _, exists := s.engineFrontendMap[record.Name]; exists {

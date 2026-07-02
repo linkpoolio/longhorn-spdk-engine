@@ -403,6 +403,57 @@ func ObserveEngineFrontend(ctx context.Context, spdkClient *spdkclient.Client, r
 // that was previously the only way to repair a stale host-side stack
 // after IM crash recovery. LONGHORN_V2_RECONCILE_ENGINE_FRONTENDS=0
 // disables the loop for emergency operator intervention.
+
+// correctStaleEngineFrontendRecordTarget validates a persisted engine
+// frontend record's target address against the locally running engine for
+// the same volume. After an IM restart the engine is recreated on a fresh
+// port while the frontend record still holds the old one; recovering or
+// healing from that record dials a dead (or foreign) listener forever and
+// the volume cycles through fault/salvage without converging. When the
+// local engine's live target differs, the record is corrected in place so
+// recovery and heal dial the real listener. Records whose engine is remote
+// or not running locally are left untouched. Returns true when a
+// correction was applied.
+func (s *Server) correctStaleEngineFrontendRecordTarget(record *EngineFrontendRecord) bool {
+	if record == nil || record.EngineName == "" || record.TargetIP == "" || record.TargetPort == 0 {
+		return false
+	}
+
+	s.RLock()
+	e := s.engineMap[record.EngineName]
+	s.RUnlock()
+	if e == nil {
+		return false
+	}
+
+	eng := e.Get()
+	if eng == nil || eng.State != string(types.InstanceStateRunning) || eng.Ip == "" || eng.Port == 0 {
+		return false
+	}
+	if record.TargetIP == eng.Ip && record.TargetPort == eng.Port {
+		return false
+	}
+
+	logrus.Warnf("Correcting stale engine frontend record %s: target %s:%d -> live engine target %s:%d",
+		record.Name, record.TargetIP, record.TargetPort, eng.Ip, eng.Port)
+	oldIP, oldPort := record.TargetIP, record.TargetPort
+	record.TargetIP = eng.Ip
+	record.TargetPort = eng.Port
+	for _, path := range record.Paths {
+		if path == nil {
+			continue
+		}
+		// Only rewrite the path that mirrored the stale primary target; a
+		// switchover secondary path pointing at another engine is not ours
+		// to correct.
+		if path.TargetIP == oldIP && path.TargetPort == oldPort {
+			path.TargetIP = eng.Ip
+			path.TargetPort = eng.Port
+		}
+	}
+	return true
+}
+
 func (s *Server) reconcileEngineFrontends() {
 	if os.Getenv("LONGHORN_V2_RECONCILE_ENGINE_FRONTENDS") == "0" {
 		logrus.Warn("EngineFrontend reconciler disabled via LONGHORN_V2_RECONCILE_ENGINE_FRONTENDS=0")
@@ -467,6 +518,18 @@ func (s *Server) reconcileOnce() {
 		ef := s.engineFrontendMap[record.Name]
 		spdkClient := s.spdkClient
 		s.RUnlock()
+
+		if s.correctStaleEngineFrontendRecordTarget(record) && ef != nil {
+			ef.Lock()
+			if ef.NvmeTcpFrontend != nil {
+				ef.NvmeTcpFrontend.TargetIP = record.TargetIP
+				ef.NvmeTcpFrontend.TargetPort = record.TargetPort
+			}
+			ef.Unlock()
+			if err := saveEngineFrontendRecord(s.metadataDir, ef); err != nil {
+				logrus.WithError(err).Warnf("EngineFrontend reconciler: failed to persist corrected record for %s", record.Name)
+			}
+		}
 
 		live, err := ObserveEngineFrontend(s.ctx, spdkClient, record)
 		if err != nil {
