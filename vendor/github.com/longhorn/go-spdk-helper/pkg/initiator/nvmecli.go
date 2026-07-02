@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	commonns "github.com/longhorn/go-common-libs/ns"
 
@@ -385,12 +386,20 @@ func disconnect(nqn string, executor *commonns.Executor) error {
 // (e.g. "nvme4"). This removes one multipath path without affecting other
 // controllers for the same subsystem NQN.
 func disconnectController(controllerName string, executor *commonns.Executor) error {
+	return disconnectControllerWithTimeout(controllerName, types.ExecuteTimeout, executor)
+}
+
+// disconnectControllerWithTimeout is disconnectController with a caller-chosen
+// timeout. Callers on a latency-sensitive path (e.g. pruning a stale path before
+// a dm suspend) pass a short timeout so a controller whose in-kernel teardown is
+// itself stuck cannot stall the caller for the full ExecuteTimeout.
+func disconnectControllerWithTimeout(controllerName string, timeout time.Duration, executor *commonns.Executor) error {
 	devPath := filepath.Join("/dev", controllerName)
 	opts := []string{
 		"disconnect",
 		"--device", devPath,
 	}
-	_, err := executor.Execute(nil, nvmeBinary, opts, types.ExecuteTimeout)
+	_, err := executor.Execute(nil, nvmeBinary, opts, timeout)
 	return err
 }
 

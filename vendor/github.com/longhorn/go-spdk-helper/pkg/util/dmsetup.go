@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	commonns "github.com/longhorn/go-common-libs/ns"
 
@@ -60,8 +61,13 @@ func DmsetupReload(dmDeviceName, table string, executor *commonns.Executor) erro
 	return err
 }
 
-// DmsetupRemove removes the device mapper device with the given name
+// DmsetupRemove removes the device mapper device with the given name.
 func DmsetupRemove(dmDeviceName string, force, deferred bool, executor *commonns.Executor) error {
+	return DmsetupRemoveWithTimeout(dmDeviceName, force, deferred, executor, types.ExecuteTimeout)
+}
+
+// DmsetupRemoveWithTimeout is DmsetupRemove with a caller-chosen timeout.
+func DmsetupRemoveWithTimeout(dmDeviceName string, force, deferred bool, executor *commonns.Executor, timeout time.Duration) error {
 	opts := []string{
 		"remove", dmDeviceName,
 	}
@@ -71,7 +77,7 @@ func DmsetupRemove(dmDeviceName string, force, deferred bool, executor *commonns
 	if deferred {
 		opts = append(opts, "--deferred")
 	}
-	_, err := executor.Execute(nil, dmsetupBinary, opts, types.ExecuteTimeout)
+	_, err := executor.Execute(nil, dmsetupBinary, opts, timeout)
 	return err
 }
 
