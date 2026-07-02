@@ -80,3 +80,62 @@ func (s *TestSuite) TestPrepareIPAndPortsReusesReservedRange(c *C) {
 	c.Assert(other.prepareIPAndPorts(5, superior), IsNil)
 	c.Check(other.PortStart, Equals, portEnd+1)
 }
+
+// A restored replica reuses its record-reserved range without preflight; if a
+// kernel socket squats a listener port, relocation must move it to a fresh
+// preflighted range, keep the local rebuild allocator geometry, and never
+// return the abandoned (tainted) range to circulation.
+func (s *TestSuite) TestEnsureListenerPortsUsableRelocatesAroundSquatter(c *C) {
+	fmt.Println("Testing Replica.ensureListenerPortsUsable relocates around a squatted listener port")
+
+	origBind := testPortBindFn
+	defer func() { testPortBindFn = origBind }()
+
+	superior, err := commonbitmap.NewBitmap(20000, 20100)
+	c.Assert(err, IsNil)
+
+	// Simulate the restored state: range [20000, 20005] reserved out-of-band.
+	start, end, err := superior.AllocateRange(6)
+	c.Assert(err, IsNil)
+	c.Assert(start, Equals, int32(20000))
+
+	r := newTestPortReplica(NvmfTransportRDMA)
+	r.IP = "10.10.5.19"
+	r.PortStart, r.PortEnd = start, end
+
+	// Squat the restored primary listener AND the first fresh candidate, so
+	// relocation must taint-walk past both.
+	squatted := map[int32]bool{20000: true, 20006: true}
+	testPortBindFn = func(ip string, port int32) error {
+		c.Assert(ip, Equals, "10.10.5.19")
+		if squatted[port] {
+			return fmt.Errorf("bind: address already in use")
+		}
+		return nil
+	}
+
+	// Exercise the exact method Create calls: probe -> relocate-once.
+	c.Assert(r.ensureListenerPortsUsable(superior), IsNil)
+
+	// [20006,20011] contained squatted 20006 -> tainted; next range wins.
+	c.Check(r.PortStart, Equals, int32(20012))
+	c.Check(r.PortEnd, Equals, int32(20017))
+
+	// Local rebuild allocator rebuilt past the dual-listener pair.
+	first, _, err := r.portAllocator.AllocateRange(2)
+	c.Assert(err, IsNil)
+	c.Check(first, Equals, r.PortStart+2)
+
+	// Neither the abandoned restored range nor the tainted candidate range
+	// may re-enter circulation: the next superior allocation starts after
+	// everything relocation consumed.
+	next, _, err := superior.AllocateRange(1)
+	c.Assert(err, IsNil)
+	c.Check(next, Equals, int32(20018))
+
+	// Clean listener ports: no-op, no relocation, range untouched.
+	beforeStart, beforeEnd := r.PortStart, r.PortEnd
+	c.Assert(r.ensureListenerPortsUsable(superior), IsNil)
+	c.Check(r.PortStart, Equals, beforeStart)
+	c.Check(r.PortEnd, Equals, beforeEnd)
+}

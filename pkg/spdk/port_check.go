@@ -41,20 +41,26 @@ func allocateUsablePortRange(allocator *commonbitmap.Bitmap, ip string, count in
 		if err != nil {
 			return 0, 0, fmt.Errorf("failed to allocate port range for %s: %w", purpose, err)
 		}
-		squatted := false
-		for p := start; p <= end; p++ {
-			if bindErr := testPortBindFn(ip, p); bindErr != nil {
-				squatted = true
-				logrus.Warnf("Port preflight for %s: %s:%d is already in use in this network namespace (%v); tainting range [%d,%d] and retrying",
-					purpose, ip, p, bindErr, start, end)
-				break
-			}
-		}
-		if !squatted {
+		port, bindErr := firstUnbindablePort(ip, start, end)
+		if port == 0 {
 			return start, end, nil
 		}
+		logrus.Warnf("Port preflight for %s: %s:%d is already in use in this network namespace (%v); tainting range [%d,%d] and retrying",
+			purpose, ip, port, bindErr, start, end)
 	}
 	return 0, 0, fmt.Errorf("failed to find a bindable port range of size %d for %s after %d attempts", count, purpose, maxAttempts)
+}
+
+// firstUnbindablePort probes [start, end] and returns the first port that
+// fails a test bind on ip along with its bind error, or 0 when every port in
+// the range is bindable.
+func firstUnbindablePort(ip string, start, end int32) (int32, error) {
+	for p := start; p <= end; p++ {
+		if bindErr := testPortBindFn(ip, p); bindErr != nil {
+			return p, bindErr
+		}
+	}
+	return 0, nil
 }
 
 // isListenerBindConflict reports whether an SPDK expose/add-listener error is

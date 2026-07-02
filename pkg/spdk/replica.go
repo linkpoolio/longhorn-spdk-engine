@@ -356,6 +356,50 @@ func (r *Replica) prepareIPAndPorts(portCount int32, superiorPortAllocator *comm
 	return nil
 }
 
+// ensureListenerPortsUsable probes the replica's listener ports and relocates
+// to a fresh range when one is squatted. Call only while the replica's own
+// listener is known to be down (after the blind subsystem teardown in Create)
+// so a failed bind is unambiguously a foreign socket. A single relocation
+// suffices: allocateUsablePortRange preflights the replacement range itself.
+func (r *Replica) ensureListenerPortsUsable(superiorPortAllocator *commonbitmap.Bitmap) error {
+	port, bindErr := firstUnbindablePort(r.IP, r.PortStart, r.rebuildPortAllocatorStart()-1)
+	if port == 0 {
+		return nil
+	}
+	r.log.WithError(bindErr).Warnf("Replica listener port %s:%d is already in use by a foreign socket; relocating port range", r.IP, port)
+	return r.relocateListenerPorts(superiorPortAllocator)
+}
+
+// relocateListenerPorts abandons the replica's current port range for a fresh
+// preflighted one. Restored replicas reuse the range reserved from their
+// persisted record, which skips the allocation-time preflight — by the time
+// the replica re-exposes, a kernel socket may be squatting a listener port.
+// The old range is deliberately NOT released: the squatter is a live socket,
+// and returning the range to the pool would just re-offer it (the same
+// tainting rule allocateUsablePortRange applies).
+func (r *Replica) relocateListenerPorts(superiorPortAllocator *commonbitmap.Bitmap) error {
+	oldStart, oldEnd := r.PortStart, r.PortEnd
+	start, end, err := allocateUsablePortRange(superiorPortAllocator, r.IP, oldEnd-oldStart+1, "replica "+r.Name)
+	if err != nil {
+		return errors.Wrapf(err, "failed to relocate port range for replica %s", r.Name)
+	}
+	r.PortStart, r.PortEnd = start, end
+
+	bitmap, err := commonbitmap.NewBitmap(r.rebuildPortAllocatorStart(), r.PortEnd)
+	if err != nil {
+		return err
+	}
+	r.portAllocator = bitmap
+
+	r.log.Warnf("Relocated replica port range from [%d, %d] to [%d, %d] around a squatted listener port", oldStart, oldEnd, start, end)
+
+	if err := saveReplicaRecord(r.metadataDir, r); err != nil {
+		r.log.WithError(err).Warn("Failed to persist relocated replica port record; reconnect-after-restart may reallocate ports")
+	}
+
+	return nil
+}
+
 func (r *Replica) IsRebuilding() bool {
 	r.RLock()
 	defer r.RUnlock()
@@ -1169,6 +1213,16 @@ func (r *Replica) Create(spdkClient *spdkclient.Client, portCount int32, superio
 	r.log.Infof("Stopping exposing bdev for replica creation if it is already exposed to avoid potential inconsistency during salvage case")
 	if err := spdkClient.StopExposeBdev(r.Nqn); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
 		return nil, errors.Wrapf(err, "failed to stop exposing replica %v", r.Name)
+	}
+
+	// A restored replica reuses the range reserved from its persisted record,
+	// which skipped the allocation-time preflight — a kernel socket may be
+	// squatting a listener port by now. The subsystem was just blindly torn
+	// down above, so a failed test-bind here can only be a foreign squatter,
+	// never this replica's own listener. Relocate instead of letting the
+	// expose fail and error the replica into a rebuild.
+	if err := r.ensureListenerPortsUsable(superiorPortAllocator); err != nil {
+		return nil, err
 	}
 
 	if err := spdkClient.StartExposeBdevWithTransport(r.Nqn, r.Head.UUID, generateNGUID(r.Name), r.IP, strconv.Itoa(int(r.PortStart)), r.transport().ToSPDKTransportType()); err != nil {
