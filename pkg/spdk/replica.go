@@ -325,7 +325,7 @@ func (r *Replica) prepareIPAndPorts(portCount int32, superiorPortAllocator *comm
 	// portCount+1: the extra slot is the TCP fallback listener at PortStart+1
 	// on dual-listener (RDMA) replicas, so the caller-requested count stays
 	// available for rebuild/clone exposes (which allocate listener pairs too).
-	r.PortStart, r.PortEnd, err = superiorPortAllocator.AllocateRange(portCount + 1)
+	r.PortStart, r.PortEnd, err = allocateUsablePortRange(superiorPortAllocator, r.IP, portCount+1, "replica "+r.Name)
 	if err != nil {
 		return err
 	}

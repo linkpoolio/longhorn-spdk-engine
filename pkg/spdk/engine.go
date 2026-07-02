@@ -390,7 +390,7 @@ func (e *Engine) createNVMeTCPTarget(spdkClient *spdkclient.Client, superiorPort
 		return err
 	}
 
-	port, _, err := superiorPortAllocator.AllocateRange(portCount)
+	port, _, err := allocateUsablePortRange(superiorPortAllocator, podIP, portCount, "engine target "+e.Name)
 	if err != nil {
 		return errors.Wrapf(err, "failed to allocate port for engine target %v", e.Name)
 	}
@@ -422,14 +422,34 @@ func (e *Engine) createNVMeTCPTarget(spdkClient *spdkclient.Client, superiorPort
 	minCntlid, maxCntlid := e.resolveCntlidRange()
 	nsUUID := getStableVolumeNsUUID(e.VolumeName)
 
-	e.log.Infof("Starting to expose RAID bdev for engine target %v on %v:%v with initial ANA state %v, cntlid [%v,%v], nsUUID %v",
-		e.Name, e.NvmeTcpTarget.IP, e.NvmeTcpTarget.Port, initialANAState, minCntlid, maxCntlid, nsUUID)
-	if err := spdkClient.StartExposeBdevWithANAState(e.NvmeTcpTarget.Nqn, e.Name, e.NvmeTcpTarget.Nguid, nsUUID,
-		e.NvmeTcpTarget.IP, strconv.Itoa(int(e.NvmeTcpTarget.Port)), spdkANAState, minCntlid, maxCntlid); err != nil {
+	const maxExposeAttempts = 3
+	for attempt := 1; ; attempt++ {
+		e.log.Infof("Starting to expose RAID bdev for engine target %v on %v:%v with initial ANA state %v, cntlid [%v,%v], nsUUID %v",
+			e.Name, e.NvmeTcpTarget.IP, e.NvmeTcpTarget.Port, initialANAState, minCntlid, maxCntlid, nsUUID)
+		exposeErr := spdkClient.StartExposeBdevWithANAState(e.NvmeTcpTarget.Nqn, e.Name, e.NvmeTcpTarget.Nguid, nsUUID,
+			e.NvmeTcpTarget.IP, strconv.Itoa(int(e.NvmeTcpTarget.Port)), spdkANAState, minCntlid, maxCntlid)
+		if exposeErr == nil {
+			break
+		}
+		// SPDK surfaces a failed listener bind (EADDRINUSE from a kernel
+		// socket squatting the port in the shared network namespace) as a
+		// generic "Invalid parameters" RPC error. The allocation preflight
+		// narrows that window but cannot close it; taint the port (leave it
+		// allocated) and retry on a fresh one instead of failing the create.
+		if attempt < maxExposeAttempts && isListenerBindConflict(exposeErr) {
+			e.log.WithError(exposeErr).Warnf("Engine target expose on %v:%v looks like a listener port conflict; retrying on a fresh port (attempt %d/%d)",
+				e.NvmeTcpTarget.IP, e.NvmeTcpTarget.Port, attempt, maxExposeAttempts)
+			newPort, _, allocErr := allocateUsablePortRange(superiorPortAllocator, e.NvmeTcpTarget.IP, portCount, "engine target "+e.Name)
+			if allocErr != nil {
+				return errors.Wrapf(allocErr, "failed to reallocate port after expose conflict for engine target %v", e.Name)
+			}
+			e.NvmeTcpTarget.Port = newPort
+			continue
+		}
 		// No need to release ports here. The engine will be marked as ERR by
 		// Create's deferred error handler, and Delete will release the ports
 		// when the user cleans up this engine.
-		return errors.Wrapf(err, "failed to start exposing RAID bdev for engine target %v", e.Name)
+		return errors.Wrapf(exposeErr, "failed to start exposing RAID bdev for engine target %v", e.Name)
 	}
 
 	e.NvmeTcpTarget.ANAState = initialANAState

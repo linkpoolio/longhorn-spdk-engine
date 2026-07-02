@@ -332,7 +332,7 @@ func (bi *BackingImage) BackingImageExpose(spdkClient *spdkclient.Client, superi
 		return exposedSnapshotLvolAddress, nil
 	}
 
-	port, _, err := superiorPortAllocator.AllocateRange(int32(types.BackingImagePortCount))
+	port, _, err := allocateUsablePortRange(superiorPortAllocator, podIP, int32(types.BackingImagePortCount), "backing image "+bi.Name)
 	if err != nil {
 		return "", err
 	}
@@ -528,7 +528,7 @@ func (bi *BackingImage) prepareBackingImageSnapshot(spdkClient *spdkclient.Clien
 	if err != nil {
 		return err
 	}
-	port, _, err := superiorPortAllocator.AllocateRange(int32(types.BackingImagePortCount))
+	port, _, err := allocateUsablePortRange(superiorPortAllocator, podIP, int32(types.BackingImagePortCount), "backing image "+bi.Name)
 	if err != nil {
 		return err
 	}
