@@ -1106,13 +1106,26 @@ func (i *Initiator) disconnectDeadSiblingControllers(goodIP, goodPort string) {
 		i.logger.WithError(err).Warn("Failed to list subsystems while clearing dead sibling controllers after connect")
 		return
 	}
-	for _, path := range deadSiblingControllerPaths(subsystems, i.NVMeTCPInfo.SubsystemNQN, goodIP, goodPort) {
-		i.logger.Warnf("Disconnecting dead NVMe/TCP sibling %s (%s, state=%s) for %s after connecting %s:%s",
-			path.Name, path.Address, path.State, i.NVMeTCPInfo.SubsystemNQN, goodIP, goodPort)
-		if err := disconnectControllerWithTimeout(path.Name, staleControllerDisconnectTimeout, i.executor); err != nil {
-			i.logger.WithError(err).Warnf("Failed to disconnect dead NVMe/TCP sibling %s within %s", path.Name, staleControllerDisconnectTimeout)
+	disconnectControllerPaths(
+		deadSiblingControllerPaths(subsystems, i.NVMeTCPInfo.SubsystemNQN, goodIP, goodPort),
+		i.NVMeTCPInfo.SubsystemNQN, fmt.Sprintf("dead sibling after connecting %s:%s", goodIP, goodPort),
+		i.executor, i.logger)
+}
+
+// disconnectControllerPaths force-disconnects each controller path with the
+// bounded stale-controller timeout and returns how many succeeded. reason is
+// woven into the logs so each caller keeps its context.
+func disconnectControllerPaths(paths []Path, nqn, reason string, executor *commonns.Executor, logger logrus.FieldLogger) int {
+	disconnected := 0
+	for _, path := range paths {
+		logger.Warnf("Disconnecting %s: controller %s (%s, state=%s) for %s", reason, path.Name, path.Address, path.State, nqn)
+		if err := disconnectControllerWithTimeout(path.Name, staleControllerDisconnectTimeout, executor); err != nil {
+			logger.WithError(err).Warnf("Failed to disconnect controller %s for %s within %s", path.Name, nqn, staleControllerDisconnectTimeout)
+			continue
 		}
+		disconnected++
 	}
+	return disconnected
 }
 
 // DisconnectDeadSubsystemControllers disconnects every non-live controller of
@@ -1137,7 +1150,7 @@ func DisconnectDeadSubsystemControllers(nqn string, executor *commonns.Executor,
 		logger.WithError(err).Warnf("Failed to list subsystems while clearing dead controllers of %s on delete", nqn)
 		return 0
 	}
-	disconnected := 0
+	var dead []Path
 	for _, sys := range subsystems {
 		if sys.NQN != nqn {
 			continue
@@ -1147,15 +1160,10 @@ func DisconnectDeadSubsystemControllers(nqn string, executor *commonns.Executor,
 				logger.Warnf("Found LIVE controller %s (%s) for %s while deleting a frontend with no initiator; not disconnecting", path.Name, path.Address, nqn)
 				continue
 			}
-			logger.Warnf("Disconnecting dead controller %s (%s, state=%s) for %s on frontend delete", path.Name, path.Address, path.State, nqn)
-			if err := disconnectControllerWithTimeout(path.Name, staleControllerDisconnectTimeout, executor); err != nil {
-				logger.WithError(err).Warnf("Failed to disconnect dead controller %s for %s within %s", path.Name, nqn, staleControllerDisconnectTimeout)
-				continue
-			}
-			disconnected++
+			dead = append(dead, path)
 		}
 	}
-	return disconnected
+	return disconnectControllerPaths(dead, nqn, "dead controller on frontend delete", executor, logger)
 }
 
 // findControllerBySubsystem looks up the controller name for the given NQN
