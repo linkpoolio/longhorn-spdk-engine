@@ -72,6 +72,15 @@ type EngineFrontend struct {
 	initiator      *initiator.Initiator
 	dmDeviceIsBusy bool
 
+	// targetMovedCheck, when set by the server, reports whether the local
+	// engine for this volume now exposes its NVMe-oF target at a different
+	// address than the one being dialed. It is consulted between connect
+	// retry attempts so a dial against a recreated engine's old port aborts
+	// immediately instead of burning the full retry budget while holding
+	// the per-volume host lock. Assigned once before Create/recovery starts
+	// and never mutated afterwards, so it is read without the ef lock.
+	targetMovedCheck func(targetIP string, targetPort int32) error
+
 	IsRestoring           bool
 	RestoringSnapshotName string
 
@@ -1069,12 +1078,32 @@ func (ef *EngineFrontend) createNvmeTcpFrontend(spdkClient *spdkclient.Client, t
 	disconnectTarget := !ef.isExpanding
 	ef.RUnlock()
 
+	// Scope the abort check to this connect only: the initiator is reused by
+	// later operations (switchover, expand) that dial different targets.
+	i.SetAbortCheck(ef.newConnectAbortCheck(targetIP, targetPort, false))
 	dmDeviceIsBusy, err = i.StartNvmeTCPInitiator(targetIP, strconv.Itoa(int(targetPort)), true, disconnectTarget)
+	i.SetAbortCheck(nil)
 	if err != nil {
 		return errors.Wrapf(err, "failed to start NVMe/TCP initiator for engine frontend %v", ef.Name)
 	}
 
 	return nil
+}
+
+// newConnectAbortCheck builds the per-attempt abort callback installed on the
+// initiator for the duration of one connect operation against the given
+// target. With checkRecoveryCancelled set it also aborts when a concurrent
+// EngineFrontendCreate has evicted this recovering frontend.
+func (ef *EngineFrontend) newConnectAbortCheck(targetIP string, targetPort int32, checkRecoveryCancelled bool) func() error {
+	return func() error {
+		if checkRecoveryCancelled && ef.isRecoveryCancelled() {
+			return ErrRecoveryCancelled
+		}
+		if ef.targetMovedCheck == nil {
+			return nil
+		}
+		return ef.targetMovedCheck(targetIP, targetPort)
+	}
 }
 
 func (ef *EngineFrontend) newNvmeTcpInitiator() (i *initiator.Initiator, nqn, nguid string, err error) {
@@ -2443,6 +2472,12 @@ func (ef *EngineFrontend) reconnectNvmeTCPPath(transportAddress string, transpor
 	if ef.initiator == nil {
 		return errors.Wrapf(ErrSwitchOverTargetInternal, "initiator is nil for engine frontend %s", ef.Name)
 	}
+	// Only recovery reconnects a persisted target, which may be stale when
+	// the engine was recreated on a different port after the record was
+	// written; abort the retry loop as soon as that (or eviction by a
+	// concurrent Create) is detected.
+	ef.initiator.SetAbortCheck(ef.newConnectAbortCheck(transportAddress, transportPort, true))
+	defer ef.initiator.SetAbortCheck(nil)
 	return ef.initiator.ReconnectNVMeTCPPath(transportAddress, transportServiceID)
 }
 

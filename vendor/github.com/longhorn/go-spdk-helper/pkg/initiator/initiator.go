@@ -75,7 +75,21 @@ type Initiator struct {
 	hostProc string
 	executor *commonns.Executor
 
+	// abortCheck, when set, is consulted before each connect retry attempt.
+	// A non-nil return aborts the remaining attempts immediately with that
+	// error. Callers use it to bail out of the multi-minute retry loop when
+	// the dialed target is known to be stale (e.g. the engine was recreated
+	// on a different port) or the owning frontend was evicted.
+	abortCheck func() error
+
 	logger logrus.FieldLogger
+}
+
+// SetAbortCheck installs a callback consulted before each NVMe/TCP connect
+// retry attempt; a non-nil return aborts the remaining attempts with that
+// error. Passing nil clears it.
+func (i *Initiator) SetAbortCheck(check func() error) {
+	i.abortCheck = check
 }
 
 type initiatorLock struct {
@@ -859,6 +873,12 @@ func (i *Initiator) discoverAndConnectNVMeTCPTarget(transportAddress, transportS
 	err = retry.Do(
 		func() error {
 			var e error
+
+			if i.abortCheck != nil {
+				if abortErr := i.abortCheck(); abortErr != nil {
+					return retry.Unrecoverable(errors.Wrapf(abortErr, "aborting NVMe/TCP target connect to %s:%s", transportAddress, transportServiceID))
+				}
+			}
 
 			// If SubsystemNQN is already known (e.g. for backup or rebuild
 			// initiators), skip the discovery step and connect directly.

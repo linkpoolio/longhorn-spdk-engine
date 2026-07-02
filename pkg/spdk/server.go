@@ -1191,6 +1191,42 @@ func (s *Server) engineFrontendByVolumeName(volumeName string) *EngineFrontend {
 	return nil
 }
 
+// newEngineTargetMovedCheck returns a callback that reports an error once the
+// local engine for the volume is running with an NVMe-oF target at a
+// different address than the one being dialed. Engines restored from
+// persisted records can be torn down and recreated on a new port while a
+// frontend connect is mid-retry; without this check the connect burns its
+// full retry budget against the dead port while holding the per-volume host
+// lock. When the engine is absent or not yet running the check stays
+// neutral — the regular retry/backoff handles that window.
+func (s *Server) newEngineTargetMovedCheck(volumeName string) func(targetIP string, targetPort int32) error {
+	return func(targetIP string, targetPort int32) error {
+		s.RLock()
+		var engine *Engine
+		for _, e := range s.engineMap {
+			if e.VolumeName == volumeName {
+				engine = e
+				break
+			}
+		}
+		s.RUnlock()
+		if engine == nil {
+			return nil
+		}
+		// Get() falls back to the lock-free snapshot, so this never queues
+		// behind a slow engine operation holding the engine lock.
+		snap := engine.Get()
+		if snap == nil || snap.State != string(types.InstanceStateRunning) || snap.Port == 0 {
+			return nil
+		}
+		if snap.Port != targetPort || (snap.Ip != "" && targetIP != "" && snap.Ip != targetIP) {
+			return errors.Errorf("engine %s target moved to %s:%d while dialing %s:%d",
+				snap.Name, snap.Ip, snap.Port, targetIP, targetPort)
+		}
+		return nil
+	}
+}
+
 func toEngineFrontendCreateGRPCError(err error, format string, args ...any) error {
 	code := grpccodes.Internal
 
@@ -1390,6 +1426,7 @@ func (s *Server) recoverEngineFrontends(ctx context.Context) {
 		ef := NewEngineFrontend(record.Name, record.EngineName, record.VolumeName,
 			record.Frontend, record.SpecSize, 0, 0, s.updateChs[types.InstanceTypeEngineFrontend])
 		ef.metadataDir = s.metadataDir
+		ef.targetMovedCheck = s.newEngineTargetMovedCheck(record.VolumeName)
 		// Tag with the engine target's actual transport (TCP; see
 		// EngineFrontendCreate). RDMA-specific teardown at switchover keys on
 		// the transport observed on the live controller, not on this tag.

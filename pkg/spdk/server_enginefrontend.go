@@ -300,6 +300,7 @@ func (s *Server) EngineFrontendCreate(ctx context.Context, req *spdkrpc.EngineFr
 	ef := NewEngineFrontend(req.Name, req.EngineName, req.VolumeName, req.Frontend, req.SpecSize,
 		req.UblkQueueDepth, req.UblkNumberOfQueue, s.updateChs[types.InstanceTypeEngineFrontend])
 	ef.metadataDir = s.metadataDir
+	ef.targetMovedCheck = s.newEngineTargetMovedCheck(req.VolumeName)
 	// Tag the frontend with the engine target's actual transport (TCP — the
 	// kernel initiator dials nvme-tcp), NOT the node's negotiated transport:
 	// on RDMA nodes the latter would tag the path RDMA even though the target
