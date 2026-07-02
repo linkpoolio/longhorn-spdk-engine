@@ -1115,6 +1115,49 @@ func (i *Initiator) disconnectDeadSiblingControllers(goodIP, goodPort string) {
 	}
 }
 
+// DisconnectDeadSubsystemControllers disconnects every non-live controller of
+// the given subsystem and returns how many were disconnected. It is the
+// owner-of-last-resort cleanup for a frontend being deleted WITHOUT a
+// recovered initiator (volume departed the node, or recovery failed): the
+// delete is the last act of the session's owner, and skipping host cleanup
+// there permanently orphans the volume's kernel sessions — the record is
+// removed right after, erasing the last pointer to them. Live controllers are
+// never touched; one is not expected for a frontend in this state, so finding
+// one is logged loudly for investigation. Each disconnect is bounded by
+// staleControllerDisconnectTimeout; failures are logged and skipped.
+func DisconnectDeadSubsystemControllers(nqn string, executor *commonns.Executor, logger logrus.FieldLogger) int {
+	if nqn == "" {
+		return 0
+	}
+	if logger == nil {
+		logger = logrus.StandardLogger()
+	}
+	subsystems, err := GetSubsystems(executor)
+	if err != nil {
+		logger.WithError(err).Warnf("Failed to list subsystems while clearing dead controllers of %s on delete", nqn)
+		return 0
+	}
+	disconnected := 0
+	for _, sys := range subsystems {
+		if sys.NQN != nqn {
+			continue
+		}
+		for _, path := range sys.Paths {
+			if strings.EqualFold(path.State, "live") {
+				logger.Warnf("Found LIVE controller %s (%s) for %s while deleting a frontend with no initiator; not disconnecting", path.Name, path.Address, nqn)
+				continue
+			}
+			logger.Warnf("Disconnecting dead controller %s (%s, state=%s) for %s on frontend delete", path.Name, path.Address, path.State, nqn)
+			if err := disconnectControllerWithTimeout(path.Name, staleControllerDisconnectTimeout, executor); err != nil {
+				logger.WithError(err).Warnf("Failed to disconnect dead controller %s for %s within %s", path.Name, nqn, staleControllerDisconnectTimeout)
+				continue
+			}
+			disconnected++
+		}
+	}
+	return disconnected
+}
+
 // findControllerBySubsystem looks up the controller name for the given NQN
 // and transport address via subsystem listing. This is used as a fallback
 // when ConnectTarget reports "already connected" but GetDevices cannot find

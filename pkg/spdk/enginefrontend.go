@@ -24,6 +24,7 @@ import (
 	"github.com/longhorn/types/pkg/generated/spdkrpc"
 
 	commonbitmap "github.com/longhorn/go-common-libs/bitmap"
+	commonTypes "github.com/longhorn/go-common-libs/types"
 	spdkclient "github.com/longhorn/go-spdk-helper/pkg/spdk/client"
 	helpertypes "github.com/longhorn/go-spdk-helper/pkg/types"
 	helperutil "github.com/longhorn/go-spdk-helper/pkg/util"
@@ -112,6 +113,8 @@ type EngineFrontend struct {
 	reconnectNvmeTCPPathFn func(transportAddress, transportServiceID string) error
 	// Test hook for target TCP reachability check during recovery.
 	checkTargetReachableFn func(address string) error
+	// Test hook for the ownerless-delete dead controller disconnect.
+	disconnectDeadSubsystemControllersFn func(nqn string) int
 	// Test hook for initiator NVMe device info loading.
 	loadInitiatorNVMeDeviceInfoFn func(transportAddress, transportServiceID, subsystemNQN string) error
 	// Test hook for initiator endpoint loading.
@@ -955,6 +958,17 @@ func (ef *EngineFrontend) Delete(spdkClient *spdkclient.Client) (err error) {
 		ef.Endpoint = ""
 
 		requireUpdate = true
+	} else if ef.NvmeTcpFrontend != nil {
+		// No initiator was ever recovered (the volume departed this node, or
+		// recovery failed) — but the volume's kernel sessions may still exist
+		// here, and this delete is their owner's last act: the record is
+		// removed below, erasing the last pointer to them. Disconnect the
+		// subsystem's dead controllers so they cannot outlive their owner.
+		// Bounded and best-effort; live controllers are never touched.
+		nqn, _ := ef.getVolumeTargetIdentity()
+		if n := ef.disconnectDeadSubsystemControllers(nqn); n > 0 {
+			ef.log.Warnf("Disconnected %d dead kernel controller(s) for %s while deleting engine frontend with no initiator", n, nqn)
+		}
 	}
 
 	if ef.NvmeTcpFrontend != nil {
@@ -1088,6 +1102,21 @@ func (ef *EngineFrontend) createNvmeTcpFrontend(spdkClient *spdkclient.Client, t
 	}
 
 	return nil
+}
+
+// disconnectDeadSubsystemControllers clears the volume subsystem's non-live
+// kernel controllers when this frontend is deleted without a recovered
+// initiator. Best-effort: an executor failure just skips the cleanup.
+func (ef *EngineFrontend) disconnectDeadSubsystemControllers(nqn string) int {
+	if ef.disconnectDeadSubsystemControllersFn != nil {
+		return ef.disconnectDeadSubsystemControllersFn(nqn)
+	}
+	executor, err := helperutil.NewExecutor(commonTypes.ProcDirectory)
+	if err != nil {
+		ef.log.WithError(err).Warn("Failed to create executor for dead controller cleanup on delete")
+		return 0
+	}
+	return initiator.DisconnectDeadSubsystemControllers(nqn, executor, logrus.WithField("engineFrontendName", ef.Name))
 }
 
 // newConnectAbortCheck builds the per-attempt abort callback installed on the
