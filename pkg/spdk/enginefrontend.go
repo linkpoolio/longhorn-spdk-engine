@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -36,6 +37,11 @@ import (
 
 type EngineFrontend struct {
 	sync.RWMutex
+
+	// getSnapshot holds the most recently built RPC view of this engine
+	// frontend. Get() serves it when the mutex is write-held by a slow
+	// operation, so list/monitor reads never queue behind host NVMe/dm work.
+	getSnapshot atomic.Pointer[spdkrpc.EngineFrontend]
 
 	Name        string
 	EngineName  string
@@ -1095,6 +1101,7 @@ func (ef *EngineFrontend) getEngineServiceAddress() string {
 }
 
 func (ef *EngineFrontend) getWithoutLock() (res *spdkrpc.EngineFrontend) {
+	defer func() { ef.getSnapshot.Store(res) }()
 	res = &spdkrpc.EngineFrontend{
 		Name:       ef.Name,
 		VolumeName: ef.VolumeName,
@@ -1179,7 +1186,15 @@ func (ef *EngineFrontend) SetErrorState() {
 
 // Get returns a copy of the current engine frontend state.
 func (ef *EngineFrontend) Get() (res *spdkrpc.EngineFrontend) {
-	ef.RLock()
+	// Never block a read behind a long-held write lock. Serve the last
+	// snapshot instead; it is refreshed on every successful read and by the
+	// mutating paths that return frontend state.
+	if !ef.TryRLock() {
+		if snap := ef.getSnapshot.Load(); snap != nil {
+			return snap
+		}
+		ef.RLock()
+	}
 	defer ef.RUnlock()
 
 	return ef.getWithoutLock()

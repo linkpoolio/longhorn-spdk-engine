@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -125,6 +126,12 @@ func (m *MockReplicaAdder) ReplicaAddFinish(srcReplicaServiceCli, dstReplicaServ
 
 type Engine struct {
 	sync.RWMutex
+
+	// getSnapshot holds the most recently built RPC view of this engine.
+	// Get() serves it when the engine mutex is write-held by a slow
+	// operation (raid assembly, replica attach), so list/monitor reads
+	// never queue behind the data path.
+	getSnapshot atomic.Pointer[spdkrpc.Engine]
 
 	ctx       context.Context
 	cancelCtx context.CancelFunc
@@ -1229,13 +1236,23 @@ func releasePortIfExists(superiorPortAllocator *commonbitmap.Bitmap, ports map[i
 }
 
 func (e *Engine) Get() (res *spdkrpc.Engine) {
-	e.RLock()
+	// Never block a read behind a long-held write lock (engine creation
+	// attaches replicas and assembles the raid while holding it). Serve the
+	// last snapshot instead; it is refreshed on every successful read and by
+	// the mutating paths that return engine state.
+	if !e.TryRLock() {
+		if snap := e.getSnapshot.Load(); snap != nil {
+			return snap
+		}
+		e.RLock()
+	}
 	defer e.RUnlock()
 
 	return e.getWithoutLock()
 }
 
 func (e *Engine) getWithoutLock() (res *spdkrpc.Engine) {
+	defer func() { e.getSnapshot.Store(res) }()
 	res = &spdkrpc.Engine{
 		Name:                  e.Name,
 		VolumeName:            e.VolumeName,
