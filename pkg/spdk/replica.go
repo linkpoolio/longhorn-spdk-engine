@@ -158,9 +158,10 @@ type RebuildingDstCache struct {
 	processingSize              uint64
 	snapshotTotalRebuildingSize uint64
 
-	// shallowCopyProgress detects a shallow copy whose handled-cluster count
-	// stops advancing while the status RPCs keep succeeding.
-	shallowCopyProgress shallowCopyProgressTracker
+	// shallow-copy stall watchdog state; see RebuildingDstShallowCopyCheck
+	shallowCopyStallSnapshot string
+	shallowCopyStallHandled  uint64
+	shallowCopyStallSince    time.Time
 }
 
 type RebuildingSrcCache struct {
@@ -3371,7 +3372,7 @@ func (r *Replica) RebuildingDstStart(spdkClient *spdkclient.Client, srcReplicaNa
 	r.rebuildingDstCache.processingSize = 0
 	r.rebuildingDstCache.processedSnapshotList = make([]string, 0, len(rebuildingSnapshotList))
 	r.rebuildingDstCache.processedSnapshotsSize = 0
-	r.rebuildingDstCache.shallowCopyProgress.Reset()
+	r.rebuildingDstCache.shallowCopyStallSince = time.Time{}
 
 	r.isRebuilding = true
 
@@ -3966,22 +3967,17 @@ func (r *Replica) RebuildingDstShallowCopyCheck(spdkClient *spdkclient.Client) (
 				r.rebuildingDstCache.rebuildingSize = r.rebuildingDstCache.rebuildingSize - snapApiLvol.ActualSize + r.rebuildingDstCache.snapshotTotalRebuildingSize
 				r.log.Infof("Rebuilding dst replica detected that snapshot %s shallow copy total size %d is different from the actual size %d, which typically means a range shallow copy", r.rebuildingDstCache.processingSnapshotName, r.rebuildingDstCache.snapshotTotalRebuildingSize, snapApiLvol.ActualSize)
 			}
-			// A brownout can freeze the copy op while every status RPC above keeps
-			// succeeding with the same handled-cluster count; without this the
-			// rebuild would hang until MaxShallowCopyWaitTime (72h). Abort through
-			// the same rebuildingError path an src-reported error takes so the
-			// engine fails the rebuild and Longhorn retries it.
-			if stalled, stallDuration := r.rebuildingDstCache.shallowCopyProgress.Observe(r.rebuildingDstCache.processingSnapshotName, state, handledClusters, time.Now()); stalled {
-				stallErr := fmt.Errorf("snapshot %s shallow copy from src replica %s to dst replica %s stalled at %d of %d handled clusters for %v (max allowed %v), aborting the rebuilding", r.rebuildingDstCache.processingSnapshotName, r.rebuildingDstCache.srcReplicaName, r.Name, handledClusters, totalClusters, stallDuration, MaxShallowCopyStallTime)
-				r.log.WithFields(logrus.Fields{
-					"dstReplica":      r.Name,
-					"srcReplica":      r.rebuildingDstCache.srcReplicaName,
-					"snapshot":        r.rebuildingDstCache.processingSnapshotName,
-					"handledClusters": handledClusters,
-					"totalClusters":   totalClusters,
-					"stallDuration":   stallDuration.String(),
-				}).Error("Rebuilding dst replica detected a stalled shallow copy, aborting the rebuilding so it can be retried")
-				r.rebuildingDstCache.rebuildingError = stallErr.Error()
+			if state != types.ProgressStateInProgress {
+				r.rebuildingDstCache.shallowCopyStallSince = time.Time{}
+			} else if r.rebuildingDstCache.shallowCopyStallSince.IsZero() ||
+				r.rebuildingDstCache.shallowCopyStallSnapshot != r.rebuildingDstCache.processingSnapshotName ||
+				r.rebuildingDstCache.shallowCopyStallHandled != handledClusters {
+				r.rebuildingDstCache.shallowCopyStallSnapshot = r.rebuildingDstCache.processingSnapshotName
+				r.rebuildingDstCache.shallowCopyStallHandled = handledClusters
+				r.rebuildingDstCache.shallowCopyStallSince = time.Now()
+			} else if stallDuration := time.Since(r.rebuildingDstCache.shallowCopyStallSince); stallDuration > MaxShallowCopyStallTime {
+				r.log.Errorf("Rebuilding dst replica detected snapshot %s shallow copy from src replica %s stalled at %d of %d handled clusters for %v (max allowed %v), aborting the rebuilding so it can be retried", r.rebuildingDstCache.processingSnapshotName, r.rebuildingDstCache.srcReplicaName, handledClusters, totalClusters, stallDuration, MaxShallowCopyStallTime)
+				r.rebuildingDstCache.rebuildingError = fmt.Sprintf("snapshot %s shallow copy stalled at %d of %d handled clusters for %v", r.rebuildingDstCache.processingSnapshotName, handledClusters, totalClusters, stallDuration)
 				r.rebuildingDstCache.rebuildingState = types.ProgressStateError
 				r.rebuildingDstCache.processingState = types.ProgressStateError
 			}
