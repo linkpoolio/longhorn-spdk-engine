@@ -44,6 +44,11 @@ const (
 
 	MaxShallowCopyWaitTime   = 72 * time.Hour
 	ShallowCopyCheckInterval = 3 * time.Second
+	// MaxShallowCopyStallTime is how long an in-progress shallow copy may report
+	// the same handled-cluster count before the rebuild is aborted. It bounds the
+	// brownout case MaxShallowCopyWaitTime never catches: the status RPCs keep
+	// succeeding but the copy itself is frozen.
+	MaxShallowCopyStallTime = 5 * time.Minute
 
 	MaxSnapshotCloneWaitTime         = 72 * time.Hour
 	SnapshotCloneStatusCheckInterval = 3 * time.Second
