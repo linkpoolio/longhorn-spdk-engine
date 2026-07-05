@@ -346,3 +346,14 @@ func (c *Client) SendCommand(method string, params interface{}) ([]byte, error) 
 func (c *Client) SendCommandWithLongTimeout(method string, params interface{}) ([]byte, error) {
 	return c.SendMsgAsyncWithTimeout(method, params, DefaultLongTimeout)
 }
+
+// SendCommandWithTimeout sends a command bounded by a caller-supplied timeout.
+// A non-positive timeout falls back to the long timeout. On timeout the caller
+// returns while the dispatcher discards any late response (see handleRecv), so
+// timing out here does not wedge the shared client.
+func (c *Client) SendCommandWithTimeout(method string, params interface{}, timeout time.Duration) ([]byte, error) {
+	if timeout <= 0 {
+		timeout = DefaultLongTimeout
+	}
+	return c.SendMsgAsyncWithTimeout(method, params, timeout)
+}

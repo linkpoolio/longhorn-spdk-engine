@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/cockroachdb/errors"
 
+	"github.com/longhorn/go-spdk-helper/pkg/jsonrpc"
 	spdktypes "github.com/longhorn/go-spdk-helper/pkg/spdk/types"
 )
 
@@ -1024,6 +1026,21 @@ func (c *Client) BdevRaidClearBaseBdevFaultyState(baseBdevName string) (cleared 
 // "multipath": Multipathing behavior: disable, failover, multipath. Default is failover
 func (c *Client) BdevNvmeAttachController(name, subnqn, traddr, trsvcid string, trtype spdktypes.NvmeTransportType, adrfam spdktypes.NvmeAddressFamily,
 	ctrlrLossTimeoutSec, reconnectDelaySec, fastIOFailTimeoutSec int32, multipath string) (bdevNameList []string, err error) {
+	// Long blob recovery time might be needed if the spdk_tgt is not shutdown gracefully.
+	return c.BdevNvmeAttachControllerWithTimeout(name, subnqn, traddr, trsvcid, trtype, adrfam,
+		ctrlrLossTimeoutSec, reconnectDelaySec, fastIOFailTimeoutSec, multipath, jsonrpc.DefaultLongTimeout)
+}
+
+// BdevNvmeAttachControllerWithTimeout is BdevNvmeAttachController with a
+// caller-supplied RPC timeout. Attaching a controller whose target is
+// unreachable, or whose spdk_tgt reactor is wedged, otherwise blocks for the
+// 24h long timeout — and callers such as the engine hold their write lock
+// across the attach, so a single stuck attach freezes every reader on that
+// engine (and, at scale, the whole instance-manager). A bounded timeout lets
+// the attach fail fast so the caller can release the lock and proceed degraded.
+// A non-positive timeout falls back to the long timeout.
+func (c *Client) BdevNvmeAttachControllerWithTimeout(name, subnqn, traddr, trsvcid string, trtype spdktypes.NvmeTransportType, adrfam spdktypes.NvmeAddressFamily,
+	ctrlrLossTimeoutSec, reconnectDelaySec, fastIOFailTimeoutSec int32, multipath string, timeout time.Duration) (bdevNameList []string, err error) {
 	req := spdktypes.BdevNvmeAttachControllerRequest{
 		Name: name,
 		NvmeTransportID: spdktypes.NvmeTransportID{
@@ -1039,8 +1056,7 @@ func (c *Client) BdevNvmeAttachController(name, subnqn, traddr, trsvcid string, 
 		Multipath:            multipath,
 	}
 
-	// Long blob recovery time might be needed if the spdk_tgt is not shutdown gracefully.
-	cmdOutput, err := c.jsonCli.SendCommandWithLongTimeout("bdev_nvme_attach_controller", req)
+	cmdOutput, err := c.jsonCli.SendCommandWithTimeout("bdev_nvme_attach_controller", req, timeout)
 	if err != nil {
 		return nil, err
 	}
