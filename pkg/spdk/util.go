@@ -150,7 +150,15 @@ func attachControllerRPCTimeout(ctrlrLossTimeout, fastIOFailTimeoutSec int) time
 // bdev it is usable — adopt it (return its bdev name). Otherwise it is
 // reconnecting to a dead target with no namespace: detach it once so a later
 // attempt starts clean, and signal the caller to stop retrying.
-func resolveAttachAlreadyExists(spdkClient *spdkclient.Client, controllerName string) (bdevName string, adopted bool) {
+// attachControllerResolver is the subset of the SPDK client that
+// resolveAttachAlreadyExists needs; a narrow interface keeps the -114 decision
+// unit-testable.
+type attachControllerResolver interface {
+	BdevGetBdevs(name string, timeout uint64) ([]spdktypes.BdevInfo, error)
+	BdevNvmeDetachController(name string) (bool, error)
+}
+
+func resolveAttachAlreadyExists(spdkClient attachControllerResolver, controllerName string) (bdevName string, adopted bool) {
 	nvmeBdevName := controllerName + "n1"
 	if bdevs, err := spdkClient.BdevGetBdevs(nvmeBdevName, 0); err == nil && len(bdevs) == 1 {
 		return nvmeBdevName, true
