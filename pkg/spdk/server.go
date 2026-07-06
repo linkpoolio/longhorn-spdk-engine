@@ -83,6 +83,12 @@ type Server struct {
 	// (e.g. /var/lib/longhorn). If empty, persistence is disabled.
 	metadataDir string
 
+	// nodeTransport is this IM node's negotiated NVMe-oF transport (TCP or
+	// RDMA), detected once at startup from SPDK's available transports. It
+	// is propagated to every Engine/Replica/EngineFrontend created here so
+	// they expose/dial the matching transport.
+	nodeTransport NvmfTransportType
+
 	newServiceClient ServiceClientFactory
 }
 
@@ -109,6 +115,8 @@ func NewServer(ctx context.Context, portStart, portEnd int32, newServiceClient S
 		replicaKeepAliveTimeoutMs); err != nil {
 		return nil, errors.Wrap(err, "failed to set NVMe options")
 	}
+
+	nodeTransport := NegotiateNodeTransport(cli)
 
 	broadcasters := map[types.InstanceType]*broadcaster.Broadcaster{}
 	broadcastChs := map[types.InstanceType]chan interface{}{}
@@ -144,6 +152,7 @@ func NewServer(ctx context.Context, portStart, portEnd int32, newServiceClient S
 		volumeHostLocks: map[string]*volumeHostLockEntry{},
 
 		metadataDir:      types.MetadataDir,
+		nodeTransport:    nodeTransport,
 		newServiceClient: newServiceClient,
 	}
 	s.hotplugActive.Store(true)
