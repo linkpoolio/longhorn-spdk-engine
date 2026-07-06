@@ -71,6 +71,17 @@ const (
 	replicaKeepAliveTimeoutMs   = 10000
 	replicaMultipath            = "disable"
 
+	// Rebuild-path bdev_nvme timeouts, applied to the clone/rebuild remote
+	// attaches in replica.go. Generous enough to ride out a slow-but-alive
+	// rebuild source without declaring it dead (the source is often the
+	// volume's only healthy replica, so a premature controller loss cascades
+	// into a faulted volume). Must respect SPDK's attach-time ordering
+	// reconnect_delay_sec <= fast_io_fail_timeout_sec <= ctrlr_loss_timeout_sec
+	// (rpc_bdev_nvme_attach_controller validation in bdev_nvme.c).
+	rebuildCtrlrLossTimeoutSec  = 30
+	rebuildReconnectDelaySec    = 5
+	rebuildFastIOFailTimeoutSec = 15
+
 	// replicaTransportTos tags outbound NVMe-oF packets with DSCP. SPDK passes
 	// this byte to rdma_set_option(RDMA_OPTION_ID_TOS), the raw 8-bit IPv4 TOS
 	// (DSCP in the upper 6 bits). DSCP 26 (AF31) = TOS 26<<2 = 104.

@@ -2456,8 +2456,11 @@ func (r *Replica) SnapshotCloneSrcStart(spdkClient *spdkclient.Client, snapshotN
 	}
 
 	dstCloningLvolName := GetReplicaCloningLvolName(dstReplicaName)
-	dstCloningBdevName, err := connectNVMfBdev(spdkClient, dstCloningLvolName, dstCloningLvolAddress,
-		replicaCtrlrLossTimeoutSec, replicaFastIOFailTimeoutSec, maxRetries, retryInterval)
+	// The cloning lvol is exposed on a single dedicated listener; the legacy
+	// +1 TCP fallback only exists for replica primary listeners, so it stays
+	// disabled here.
+	dstCloningBdevName, _, _, err := connectNVMfBdevWithReconnect(spdkClient, dstCloningLvolName, dstCloningLvolAddress, r.transport(),
+		rebuildCtrlrLossTimeoutSec, rebuildReconnectDelaySec, rebuildFastIOFailTimeoutSec, maxRetries, retryInterval, false)
 	if err != nil {
 		return err
 	}
@@ -2668,7 +2671,10 @@ func (r *Replica) rebuildingSrcAttachNoLock(spdkClient *spdkclient.Client, dstRe
 		return nil
 	}
 
-	r.rebuildingSrcCache.dstRebuildingBdevName, err = connectNVMfBdev(spdkClient, dstRebuildingLvolName, dstRebuildingLvolAddress, replicaCtrlrLossTimeoutSec, replicaFastIOFailTimeoutSec, maxRetries, retryInterval)
+	// The dst rebuilding lvol is exposed on a single dedicated listener; the
+	// legacy +1 TCP fallback only exists for replica primary listeners, so it
+	// stays disabled here.
+	r.rebuildingSrcCache.dstRebuildingBdevName, _, _, err = connectNVMfBdevWithReconnect(spdkClient, dstRebuildingLvolName, dstRebuildingLvolAddress, r.transport(), rebuildCtrlrLossTimeoutSec, rebuildReconnectDelaySec, rebuildFastIOFailTimeoutSec, maxRetries, retryInterval, false)
 	if err != nil {
 		return errors.Wrapf(err, "failed to connect rebuilding lvol %s with address %s as a NVMe bdev for replica %s rebuilding src attach", dstRebuildingLvolName, dstRebuildingLvolAddress, r.Name)
 	}
@@ -3096,8 +3102,11 @@ func (r *Replica) RebuildingDstStart(spdkClient *spdkclient.Client, srcReplicaNa
 	}
 
 	externalSnapshotLvolName := GetReplicaSnapshotLvolName(srcReplicaName, externalSnapshotName)
-	externalSnapshotBdevName, err := connectNVMfBdev(spdkClient, externalSnapshotLvolName, externalSnapshotAddress,
-		replicaCtrlrLossTimeoutSec, replicaFastIOFailTimeoutSec, maxRetries, retryInterval)
+	// The exposed src snapshot lives on a single dedicated listener; the
+	// legacy +1 TCP fallback only exists for replica primary listeners, so it
+	// stays disabled here.
+	externalSnapshotBdevName, _, _, err := connectNVMfBdevWithReconnect(spdkClient, externalSnapshotLvolName, externalSnapshotAddress, r.transport(),
+		rebuildCtrlrLossTimeoutSec, rebuildReconnectDelaySec, rebuildFastIOFailTimeoutSec, maxRetries, retryInterval, false)
 	if err != nil {
 		return "", errors.Wrapf(err, "failed to connect the external src snapshot lvol %s with address %s as a NVMf bdev for dst replica %v rebuilding start", externalSnapshotLvolName, externalSnapshotAddress, r.Name)
 	}
