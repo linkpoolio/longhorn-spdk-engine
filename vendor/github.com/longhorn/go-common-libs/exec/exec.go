@@ -86,6 +86,23 @@ func (e *Executor) executeCmd(cmd *exec.Cmd, timeout time.Duration) (string, err
 				cmd.Path, cmd.Args, output.String(), stderr.String())
 		}
 	case <-ctx.Done():
+		// Kill the process on timeout. The command was built with exec.Command
+		// (not CommandContext), so without this the orphaned child keeps running
+		// after the Go caller has already returned. For nsenter-backed commands
+		// (nsenter execs into the target, so it shares one PID), this SIGKILL
+		// reaps the dmsetup/nvme process that would otherwise hold the dm device
+		// in a transitional state (e.g. suspended mid-flight) and race the
+		// caller's retry — which is what wedges an instance manager in
+		// uninterruptible D-state on a storage-node restart. The kill is
+		// best-effort: a process already blocked in the kernel (D-state) will
+		// not die until its syscall returns, but the pending SIGKILL guarantees
+		// it dies the moment that happens instead of lingering indefinitely.
+		// errChan is intentionally not drained synchronously: doing so would
+		// block forever on a D-stuck process and reintroduce the hang; the
+		// goroutine unwinds itself once the killed process exits.
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
 		return "", errors.Errorf("timeout executing: %v %v", cmd.Path, cmd.Args)
 	}
 

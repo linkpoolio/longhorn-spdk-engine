@@ -42,6 +42,12 @@ type Client struct {
 	// TODO: may need to launch a cleanup mechanism for the entries that has been there for a long time.
 	responseChans       map[uint32]chan *Response
 	responseChanInfoMap map[uint32]string
+
+	// defaultTimeout is applied by SendCommand. It defaults to
+	// DefaultShortTimeout; use NewClientWithTimeout to override it (e.g. for
+	// PreStop-hook CLIs that cannot afford to wait a full minute on a wedged
+	// SPDK target).
+	defaultTimeout time.Duration
 }
 
 type messageWrapper struct {
@@ -51,6 +57,17 @@ type messageWrapper struct {
 }
 
 func NewClient(ctx context.Context, conn net.Conn) *Client {
+	return NewClientWithTimeout(ctx, conn, DefaultShortTimeout)
+}
+
+// NewClientWithTimeout is NewClient with a custom default timeout for
+// SendCommand. A non-positive defaultTimeout falls back to
+// DefaultShortTimeout.
+func NewClientWithTimeout(ctx context.Context, conn net.Conn, defaultTimeout time.Duration) *Client {
+	if defaultTimeout <= 0 {
+		defaultTimeout = DefaultShortTimeout
+	}
+
 	c := &Client{
 		ctx: ctx,
 
@@ -71,6 +88,8 @@ func NewClient(ctx context.Context, conn net.Conn) *Client {
 		respReceiverQueue:   make(chan *Response, DefaultConcurrentLimit),
 		responseChans:       make(map[uint32]chan *Response),
 		responseChanInfoMap: make(map[uint32]string),
+
+		defaultTimeout: defaultTimeout,
 	}
 	c.encoder.SetIndent("", "\t")
 
@@ -321,9 +340,20 @@ func (c *Client) SendMsgAsyncWithTimeout(method string, params interface{}, time
 }
 
 func (c *Client) SendCommand(method string, params interface{}) ([]byte, error) {
-	return c.SendMsgAsyncWithTimeout(method, params, DefaultShortTimeout)
+	return c.SendMsgAsyncWithTimeout(method, params, c.defaultTimeout)
 }
 
 func (c *Client) SendCommandWithLongTimeout(method string, params interface{}) ([]byte, error) {
 	return c.SendMsgAsyncWithTimeout(method, params, DefaultLongTimeout)
+}
+
+// SendCommandWithTimeout sends a command bounded by a caller-supplied timeout.
+// A non-positive timeout falls back to the long timeout. On timeout the caller
+// returns while the dispatcher discards any late response (see handleRecv), so
+// timing out here does not wedge the shared client.
+func (c *Client) SendCommandWithTimeout(method string, params interface{}, timeout time.Duration) ([]byte, error) {
+	if timeout <= 0 {
+		timeout = DefaultLongTimeout
+	}
+	return c.SendMsgAsyncWithTimeout(method, params, timeout)
 }

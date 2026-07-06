@@ -116,7 +116,7 @@ github.com/longhorn/backupstore
 github.com/longhorn/backupstore/logging
 github.com/longhorn/backupstore/types
 github.com/longhorn/backupstore/util
-# github.com/longhorn/go-common-libs v0.0.0-20260502161928-1e84fa75a8f1
+# github.com/longhorn/go-common-libs v0.0.0-20260502161928-1e84fa75a8f1 => github.com/linkpoolio/go-common-libs v0.0.0-20260623134507-fea5f2490080
 ## explicit; go 1.25.0
 github.com/longhorn/go-common-libs/backup
 github.com/longhorn/go-common-libs/bitmap
@@ -129,7 +129,7 @@ github.com/longhorn/go-common-libs/sync
 github.com/longhorn/go-common-libs/sys
 github.com/longhorn/go-common-libs/types
 github.com/longhorn/go-common-libs/utils
-# github.com/longhorn/go-spdk-helper v0.6.3-0.20260628115240-ebdbbdcde6a9
+# github.com/longhorn/go-spdk-helper v0.6.3-0.20260628115240-ebdbbdcde6a9 => github.com/linkpoolio/go-spdk-helper v0.6.1-0.20260706091300-79ed23481fc1
 ## explicit; go 1.25.3
 github.com/longhorn/go-spdk-helper/pkg/initiator
 github.com/longhorn/go-spdk-helper/pkg/jsonrpc
@@ -138,8 +138,8 @@ github.com/longhorn/go-spdk-helper/pkg/spdk/setup
 github.com/longhorn/go-spdk-helper/pkg/spdk/types
 github.com/longhorn/go-spdk-helper/pkg/types
 github.com/longhorn/go-spdk-helper/pkg/util
-# github.com/longhorn/types v0.0.0-20260514154143-1dfb06f48eeb
-## explicit; go 1.24.0
+# github.com/longhorn/types v0.0.0-20260514154143-1dfb06f48eeb => github.com/linkpoolio/types v0.0.0-20260610135513-3130d10db443
+## explicit; go 1.25.0
 github.com/longhorn/types/pkg/generated/enginerpc
 github.com/longhorn/types/pkg/generated/imrpc
 github.com/longhorn/types/pkg/generated/spdkrpc
@@ -458,3 +458,6 @@ sigs.k8s.io/randfill/bytesource
 # sigs.k8s.io/structured-merge-diff/v6 v6.3.2
 ## explicit; go 1.23
 sigs.k8s.io/structured-merge-diff/v6/value
+# github.com/longhorn/types => github.com/linkpoolio/types v0.0.0-20260610135513-3130d10db443
+# github.com/longhorn/go-spdk-helper => github.com/linkpoolio/go-spdk-helper v0.6.1-0.20260706091300-79ed23481fc1
+# github.com/longhorn/go-common-libs => github.com/linkpoolio/go-common-libs v0.0.0-20260623134507-fea5f2490080
