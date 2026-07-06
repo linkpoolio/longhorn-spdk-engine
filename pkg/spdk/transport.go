@@ -2,6 +2,7 @@ package spdk
 
 import (
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/sirupsen/logrus"
@@ -80,7 +81,12 @@ var (
 		IoUnitSize:          uint32(envIntOrDefault("LONGHORN_V2_NVMF_RDMA_IO_UNIT_SIZE", 8192)),
 		MaxAqDepth:          uint32(envIntOrDefault("LONGHORN_V2_NVMF_RDMA_MAX_AQ_DEPTH", 128)),
 		NumSharedBuffers:    uint32(envIntOrDefault("LONGHORN_V2_NVMF_RDMA_NUM_SHARED_BUFFERS", 4095)),
-		BufCacheSize:        uint32(envIntOrDefault("LONGHORN_V2_NVMF_RDMA_BUF_CACHE_SIZE", 64)),
+		// Explicit per-poll-group iobuf cache caps (v26.05): without them the
+		// default cache is pool/(2*poll_groups) PER TRANSPORT, so two
+		// transports' caches consume the whole pool at any pool size.
+		// buf_cache_size must NOT be sent alongside (shared C-union slot).
+		IobufSmallCacheSize: uint32(envIntOrDefault("LONGHORN_V2_NVMF_RDMA_IOBUF_SMALL_CACHE_SIZE", 64)),
+		IobufLargeCacheSize: uint32(envIntOrDefault("LONGHORN_V2_NVMF_RDMA_IOBUF_LARGE_CACHE_SIZE", 64)),
 		Zcopy:               boolPtr(true),
 		DataWrPoolSize:      uint32(envIntOrDefault("LONGHORN_V2_NVMF_RDMA_DATA_WR_POOL_SIZE", 4095)),
 		AcceptorPollRate:    uint32(envIntOrDefault("LONGHORN_V2_NVMF_RDMA_ACCEPTOR_POLL_RATE", 10000)),
@@ -101,7 +107,9 @@ var (
 		IoUnitSize:          uint32(envIntOrDefault("LONGHORN_V2_NVMF_TCP_IO_UNIT_SIZE", 131072)),
 		MaxAqDepth:          uint32(envIntOrDefault("LONGHORN_V2_NVMF_TCP_MAX_AQ_DEPTH", 128)),
 		NumSharedBuffers:    uint32(envIntOrDefault("LONGHORN_V2_NVMF_TCP_NUM_SHARED_BUFFERS", 2047)),
-		BufCacheSize:        uint32(envIntOrDefault("LONGHORN_V2_NVMF_TCP_BUF_CACHE_SIZE", 64)),
+		// See the RDMA opts note: explicit caps, and never buf_cache_size.
+		IobufSmallCacheSize: uint32(envIntOrDefault("LONGHORN_V2_NVMF_TCP_IOBUF_SMALL_CACHE_SIZE", 64)),
+		IobufLargeCacheSize: uint32(envIntOrDefault("LONGHORN_V2_NVMF_TCP_IOBUF_LARGE_CACHE_SIZE", 64)),
 		Zcopy:               boolPtr(true),
 		AcceptorPollRate:    uint32(envIntOrDefault("LONGHORN_V2_NVMF_TCP_ACCEPTOR_POLL_RATE", 10000)),
 	}
@@ -127,4 +135,87 @@ func NegotiateNodeTransport(spdkClient *spdkclient.Client) NvmfTransportType {
 	}
 	logrus.Info("NVMe-oF RDMA transport negotiated on this node with tuned opts")
 	return NvmfTransportRDMA
+}
+
+// iobufPoolCounts derives the iobuf pool sizes from what this node will
+// actually configure, instead of a hand-tuned constant:
+//
+//	large = SPDK base
+//	      + each created transport's num_shared_buffers (its in-flight
+//	        working set — pre-v26.05 this lived in a private per-transport
+//	        pool; v26.05 moved it into the shared iobuf pool)
+//	      + each transport's per-poll-group cache cap x reactors
+//	      + a per-reactor allowance for bdev/accel channel caches
+//
+// The small pool follows the same shape on the SPDK small-pool baseline.
+// Transport caches MUST be explicitly capped (IobufSmall/LargeCacheSize in
+// the opts): the v26.05 default cache is pool/(2*poll_groups) per transport,
+// which makes demand scale with the pool itself and never converge.
+func iobufPoolCounts(rdmaCapable bool, reactors int) (small, large uint64) {
+	if reactors < 1 {
+		reactors = 1
+	}
+	r := uint64(reactors)
+
+	// Per-reactor allowance for the non-transport channel caches (bdev,
+	// accel, blobstore md): SPDK populates small per-channel caches on
+	// demand; 64 large + 128 small per reactor covers the observed set.
+	const chanLargePerReactor = 64
+	const chanSmallPerReactor = 128
+
+	large = iobufBaseLargePoolCount +
+		uint64(nvmfTcpOpts.NumSharedBuffers) +
+		uint64(nvmfTcpOpts.IobufLargeCacheSize)*r +
+		chanLargePerReactor*r
+	small = iobufBaseSmallPoolCount +
+		uint64(nvmfTcpOpts.IobufSmallCacheSize)*r +
+		chanSmallPerReactor*r
+	if rdmaCapable {
+		large += uint64(nvmfRdmaOpts.NumSharedBuffers) +
+			uint64(nvmfRdmaOpts.IobufLargeCacheSize)*r
+		small += uint64(nvmfRdmaOpts.IobufSmallCacheSize) * r
+	}
+	return small, large
+}
+
+// iobufPoolBytes is the hugepage memory the derived pools will pin.
+func iobufPoolBytes(small, large uint64) uint64 {
+	return small*iobufSmallBufsize + large*iobufLargeBufsize
+}
+
+// spdkMemSizeBytes returns the node's SPDK hugepage allocation: the
+// LONGHORN_V2_SPDK_MEM_SIZE_MIB env exported by the IM wrapper from the
+// --mem-size argument (the Longhorn spdk-memory-size setting / per-node
+// label), falling back to the host's total 2MiB hugepage reservation from
+// /proc/meminfo. Returns 0 when neither is available.
+func spdkMemSizeBytes() uint64 {
+	if v := envIntOrDefault("LONGHORN_V2_SPDK_MEM_SIZE_MIB", 0); v > 0 {
+		return uint64(v) << 20
+	}
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	var totalPages, pageKiB uint64
+	for _, line := range strings.Split(string(data), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 {
+			continue
+		}
+		switch f[0] {
+		case "HugePages_Total:":
+			totalPages = parseUintOrZero(f[1])
+		case "Hugepagesize:":
+			pageKiB = parseUintOrZero(f[1])
+		}
+	}
+	return totalPages * pageKiB << 10
+}
+
+func parseUintOrZero(s string) uint64 {
+	v, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return v
 }

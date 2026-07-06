@@ -122,14 +122,24 @@ func NewServer(ctx context.Context, portStart, portEnd int32, newServiceClient S
 	//   iobuf_set_options → growing pools post-init is a no-op
 	//   bdev_nvme_set_options → ditto, the initiator defaults are frozen on init
 	// Then framework_start_init drives subsystem init with the tuned opts.
-	iobufLargePoolCount := iobufLargePoolCountTCP
-	if DetectTransport().RDMA {
-		iobufLargePoolCount = iobufLargePoolCountRDMA
+	rdmaCapable := DetectTransport().RDMA
+	reactors := spdkCoreCount()
+	iobufSmall, iobufLarge := iobufPoolCounts(rdmaCapable, reactors)
+	if budget := spdkMemSizeBytes(); budget > 0 {
+		if need := iobufPoolBytes(iobufSmall, iobufLarge); float64(need) > float64(budget)*iobufBudgetMaxFraction {
+			// A clamped pool deadlocks I/O later, which is strictly worse
+			// than refusing to start: this is a node sizing error to fix in
+			// the spdk-memory-size setting or the transport tunables.
+			return nil, fmt.Errorf("derived iobuf pools (small=%d large=%d, %dMiB) exceed %d%% of the node's SPDK hugepage allocation (%dMiB); raise spdk-memory-size or lower the nvmf transport tunables",
+				iobufSmall, iobufLarge, need>>20, int(iobufBudgetMaxFraction*100), budget>>20)
+		}
+	} else {
+		logrus.Warn("Cannot determine the SPDK hugepage allocation; skipping the iobuf pool budget check")
 	}
-	if _, err = cli.IobufSetOptions(iobufSmallPoolCount, iobufLargePoolCount, 0, 0); err != nil {
+	if _, err = cli.IobufSetOptions(iobufSmall, iobufLarge, 0, 0); err != nil {
 		logrus.WithError(err).Warn("Failed to grow iobuf pools before init; transport create may fail with ENOMEM")
 	} else {
-		logrus.Infof("Grew iobuf pools to small=%d large=%d before subsystem init", iobufSmallPoolCount, iobufLargePoolCount)
+		logrus.Infof("Grew iobuf pools to small=%d large=%d (rdma=%v reactors=%d) before subsystem init", iobufSmall, iobufLarge, rdmaCapable, reactors)
 	}
 
 	if _, err = cli.BdevNvmeSetOptionsWithTos(

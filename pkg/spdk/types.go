@@ -81,29 +81,21 @@ const (
 	// (DSCP in the upper 6 bits). DSCP 26 (AF31) = TOS 26<<2 = 104.
 	replicaTransportTos = 104
 
-	// iobuf pool sizes. SPDK defaults are too small once nvmf transports use a
-	// tuned num_shared_buffers; sized for that + accel/bdev channel caches.
-	// Applied via iobuf_set_options before framework_start_init (the IM
-	// entrypoint starts spdk_tgt with --wait-for-rpc).
-	//
-	// Since SPDK v26.05 the nvmf transports draw their data buffers from the
-	// iobuf pool (num_shared_buffers is deprecated), so the pool must cover
-	// the SPDK base demand (4096 large / 8192 small) PLUS every transport's
-	// shared buffers: TCP 2047 on all nodes, RDMA 4095 more on RDMA nodes.
-	// Undersizing surfaces as "Failed to populate 'bdev' iobuf large buffer
-	// cache" and I/O stalls once transports drain the pool.
-	// Observed init demand on a 16-reactor RDMA storage node (ma3-worker-9,
-	// v26.05): ~6.1k transport shared-buffer reservations (RDMA 4095 + TCP
-	// 2047) + 2k RDMA poll-group caches (128 x reactors) + accel/bdev channel
-	// caches — undersizing failed accel channel creation outright (rc=-12)
-	// and kept the disk from attaching. Large-pool hugepage cost at the
-	// default 132KiB bufsize: 8192 ≈ 1.1GiB (TCP nodes), 20480 ≈ 2.6GiB
-	// (RDMA nodes, within the 8-16GiB storage-node budgets). Per-pg transport
-	// caches scale as num_shared_buffers/poll_groups, so nodes with FEWER
-	// reactors cache MORE per pg — observed 1024/pg on ma4-worker-1.
-	iobufLargePoolCountTCP  uint64 = 8192
-	iobufLargePoolCountRDMA uint64 = 20480
-	iobufSmallPoolCount     uint64 = 16384
+	// SPDK's built-in iobuf pool baselines (v26.05 defaults) and buffer sizes.
+	// The pools live in hugepage memory; every data-moving subsystem (bdev,
+	// accel, and — since v26.05 — the nvmf transports) draws per-I/O buffers
+	// from them.
+	iobufBaseSmallPoolCount uint64 = 8192
+	iobufBaseLargePoolCount uint64 = 4096
+	iobufSmallBufsize       uint64 = 8192
+	iobufLargeBufsize       uint64 = 135168
+
+	// iobufBudgetMaxFraction caps the iobuf pools' share of the node's SPDK
+	// hugepage allocation: the same memory must also hold the DPDK heap,
+	// blobstore metadata, accel mempools, and transport WR pools. 50%
+	// reflects the working production floor — consumer nodes on the 2GiB
+	// default have run ~1GiB of pools alongside their data path.
+	iobufBudgetMaxFraction = 0.50
 
 	// accelMlx5MkeysPerCore is the per-core scaling factor for accel_mlx5's mkey
 	// pool. SPDK enforces a minimum of ACCEL_MLX5_MAX_MKEYS_IN_TASK(16) per core;
