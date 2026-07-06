@@ -85,8 +85,18 @@ const (
 	// tuned num_shared_buffers; sized for that + accel/bdev channel caches.
 	// Applied via iobuf_set_options before framework_start_init (the IM
 	// entrypoint starts spdk_tgt with --wait-for-rpc).
-	iobufLargePoolCount uint64 = 4096
-	iobufSmallPoolCount uint64 = 8192
+	//
+	// Since SPDK v26.05 the nvmf transports draw their data buffers from the
+	// iobuf pool (num_shared_buffers is deprecated), so the pool must cover
+	// the SPDK base demand (4096 large / 8192 small) PLUS every transport's
+	// shared buffers: TCP 2047 on all nodes, RDMA 4095 more on RDMA nodes.
+	// Undersizing surfaces as "Failed to populate 'bdev' iobuf large buffer
+	// cache" and I/O stalls once transports drain the pool.
+	// Large-pool hugepage cost at the default 132KiB bufsize:
+	// 8192 ≈ 1.1GiB (TCP nodes), 12288 ≈ 1.6GiB (RDMA nodes).
+	iobufLargePoolCountTCP  uint64 = 8192
+	iobufLargePoolCountRDMA uint64 = 12288
+	iobufSmallPoolCount     uint64 = 16384
 
 	// accelMlx5MkeysPerCore is the per-core scaling factor for accel_mlx5's mkey
 	// pool. SPDK enforces a minimum of ACCEL_MLX5_MAX_MKEYS_IN_TASK(16) per core;

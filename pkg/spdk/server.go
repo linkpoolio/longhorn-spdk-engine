@@ -122,6 +122,10 @@ func NewServer(ctx context.Context, portStart, portEnd int32, newServiceClient S
 	//   iobuf_set_options → growing pools post-init is a no-op
 	//   bdev_nvme_set_options → ditto, the initiator defaults are frozen on init
 	// Then framework_start_init drives subsystem init with the tuned opts.
+	iobufLargePoolCount := iobufLargePoolCountTCP
+	if DetectTransport().RDMA {
+		iobufLargePoolCount = iobufLargePoolCountRDMA
+	}
 	if _, err = cli.IobufSetOptions(iobufSmallPoolCount, iobufLargePoolCount, 0, 0); err != nil {
 		logrus.WithError(err).Warn("Failed to grow iobuf pools before init; transport create may fail with ENOMEM")
 	} else {
