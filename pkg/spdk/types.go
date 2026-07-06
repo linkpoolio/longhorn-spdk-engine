@@ -51,25 +51,19 @@ const (
 )
 
 const (
-	// Timeouts for RAID base bdev (replica)
-	// The ctrlr_loss_timeout_sec setting applies to the base bdev's NVMe controller
-	// and defines the timeout duration (30 seconds) for SPDK to attempt reconnecting to the controller
-	// after losing connection.
-	//
-	// When an instance manager containing a replica is deleted, SPDK starts to reconnect to the base bdev's controller.
-	// If the connection cannot be reestablished within the ctrlr_loss_timeout_sec period, the base bdev is removed from the RAID bdev.
-	//
-	// Because the ctrl-loss-tmo for the NVMe/TCP initiator connecting to the RAID target is also set to 30 seconds,
-	// replicaCtrlrLossTimeoutSec and replicaFastIOFailTimeoutSec are set to 15 seconds and 10 seconds, respectively.
-	//
-	// If an I/O operation to a replica (base bdev) is unresponsive within 10 seconds, an I/O error is returned,
-	// and the base bdev is deleted after 5 seconds.
-	replicaCtrlrLossTimeoutSec  = 15
+	// Timeouts for RAID base bdev (replica), production-tuned: a dead replica
+	// path must be declared lost within seconds — volume failover and
+	// instance-manager kick recovery are choreographed around a 3s controller
+	// loss. Ordering constraint (bdev_nvme attach validation):
+	// reconnect_delay_sec <= fast_io_fail_timeout_sec <= ctrlr_loss_timeout_sec.
+	replicaCtrlrLossTimeoutSec  = 3
 	replicaReconnectDelaySec    = 2
-	replicaFastIOFailTimeoutSec = 10
-	replicaTransportAckTimeout  = 10
-	replicaKeepAliveTimeoutMs   = 10000
-	replicaMultipath            = "disable"
+	replicaFastIOFailTimeoutSec = 2
+	// RDMA retransmit exponent (4.096us * 2^13 ≈ 33ms per retry), tuned
+	// alongside the loss tuple.
+	replicaTransportAckTimeout = 13
+	replicaKeepAliveTimeoutMs  = 10000
+	replicaMultipath           = "disable"
 
 	// Rebuild-path bdev_nvme timeouts, applied to the clone/rebuild remote
 	// attaches in replica.go. Generous enough to ride out a slow-but-alive
