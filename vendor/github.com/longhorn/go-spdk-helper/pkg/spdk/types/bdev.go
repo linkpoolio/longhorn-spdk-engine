@@ -71,8 +71,10 @@ type BdevInfoBasic struct {
 	SupportedIoTypes SupportedIoTypes `json:"supported_io_types"`
 
 	MemoryDomains []struct {
-		DmaDeviceID   string `json:"dma_device_id"`
-		DmaDeviceType int32  `json:"dma_device_type"`
+		DmaDeviceID string `json:"dma_device_id"`
+		// SPDK v26.05 reports the dma device type as its name (e.g. "DMA",
+		// "RDMA"); older targets wrote an int32, which this no longer decodes.
+		DmaDeviceType string `json:"dma_device_type"`
 	} `json:"memory_domains,omitempty"`
 }
 
