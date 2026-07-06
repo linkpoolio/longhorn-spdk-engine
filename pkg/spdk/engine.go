@@ -516,89 +516,59 @@ func (e *Engine) RemoveTargetListener(spdkClient *spdkclient.Client, transport N
 	return nil
 }
 
-// pickReplicaAddress selects the address + transport to dial for a replica.
-// When the transport-aware map carries an entry for the replica (a storage IM
-// that reports its typed TCP/RDMA ports) it is the source of truth. When it
-// does not -- a transport-unaware/older storage IM that reports only the
-// legacy primary port -- we fall back to the addressing convention via
-// legacyTransportFallback, which keeps a rebased engine backward-compatible
-// with storage IMs that predate typed-port reporting (no storage roll needed).
-//
-// The returned legacyConvention flag reports whether the address was derived
-// from the legacy convention (true) or taken from the transport map (false).
-// Only legacy-convention dials may use the runtime TCP fallback at primary+1
-// (see shouldAttemptLegacyTCPFallback).
-func (e *Engine) pickReplicaAddress(replicaName, legacyAddress string, replicaTransportAddressMap map[string]*spdkrpc.ReplicaTransportAddresses) (string, NvmfTransportType, bool) {
-	tAddrs, ok := replicaTransportAddressMap[replicaName]
-	if !ok || tAddrs == nil {
-		return e.legacyTransportFallback(legacyAddress)
+// pickReplicaAddress selects the address + transport to dial for a replica
+// from its typed transport addresses. The map is the source of truth: every
+// storage IM reports its typed TCP/RDMA listener ports, so a missing or empty
+// entry is a misconfiguration to surface, not a case to paper over with an
+// addressing convention.
+func (e *Engine) pickReplicaAddress(replicaName string, replicaTransportAddressMap map[string]*spdkrpc.ReplicaTransportAddresses) (string, NvmfTransportType, error) {
+	addr, transport, err := e.pickFromTransportAddresses(replicaTransportAddressMap[replicaName])
+	if err != nil {
+		return "", "", errors.Wrapf(err, "replica %s", replicaName)
 	}
-	return e.pickFromTransportAddresses(legacyAddress, tAddrs)
+	return addr, transport, nil
 }
 
 // pickRebuildDstAddress applies the same selection rule to a rebuild
 // destination's transport addresses.
-func (e *Engine) pickRebuildDstAddress(legacyAddress string, tAddrs *spdkrpc.ReplicaTransportAddresses) (string, NvmfTransportType, bool) {
-	return e.pickFromTransportAddresses(legacyAddress, tAddrs)
+func (e *Engine) pickRebuildDstAddress(tAddrs *spdkrpc.ReplicaTransportAddresses) (string, NvmfTransportType, error) {
+	return e.pickFromTransportAddresses(tAddrs)
 }
 
-// pickFromTransportAddresses is the shared selection rule when the replica
-// advertises typed transport addresses: prefer the RDMA address when this
-// engine is RDMA-capable and the replica advertises one; otherwise the
-// replica's advertised TCP address; otherwise fall back to the convention.
-func (e *Engine) pickFromTransportAddresses(legacyAddress string, tAddrs *spdkrpc.ReplicaTransportAddresses) (string, NvmfTransportType, bool) {
+// pickFromTransportAddresses prefers the RDMA address when this engine is
+// RDMA-capable and the replica advertises one; otherwise the replica's
+// advertised TCP address (on RDMA storage nodes that is the dedicated TCP
+// listener at primary+1, which keeps engines on TCP-only nodes connected).
+func (e *Engine) pickFromTransportAddresses(tAddrs *spdkrpc.ReplicaTransportAddresses) (string, NvmfTransportType, error) {
 	if tAddrs == nil {
-		return e.legacyTransportFallback(legacyAddress)
+		return "", "", fmt.Errorf("no transport addresses advertised")
 	}
 	if e.replicaTransport().IsRDMA() && tAddrs.RdmaAddress != "" {
-		return tAddrs.RdmaAddress, NvmfTransportRDMA, false
+		return tAddrs.RdmaAddress, NvmfTransportRDMA, nil
 	}
 	if tAddrs.TcpAddress != "" {
-		return tAddrs.TcpAddress, NvmfTransportTCP, false
+		return tAddrs.TcpAddress, NvmfTransportTCP, nil
 	}
-	return e.legacyTransportFallback(legacyAddress)
-}
-
-// legacyTransportFallback derives the address+transport to dial when a replica
-// advertises no usable transport-address map entry, i.e. its storage IM does
-// not report typed TCP/RDMA ports. It mirrors the storage exposure convention
-// (Replica.listenerPortsForTransport / addTCPFallbackListener) and the
-// pre-rebase engine behaviour:
-//
-//   - the legacy address is the replica's primary listener port;
-//   - on an RDMA storage node that primary is the RDMA listener, with a TCP
-//     fallback exposed at primary+1.
-//
-// So an RDMA engine dials the legacy (RDMA primary) address over RDMA, and a
-// TCP engine dials primary+1 over TCP. This keeps a rebased engine connecting
-// to an older, transport-unaware storage IM without a storage roll. If the
-// address can't be parsed, dial it as-is over TCP as a last resort.
-func (e *Engine) legacyTransportFallback(legacyAddress string) (string, NvmfTransportType, bool) {
-	if e.replicaTransport().IsRDMA() {
-		return legacyAddress, NvmfTransportRDMA, true
-	}
-	host, portStr, err := net.SplitHostPort(legacyAddress)
-	if err != nil {
-		return legacyAddress, NvmfTransportTCP, true
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return legacyAddress, NvmfTransportTCP, true
-	}
-	return net.JoinHostPort(host, strconv.Itoa(int(tcpFallbackPortFor(int32(port))))), NvmfTransportTCP, true
+	return "", "", fmt.Errorf("transport addresses carry neither a usable RDMA nor TCP address")
 }
 
 func (e *Engine) connectReplicas(spdkClient *spdkclient.Client, replicaAddressMap map[string]string, replicaTransportAddressMap map[string]*spdkrpc.ReplicaTransportAddresses) []string {
 	replicaBdevList := []string{}
 	for replicaName, replicaAddr := range replicaAddressMap {
-		addr, transport, legacyConvention := e.pickReplicaAddress(replicaName, replicaAddr, replicaTransportAddressMap)
 		e.ReplicaStatusMap[replicaName] = &EngineReplicaStatus{
-			Address:       replicaAddr,
-			DialedAddress: addr,
-			Transport:     transport,
+			Address: replicaAddr,
 		}
 
-		bdevName, dialedAddr, dialedTransport, err := connectNVMfBdevWithTransport(spdkClient, replicaName, addr, transport, e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval, legacyConvention)
+		addr, transport, err := e.pickReplicaAddress(replicaName, replicaTransportAddressMap)
+		if err != nil {
+			e.log.WithError(err).Warnf("Failed to resolve transport addresses for replica %s (canonical address %s) during engine creation, will mark the mode to ERR and continue", replicaName, replicaAddr)
+			e.ReplicaStatusMap[replicaName].Mode = types.ModeERR
+			continue
+		}
+		e.ReplicaStatusMap[replicaName].DialedAddress = addr
+		e.ReplicaStatusMap[replicaName].Transport = transport
+
+		bdevName, dialedAddr, dialedTransport, err := connectNVMfBdevWithTransport(spdkClient, replicaName, addr, transport, e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
 		if err != nil {
 			e.log.WithError(err).Warnf("Failed to get bdev from replica %s with canonical address %s dialed at %s (transport=%s) during engine creation, will mark the mode to ERR and continue", replicaName, replicaAddr, addr, transport)
 			e.ReplicaStatusMap[replicaName].Mode = types.ModeERR
@@ -606,10 +576,8 @@ func (e *Engine) connectReplicas(spdkClient *spdkclient.Client, replicaAddressMa
 			// TODO: Check if a replica is really a RW replica rather than a rebuilding failed replica
 			e.ReplicaStatusMap[replicaName].Mode = types.ModeRW
 			e.ReplicaStatusMap[replicaName].BdevName = bdevName
-			// Record what was actually attached: the connect helper may have
-			// fallen back to the replica's TCP listener at primary+1, and the
-			// dial-address validation in validateAndUpdateReplicaNvme compares
-			// against these fields.
+			// Record what was actually attached: the dial-address validation in
+			// validateAndUpdateReplicaNvme compares against these fields.
 			e.ReplicaStatusMap[replicaName].DialedAddress = dialedAddr
 			e.ReplicaStatusMap[replicaName].Transport = dialedTransport
 			replicaBdevList = append(replicaBdevList, bdevName)
@@ -1241,8 +1209,11 @@ func (e *Engine) replicaAddStart(spdkClient *spdkclient.Client, replicaClients m
 
 	// Add rebuilding replica head bdev to the base bdev list of the RAID bdev,
 	// dialing the transport (RDMA/TCP) the dst replica advertises for its head.
-	attachAddr, attachTransport, legacyConvention := e.pickRebuildDstAddress(dstHeadLvolAddress, dstHeadLvolTransportAddrs)
-	dstHeadLvolBdevName, attachedAddr, attachedTransport, err := connectNVMfBdevWithTransport(spdkClient, dstReplicaName, attachAddr, attachTransport, e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval, legacyConvention)
+	attachAddr, attachTransport, err := e.pickRebuildDstAddress(dstHeadLvolTransportAddrs)
+	if err != nil {
+		return nil, startUpdateRequired, nil, errors.Wrapf(err, "failed to resolve transport addresses for rebuilding dst replica %s head lvol (address %s)", dstReplicaName, dstHeadLvolAddress)
+	}
+	dstHeadLvolBdevName, attachedAddr, attachedTransport, err := connectNVMfBdevWithTransport(spdkClient, dstReplicaName, attachAddr, attachTransport, e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
 	if err != nil {
 		return nil, startUpdateRequired, nil, err
 	}
@@ -2044,7 +2015,7 @@ func (e *Engine) replicaSnapshotOperation(spdkClient *spdkclient.Client, replica
 		// Reconnect re-dials the recorded dial address, which is known-good
 		// from the original attach; the legacy +1 TCP fallback only applies
 		// to first-time legacy-convention dials, so it is disabled here.
-		bdevName, dialedAddr, dialedTransport, err := connectNVMfBdevWithTransport(spdkClient, replicaName, replicaStatus.dialAddress(), replicaStatus.transportOrDefault(e.replicaTransport()), e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval, false)
+		bdevName, dialedAddr, dialedTransport, err := connectNVMfBdevWithTransport(spdkClient, replicaName, replicaStatus.dialAddress(), replicaStatus.transportOrDefault(e.replicaTransport()), e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
 		if err != nil {
 			return err
 		}
@@ -3081,7 +3052,7 @@ func (e *Engine) expandSingleReplica(spdkClient *spdkclient.Client, replicaName 
 
 	// Reconnect re-dials the recorded dial address (see the snapshot revert
 	// path); the legacy +1 TCP fallback is for first-time legacy dials only.
-	_, _, _, err = connectNVMfBdevWithTransport(spdkClient, replicaName, replicaStatus.dialAddress(), replicaStatus.transportOrDefault(e.replicaTransport()), e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval, false)
+	_, _, _, err = connectNVMfBdevWithTransport(spdkClient, replicaName, replicaStatus.dialAddress(), replicaStatus.transportOrDefault(e.replicaTransport()), e.ctrlrLossTimeout, e.fastIOFailTimeoutSec, maxRetries, retryInterval)
 	return err
 }
 

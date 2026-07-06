@@ -360,27 +360,14 @@ func ExtractBackingImageAndDiskUUID(lvolName string) (string, string, error) {
 }
 
 // connectNVMfBdevWithTransport attaches the remote lvol over the given
-// transport and returns the bdev name plus the address/transport actually
-// dialed. They differ from the inputs only when the legacy TCP fallback at
-// primary port+1 was attempted (see shouldAttemptLegacyTCPFallback); callers
-// must record the returned values (EngineReplicaStatus.DialedAddress /
-// .Transport) so dial-address validation compares against what was attached.
-func connectNVMfBdevWithTransport(spdkClient *spdkclient.Client, controllerName, address string, transport NvmfTransportType, ctrlrLossTimeout, fastIOFailTimeoutSec int, maxRetries int, retryInterval time.Duration, allowLegacyTCPFallback bool) (bdevName, dialedAddress string, dialedTransport NvmfTransportType, err error) {
-	return connectNVMfBdevWithReconnect(spdkClient, controllerName, address, transport, ctrlrLossTimeout, replicaReconnectDelaySec, fastIOFailTimeoutSec, maxRetries, retryInterval, allowLegacyTCPFallback)
+// transport and returns the bdev name plus the address/transport dialed;
+// callers record them (EngineReplicaStatus.DialedAddress / .Transport) so
+// dial-address validation compares against what was attached.
+func connectNVMfBdevWithTransport(spdkClient *spdkclient.Client, controllerName, address string, transport NvmfTransportType, ctrlrLossTimeout, fastIOFailTimeoutSec int, maxRetries int, retryInterval time.Duration) (bdevName, dialedAddress string, dialedTransport NvmfTransportType, err error) {
+	return connectNVMfBdevWithReconnect(spdkClient, controllerName, address, transport, ctrlrLossTimeout, replicaReconnectDelaySec, fastIOFailTimeoutSec, maxRetries, retryInterval)
 }
 
-// shouldAttemptLegacyTCPFallback reports whether a failed primary attach may
-// retry the replica's conventional TCP fallback listener at primary port+1.
-// Only legacy-convention RDMA dials qualify:
-//   - addresses derived from the explicit transport map must not fall back —
-//     the map is the source of truth and tcp_address+1 has no defined listener;
-//   - a legacy-convention TCP dial already targets the fallback listener at
-//     primary+1, so another +1 would point at an arbitrary port.
-func shouldAttemptLegacyTCPFallback(legacyConvention bool, transport NvmfTransportType) bool {
-	return legacyConvention && transport.IsRDMA()
-}
-
-func connectNVMfBdevWithReconnect(spdkClient *spdkclient.Client, controllerName, address string, transport NvmfTransportType, ctrlrLossTimeout, reconnectDelay, fastIOFailTimeoutSec int, maxRetries int, retryInterval time.Duration, allowLegacyTCPFallback bool) (bdevName, dialedAddress string, dialedTransport NvmfTransportType, err error) {
+func connectNVMfBdevWithReconnect(spdkClient *spdkclient.Client, controllerName, address string, transport NvmfTransportType, ctrlrLossTimeout, reconnectDelay, fastIOFailTimeoutSec int, maxRetries int, retryInterval time.Duration) (bdevName, dialedAddress string, dialedTransport NvmfTransportType, err error) {
 	if controllerName == "" || address == "" {
 		return "", "", "", fmt.Errorf("controllerName or address is empty")
 	}
@@ -450,16 +437,7 @@ func connectNVMfBdevWithReconnect(spdkClient *spdkclient.Client, controllerName,
 	)
 
 	if err != nil {
-		if !shouldAttemptLegacyTCPFallback(allowLegacyTCPFallback, transport) {
-			return "", "", "", fmt.Errorf("attach NVMe controller failed after %d attempts: %w", maxRetries, err)
-		}
-		var fallbackAddress string
-		nvmeBdevNameList, fallbackAddress, err = attemptTCPFallback(spdkClient, controllerName, ip, port, ctrlrLossTimeout, reconnectDelay, fastIOFailTimeoutSec, transport, err)
-		if err != nil {
-			return "", "", "", fmt.Errorf("attach NVMe controller failed after %d attempts: %w", maxRetries, err)
-		}
-		dialedAddress = fallbackAddress
-		dialedTransport = NvmfTransportTCP
+		return "", "", "", fmt.Errorf("attach NVMe controller failed after %d attempts: %w", maxRetries, err)
 	}
 
 	if len(nvmeBdevNameList) != 1 {
@@ -469,37 +447,3 @@ func connectNVMfBdevWithReconnect(spdkClient *spdkclient.Client, controllerName,
 	return nvmeBdevNameList[0], dialedAddress, dialedTransport, nil
 }
 
-func attemptTCPFallback(spdkClient *spdkclient.Client, controllerName, ip, port string, ctrlrLossTimeout, reconnectDelay, fastIOFailTimeoutSec int, originalTransport NvmfTransportType, primaryErr error) ([]string, string, error) {
-	primaryPort, parseErr := strconv.Atoi(port)
-	if parseErr != nil {
-		return nil, "", primaryErr
-	}
-	fallbackPort := strconv.Itoa(primaryPort + 1)
-
-	if _, detachErr := spdkClient.BdevNvmeDetachController(controllerName); detachErr != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(detachErr) {
-		return nil, "", primaryErr
-	}
-
-	logrus.WithError(primaryErr).Warnf(
-		"Primary NVMe attach failed (controller=%s transport=%s address=%s:%s); trying TCP fallback on %s:%s",
-		controllerName, originalTransport, ip, port, ip, fallbackPort,
-	)
-
-	list, err := spdkClient.BdevNvmeAttachControllerWithTimeout(
-		controllerName,
-		helpertypes.GetNQN(controllerName),
-		ip,
-		fallbackPort,
-		spdktypes.NvmeTransportTypeTCP,
-		spdktypes.NvmeAddressFamilyIPv4,
-		int32(ctrlrLossTimeout),
-		int32(reconnectDelay),
-		int32(fastIOFailTimeoutSec),
-		replicaMultipath,
-		attachControllerRPCTimeout(ctrlrLossTimeout, fastIOFailTimeoutSec),
-	)
-	if err != nil {
-		return nil, "", fmt.Errorf("primary attach failed (%v) and TCP fallback to %s:%s also failed: %w", primaryErr, ip, fallbackPort, err)
-	}
-	return list, net.JoinHostPort(ip, fallbackPort), nil
-}
