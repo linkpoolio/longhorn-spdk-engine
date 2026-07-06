@@ -92,10 +92,15 @@ const (
 	// shared buffers: TCP 2047 on all nodes, RDMA 4095 more on RDMA nodes.
 	// Undersizing surfaces as "Failed to populate 'bdev' iobuf large buffer
 	// cache" and I/O stalls once transports drain the pool.
-	// Large-pool hugepage cost at the default 132KiB bufsize:
-	// 8192 ≈ 1.1GiB (TCP nodes), 12288 ≈ 1.6GiB (RDMA nodes).
+	// Observed init demand on a 16-reactor RDMA storage node (ma3-worker-9,
+	// v26.05): ~6.1k transport shared-buffer reservations (RDMA 4095 + TCP
+	// 2047) + 2k RDMA poll-group caches (128 x reactors) + accel/bdev channel
+	// caches — undersizing failed accel channel creation outright (rc=-12)
+	// and kept the disk from attaching. Large-pool hugepage cost at the
+	// default 132KiB bufsize: 8192 ≈ 1.1GiB (TCP nodes), 16384 ≈ 2.1GiB
+	// (RDMA nodes, within the 8-16GiB storage-node budgets).
 	iobufLargePoolCountTCP  uint64 = 8192
-	iobufLargePoolCountRDMA uint64 = 12288
+	iobufLargePoolCountRDMA uint64 = 16384
 	iobufSmallPoolCount     uint64 = 16384
 
 	// accelMlx5MkeysPerCore is the per-core scaling factor for accel_mlx5's mkey
