@@ -4,55 +4,70 @@ import (
 	"testing"
 )
 
-// The derived pools must cover the demand that starved the fleet on
-// 2026-07-06: transports' shared buffers moved into the shared iobuf pool on
-// SPDK v26.05, plus capped per-poll-group caches, plus channel-cache
-// allowances. Cases pin the two production node shapes that failed.
-func TestIobufPoolCounts(t *testing.T) {
-	tcpShared := uint64(nvmfTcpOpts.NumSharedBuffers)
-	rdmaShared := uint64(nvmfRdmaOpts.NumSharedBuffers)
-
+// Budget-first sizing: the pools take 50% of the node's SPDK hugepage
+// allocation by default, split 7:1 large:small by bytes, floored at the SPDK
+// baselines. Cases pin the production node shapes.
+func TestIobufPoolCountsBudget(t *testing.T) {
 	cases := []struct {
-		name     string
-		rdma     bool
-		reactors int
+		name      string
+		rdma      bool
+		reactors  int
+		budgetMiB uint64
 	}{
-		{"tcp consumer node", false, 4},
-		{"rdma storage node 16 reactors (ma3-worker-9)", true, 16},
-		{"rdma node few reactors (ma4-worker-1)", true, 4},
-		{"degenerate reactor count", true, 0},
+		{"tcp consumer node, 2GiB default", false, 4, 2048},
+		{"rdma storage node, 16GiB (ma3-worker-9)", true, 16, 16384},
+		{"rdma node, 8GiB (ma3-worker-11)", true, 16, 8192},
+		{"rdma node, few reactors (ma4-worker-1)", true, 4, 16384},
 	}
 	for _, tc := range cases {
-		small, large := iobufPoolCounts(tc.rdma, tc.reactors)
+		budget := tc.budgetMiB << 20
+		small, large := iobufPoolCounts(tc.rdma, tc.reactors, budget)
 
-		minLarge := iobufBaseLargePoolCount + tcpShared
-		if tc.rdma {
-			minLarge += rdmaShared
+		need := iobufPoolBytes(small, large)
+		lo, hi := budget*45/100, budget*55/100
+		if need < lo || need > hi {
+			t.Errorf("%s: pools use %dMiB, want ~50%% of %dMiB", tc.name, need>>20, tc.budgetMiB)
 		}
-		if large < minLarge {
-			t.Errorf("%s: large=%d does not cover base+shared demand %d", tc.name, large, minLarge)
+		if large < iobufBaseLargePoolCount || small < iobufBaseSmallPoolCount {
+			t.Errorf("%s: pools below SPDK baselines (small=%d large=%d)", tc.name, small, large)
 		}
-		if small < iobufBaseSmallPoolCount {
-			t.Errorf("%s: small=%d below SPDK baseline %d", tc.name, small, iobufBaseSmallPoolCount)
-		}
-
-		// The pools must fit the smallest production hugepage budget for the
-		// node class (8GiB on RDMA nodes, 2GiB floor on TCP nodes) under the
-		// budget fraction.
-		budget := uint64(2) << 30
-		if tc.rdma {
-			budget = 8 << 30
-		}
-		if need := iobufPoolBytes(small, large); float64(need) > float64(budget)*iobufBudgetMaxFraction {
-			t.Errorf("%s: pools need %dMiB, over %d%% of %dMiB budget",
-				tc.name, need>>20, int(iobufBudgetMaxFraction*100), budget>>20)
+		// The large pool must comfortably cover the init-time cache
+		// population that starved the fleet: capped transport caches x
+		// reactors, both transports.
+		caches := (uint64(nvmfTcpOpts.IobufLargeCacheSize) + uint64(nvmfRdmaOpts.IobufLargeCacheSize)) * uint64(tc.reactors)
+		if large < iobufBaseLargePoolCount+caches {
+			t.Errorf("%s: large=%d cannot cover base+capped caches %d", tc.name, large, iobufBaseLargePoolCount+caches)
 		}
 	}
 }
 
-// Demand must not scale with the pool (the v26.05 default-cache trap): the
-// derivation depends only on configuration, so two consecutive computations
-// are identical, and the transport opts must carry explicit cache caps.
+// With no discoverable budget, the configured-demand fallback covers the
+// SPDK baselines plus both transports' shared buffers.
+func TestIobufPoolCountsFallback(t *testing.T) {
+	small, large := iobufPoolCounts(true, 16, 0)
+	minLarge := iobufBaseLargePoolCount + uint64(nvmfTcpOpts.NumSharedBuffers) + uint64(nvmfRdmaOpts.NumSharedBuffers)
+	if large < minLarge {
+		t.Errorf("fallback large=%d does not cover base+shared demand %d", large, minLarge)
+	}
+	if small < iobufBaseSmallPoolCount {
+		t.Errorf("fallback small=%d below SPDK baseline", small)
+	}
+}
+
+// Absolute overrides trump the budget derivation.
+func TestIobufPoolCountsOverride(t *testing.T) {
+	t.Setenv("LONGHORN_V2_IOBUF_LARGE_POOL_COUNT", "12345")
+	t.Setenv("LONGHORN_V2_IOBUF_SMALL_POOL_COUNT", "23456")
+	small, large := iobufPoolCounts(true, 16, 8<<30)
+	if large != 12345 || small != 23456 {
+		t.Errorf("overrides not honored: small=%d large=%d", small, large)
+	}
+}
+
+// The transports must carry explicit iobuf cache caps: the v26.05 default
+// cache is pool/(2*poll_groups) per transport, which consumes the entire
+// pool at any size. buf_cache_size shares a C-union decode slot with
+// iobuf_small_cache_size and must never be sent alongside it.
 func TestIobufTransportCacheCapsExplicit(t *testing.T) {
 	if nvmfTcpOpts.IobufLargeCacheSize == 0 || nvmfTcpOpts.IobufSmallCacheSize == 0 {
 		t.Fatal("TCP transport opts must cap iobuf caches explicitly")

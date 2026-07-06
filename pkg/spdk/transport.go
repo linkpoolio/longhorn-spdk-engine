@@ -137,43 +137,67 @@ func NegotiateNodeTransport(spdkClient *spdkclient.Client) NvmfTransportType {
 	return NvmfTransportRDMA
 }
 
-// iobufPoolCounts derives the iobuf pool sizes from what this node will
-// actually configure, instead of a hand-tuned constant:
+// iobufPoolCounts sizes the iobuf pools from the node's SPDK hugepage
+// allocation: the pools are pinned hugepage memory, so sizing them is
+// deciding how the allocation splits between I/O buffers and everything
+// else (DPDK heap, blobstore metadata, accel mempools). Default: 50% of the
+// budget, split 7:1 large:small by bytes (the data path is 128KiB-dominated),
+// floored at the SPDK baselines. Overrides:
 //
-//	large = SPDK base
-//	      + each created transport's num_shared_buffers (its in-flight
-//	        working set — pre-v26.05 this lived in a private per-transport
-//	        pool; v26.05 moved it into the shared iobuf pool)
-//	      + each transport's per-poll-group cache cap x reactors
-//	      + a per-reactor allowance for bdev/accel channel caches
+//	LONGHORN_V2_IOBUF_BUDGET_PERCENT     — pool share of the budget (default 50)
+//	LONGHORN_V2_IOBUF_LARGE_POOL_COUNT   — absolute large count (trumps all)
+//	LONGHORN_V2_IOBUF_SMALL_POOL_COUNT   — absolute small count (trumps all)
 //
-// The small pool follows the same shape on the SPDK small-pool baseline.
+// When the budget is unknowable the configured-demand fallback applies:
+// SPDK baselines + each created transport's num_shared_buffers + the capped
+// per-poll-group caches + a per-reactor channel allowance.
 // Transport caches MUST be explicitly capped (IobufSmall/LargeCacheSize in
 // the opts): the v26.05 default cache is pool/(2*poll_groups) per transport,
 // which makes demand scale with the pool itself and never converge.
-func iobufPoolCounts(rdmaCapable bool, reactors int) (small, large uint64) {
+func iobufPoolCounts(rdmaCapable bool, reactors int, budgetBytes uint64) (small, large uint64) {
 	if reactors < 1 {
 		reactors = 1
 	}
-	r := uint64(reactors)
 
-	// Per-reactor allowance for the non-transport channel caches (bdev,
-	// accel, blobstore md): SPDK populates small per-channel caches on
-	// demand; 64 large + 128 small per reactor covers the observed set.
-	const chanLargePerReactor = 64
-	const chanSmallPerReactor = 128
+	if budgetBytes > 0 {
+		pct := envIntOrDefault("LONGHORN_V2_IOBUF_BUDGET_PERCENT", 50)
+		if pct < 1 || pct > 90 {
+			pct = 50
+		}
+		poolBytes := budgetBytes * uint64(pct) / 100
+		// 7:1 large:small by bytes.
+		large = poolBytes * 7 / 8 / iobufLargeBufsize
+		small = poolBytes / 8 / iobufSmallBufsize
+	} else {
+		// Configured-demand fallback (budget unknown).
+		r := uint64(reactors)
+		const chanLargePerReactor = 64
+		const chanSmallPerReactor = 128
+		large = iobufBaseLargePoolCount +
+			uint64(nvmfTcpOpts.NumSharedBuffers) +
+			uint64(nvmfTcpOpts.IobufLargeCacheSize)*r +
+			chanLargePerReactor*r
+		small = iobufBaseSmallPoolCount +
+			uint64(nvmfTcpOpts.IobufSmallCacheSize)*r +
+			chanSmallPerReactor*r
+		if rdmaCapable {
+			large += uint64(nvmfRdmaOpts.NumSharedBuffers) +
+				uint64(nvmfRdmaOpts.IobufLargeCacheSize)*r
+			small += uint64(nvmfRdmaOpts.IobufSmallCacheSize) * r
+		}
+	}
 
-	large = iobufBaseLargePoolCount +
-		uint64(nvmfTcpOpts.NumSharedBuffers) +
-		uint64(nvmfTcpOpts.IobufLargeCacheSize)*r +
-		chanLargePerReactor*r
-	small = iobufBaseSmallPoolCount +
-		uint64(nvmfTcpOpts.IobufSmallCacheSize)*r +
-		chanSmallPerReactor*r
-	if rdmaCapable {
-		large += uint64(nvmfRdmaOpts.NumSharedBuffers) +
-			uint64(nvmfRdmaOpts.IobufLargeCacheSize)*r
-		small += uint64(nvmfRdmaOpts.IobufSmallCacheSize) * r
+	if large < iobufBaseLargePoolCount {
+		large = iobufBaseLargePoolCount
+	}
+	if small < iobufBaseSmallPoolCount {
+		small = iobufBaseSmallPoolCount
+	}
+	if v := envIntOrDefault("LONGHORN_V2_IOBUF_LARGE_POOL_COUNT", 0); v > 0 {
+		large = uint64(v)
+	}
+	if v := envIntOrDefault("LONGHORN_V2_IOBUF_SMALL_POOL_COUNT", 0); v > 0 {
+		small = uint64(v)
 	}
 	return small, large
 }

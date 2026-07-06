@@ -124,22 +124,16 @@ func NewServer(ctx context.Context, portStart, portEnd int32, newServiceClient S
 	// Then framework_start_init drives subsystem init with the tuned opts.
 	rdmaCapable := DetectTransport().RDMA
 	reactors := spdkCoreCount()
-	iobufSmall, iobufLarge := iobufPoolCounts(rdmaCapable, reactors)
-	if budget := spdkMemSizeBytes(); budget > 0 {
-		if need := iobufPoolBytes(iobufSmall, iobufLarge); float64(need) > float64(budget)*iobufBudgetMaxFraction {
-			// A clamped pool deadlocks I/O later, which is strictly worse
-			// than refusing to start: this is a node sizing error to fix in
-			// the spdk-memory-size setting or the transport tunables.
-			return nil, fmt.Errorf("derived iobuf pools (small=%d large=%d, %dMiB) exceed %d%% of the node's SPDK hugepage allocation (%dMiB); raise spdk-memory-size or lower the nvmf transport tunables",
-				iobufSmall, iobufLarge, need>>20, int(iobufBudgetMaxFraction*100), budget>>20)
-		}
-	} else {
-		logrus.Warn("Cannot determine the SPDK hugepage allocation; skipping the iobuf pool budget check")
+	budget := spdkMemSizeBytes()
+	if budget == 0 {
+		logrus.Warn("Cannot determine the SPDK hugepage allocation; sizing iobuf pools from configured transport demand instead")
 	}
+	iobufSmall, iobufLarge := iobufPoolCounts(rdmaCapable, reactors, budget)
 	if _, err = cli.IobufSetOptions(iobufSmall, iobufLarge, 0, 0); err != nil {
 		logrus.WithError(err).Warn("Failed to grow iobuf pools before init; transport create may fail with ENOMEM")
 	} else {
-		logrus.Infof("Grew iobuf pools to small=%d large=%d (rdma=%v reactors=%d) before subsystem init", iobufSmall, iobufLarge, rdmaCapable, reactors)
+		logrus.Infof("Sized iobuf pools to small=%d large=%d (%dMiB of %dMiB budget, rdma=%v reactors=%d) before subsystem init",
+			iobufSmall, iobufLarge, iobufPoolBytes(iobufSmall, iobufLarge)>>20, budget>>20, rdmaCapable, reactors)
 	}
 
 	if _, err = cli.BdevNvmeSetOptionsWithTos(

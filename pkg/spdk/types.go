@@ -90,12 +90,8 @@ const (
 	iobufSmallBufsize       uint64 = 8192
 	iobufLargeBufsize       uint64 = 135168
 
-	// iobufBudgetMaxFraction caps the iobuf pools' share of the node's SPDK
-	// hugepage allocation: the same memory must also hold the DPDK heap,
-	// blobstore metadata, accel mempools, and transport WR pools. 50%
-	// reflects the working production floor — consumer nodes on the 2GiB
-	// default have run ~1GiB of pools alongside their data path.
-	iobufBudgetMaxFraction = 0.50
+	// The iobuf pools' share of the SPDK hugepage allocation is decided in
+	// iobufPoolCounts (default 50%, LONGHORN_V2_IOBUF_BUDGET_PERCENT).
 
 	// accelMlx5MkeysPerCore is the per-core scaling factor for accel_mlx5's mkey
 	// pool. SPDK enforces a minimum of ACCEL_MLX5_MAX_MKEYS_IN_TASK(16) per core;
