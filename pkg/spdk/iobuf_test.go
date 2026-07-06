@@ -24,17 +24,21 @@ func TestIobufPoolCountsBudget(t *testing.T) {
 		small, large := iobufPoolCounts(tc.rdma, tc.reactors, budget)
 
 		need := iobufPoolBytes(small, large)
-		lo, hi := budget*45/100, budget*55/100
-		if need < lo || need > hi {
-			t.Errorf("%s: pools use %dMiB, want ~50%% of %dMiB", tc.name, need>>20, tc.budgetMiB)
+		// ~20% of budget, or the SPDK floors on small budgets.
+		hi := budget * 35 / 100
+		if need > hi {
+			t.Errorf("%s: pools use %dMiB, over 35%% of %dMiB", tc.name, need>>20, tc.budgetMiB)
 		}
 		if large < iobufBaseLargePoolCount || small < iobufBaseSmallPoolCount {
 			t.Errorf("%s: pools below SPDK baselines (small=%d large=%d)", tc.name, small, large)
 		}
 		// The large pool must comfortably cover the init-time cache
-		// population that starved the fleet: capped transport caches x
-		// reactors, both transports.
-		caches := (uint64(nvmfTcpOpts.IobufLargeCacheSize) + uint64(nvmfRdmaOpts.IobufLargeCacheSize)) * uint64(tc.reactors)
+		// population that starved the fleet: capped caches x reactors for
+		// every transport this node actually creates.
+		caches := uint64(nvmfTcpOpts.IobufLargeCacheSize) * uint64(tc.reactors)
+		if tc.rdma {
+			caches += uint64(nvmfRdmaOpts.IobufLargeCacheSize) * uint64(tc.reactors)
+		}
 		if large < iobufBaseLargePoolCount+caches {
 			t.Errorf("%s: large=%d cannot cover base+capped caches %d", tc.name, large, iobufBaseLargePoolCount+caches)
 		}

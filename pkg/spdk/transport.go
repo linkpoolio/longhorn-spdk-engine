@@ -140,11 +140,15 @@ func NegotiateNodeTransport(spdkClient *spdkclient.Client) NvmfTransportType {
 // iobufPoolCounts sizes the iobuf pools from the node's SPDK hugepage
 // allocation: the pools are pinned hugepage memory, so sizing them is
 // deciding how the allocation splits between I/O buffers and everything
-// else (DPDK heap, blobstore metadata, accel mempools). Default: 50% of the
+// else (DPDK heap, blobstore metadata, accel mempools). Measured on a busy
+// 44-volume engine node (2026-07-06): connection-scaled heap demand (qpair
+// in-capsule buffers, RDMA WR pools, mlx5 mempools) was ~4.1GiB of an 8GiB
+// budget while iobuf retries stayed at zero — the heap, not the pool, is
+// the scarce side. Default: 20% of the
 // budget, split 7:1 large:small by bytes (the data path is 128KiB-dominated),
 // floored at the SPDK baselines. Overrides:
 //
-//	LONGHORN_V2_IOBUF_BUDGET_PERCENT     — pool share of the budget (default 50)
+//	LONGHORN_V2_IOBUF_BUDGET_PERCENT     — pool share of the budget (default 20)
 //	LONGHORN_V2_IOBUF_LARGE_POOL_COUNT   — absolute large count (trumps all)
 //	LONGHORN_V2_IOBUF_SMALL_POOL_COUNT   — absolute small count (trumps all)
 //
@@ -160,9 +164,9 @@ func iobufPoolCounts(rdmaCapable bool, reactors int, budgetBytes uint64) (small,
 	}
 
 	if budgetBytes > 0 {
-		pct := envIntOrDefault("LONGHORN_V2_IOBUF_BUDGET_PERCENT", 50)
+		pct := envIntOrDefault("LONGHORN_V2_IOBUF_BUDGET_PERCENT", 20)
 		if pct < 1 || pct > 90 {
-			pct = 50
+			pct = 20
 		}
 		poolBytes := budgetBytes * uint64(pct) / 100
 		// 7:1 large:small by bytes.
@@ -170,28 +174,38 @@ func iobufPoolCounts(rdmaCapable bool, reactors int, budgetBytes uint64) (small,
 		small = poolBytes / 8 / iobufSmallBufsize
 	} else {
 		// Configured-demand fallback (budget unknown).
-		r := uint64(reactors)
+		fr := uint64(reactors)
 		const chanLargePerReactor = 64
 		const chanSmallPerReactor = 128
 		large = iobufBaseLargePoolCount +
 			uint64(nvmfTcpOpts.NumSharedBuffers) +
-			uint64(nvmfTcpOpts.IobufLargeCacheSize)*r +
-			chanLargePerReactor*r
+			uint64(nvmfTcpOpts.IobufLargeCacheSize)*fr +
+			chanLargePerReactor*fr
 		small = iobufBaseSmallPoolCount +
-			uint64(nvmfTcpOpts.IobufSmallCacheSize)*r +
-			chanSmallPerReactor*r
+			uint64(nvmfTcpOpts.IobufSmallCacheSize)*fr +
+			chanSmallPerReactor*fr
 		if rdmaCapable {
 			large += uint64(nvmfRdmaOpts.NumSharedBuffers) +
-				uint64(nvmfRdmaOpts.IobufLargeCacheSize)*r
-			small += uint64(nvmfRdmaOpts.IobufSmallCacheSize) * r
+				uint64(nvmfRdmaOpts.IobufLargeCacheSize)*fr
+			small += uint64(nvmfRdmaOpts.IobufSmallCacheSize) * fr
 		}
 	}
 
-	if large < iobufBaseLargePoolCount {
-		large = iobufBaseLargePoolCount
+	// Floors: the SPDK baselines PLUS the transports' capped per-poll-group
+	// cache populations — a pool smaller than base+caches re-creates the
+	// init-time starvation the caps exist to prevent.
+	r := uint64(reactors)
+	largeFloor := iobufBaseLargePoolCount + uint64(nvmfTcpOpts.IobufLargeCacheSize)*r
+	smallFloor := iobufBaseSmallPoolCount + uint64(nvmfTcpOpts.IobufSmallCacheSize)*r
+	if rdmaCapable {
+		largeFloor += uint64(nvmfRdmaOpts.IobufLargeCacheSize) * r
+		smallFloor += uint64(nvmfRdmaOpts.IobufSmallCacheSize) * r
 	}
-	if small < iobufBaseSmallPoolCount {
-		small = iobufBaseSmallPoolCount
+	if large < largeFloor {
+		large = largeFloor
+	}
+	if small < smallFloor {
+		small = smallFloor
 	}
 	if v := envIntOrDefault("LONGHORN_V2_IOBUF_LARGE_POOL_COUNT", 0); v > 0 {
 		large = uint64(v)
