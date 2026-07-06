@@ -1105,9 +1105,10 @@ func (s *Server) recoverEngineFrontends(ctx context.Context) {
 		ef := NewEngineFrontend(record.Name, record.EngineName, record.VolumeName,
 			record.Frontend, record.SpecSize, 0, 0, s.updateChs[types.InstanceTypeEngineFrontend], s.newServiceClient)
 		ef.metadataDir = s.metadataDir
-		// Tag with the node's current transport so a switchover after recovery
-		// can explicitly release an old RDMA path's HCA queue pair.
-		ef.NvmeTcpFrontend.Transport = s.nodeTransport
+		// Tag with the engine target's actual transport (TCP; see
+		// EngineFrontendCreate). RDMA-specific teardown at switchover keys on
+		// the transport observed on the live controller, not on this tag.
+		ef.NvmeTcpFrontend.Transport = engineFrontendTargetTransport()
 		ef.VolumeNQN = record.VolumeNQN
 		ef.VolumeNGUID = record.VolumeNGUID
 		ef.ActivePath = record.ActivePath
