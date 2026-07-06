@@ -14,7 +14,7 @@ import (
 func (s *TestSuite) TestSnapshotOperationPreCheckCreateGeneratesName(c *C) {
 	fmt.Println("Testing snapshotOperationPreCheckWithoutLock generates snapshot name for create operation")
 
-	e := NewEngine("engine-a", "vol-a", types.FrontendSPDKTCPBlockdev, 10, make(chan interface{}, 1), defaultTestSnapshotMaxCount, nil)
+	e := NewEngine("engine-a", "vol-a", types.FrontendSPDKTCPBlockdev, 10, NvmfTransportTCP, make(chan interface{}, 1), defaultTestSnapshotMaxCount, nil)
 
 	snapshotName, err := e.snapshotOperationPreCheckWithoutLock(map[string]*client.SPDKClient{}, "", SnapshotOperationCreate)
 	c.Assert(err, IsNil)
@@ -25,7 +25,7 @@ func (s *TestSuite) TestSnapshotOperationPreCheckCreateGeneratesName(c *C) {
 func (s *TestSuite) TestSnapshotOperationPreCheckDeleteEmptyName(c *C) {
 	fmt.Println("Testing snapshotOperationPreCheckWithoutLock returns error for delete operation with empty snapshot name")
 
-	e := NewEngine("engine-a", "vol-a", types.FrontendSPDKTCPBlockdev, 10, make(chan interface{}, 1), defaultTestSnapshotMaxCount, nil)
+	e := NewEngine("engine-a", "vol-a", types.FrontendSPDKTCPBlockdev, 10, NvmfTransportTCP, make(chan interface{}, 1), defaultTestSnapshotMaxCount, nil)
 
 	_, err := e.snapshotOperationPreCheckWithoutLock(map[string]*client.SPDKClient{}, "", SnapshotOperationDelete)
 	c.Assert(err, NotNil)
@@ -35,7 +35,7 @@ func (s *TestSuite) TestSnapshotOperationPreCheckDeleteEmptyName(c *C) {
 func (s *TestSuite) TestSnapshotOperationPreCheckCreateFailsWhenSnapshotMaxCountReached(c *C) {
 	fmt.Println("Testing snapshotOperationPreCheckWithoutLock returns error when snapshot max count is reached")
 
-	e := NewEngine("engine-a", "vol-a", types.FrontendSPDKTCPBlockdev, 10, make(chan interface{}, 1), defaultTestSnapshotMaxCount, nil)
+	e := NewEngine("engine-a", "vol-a", types.FrontendSPDKTCPBlockdev, 10, NvmfTransportTCP, make(chan interface{}, 1), defaultTestSnapshotMaxCount, nil)
 	e.SnapshotMaxCount = 2
 	e.SnapshotMap["snap-1"] = &api.Lvol{Name: "snap-1"}
 	e.SnapshotMap["snap-2"] = &api.Lvol{Name: "snap-2"}

@@ -20,7 +20,7 @@ func TestEngineCreateRejectsTransportMapOnlyRequests(t *testing.T) {
 		map[string]*spdkrpc.ReplicaTransportAddresses{
 			"r-1": {TcpAddress: "10.0.0.1:20001"},
 		},
-		1, false, 0, nil)
+		1, false, 0)
 	if err == nil {
 		t.Fatal("expected error for transport-map-only request, got nil")
 	}
@@ -35,7 +35,7 @@ func TestEngineCreateRejectsTransportMapOnlyRequests(t *testing.T) {
 			"r-1": {TcpAddress: "10.0.0.1:20001"},
 			"r-2": {TcpAddress: "10.0.0.2:20001"},
 		},
-		1, false, 0, nil)
+		1, false, 0)
 	if err == nil {
 		t.Fatal("expected error for transport-map key missing from replicaAddressMap, got nil")
 	}
