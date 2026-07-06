@@ -1743,7 +1743,13 @@ func (e *Engine) ReplicaDelete(spdkClient *spdkclient.Client, replicaName, repli
 	// Detaching the corresponding NVMf controller to remote replica
 	e.log.Infof("Detaching the corresponding NVMf controller %v during remote replica %s delete", controllerName, replicaName)
 	if _, err := spdkClient.BdevNvmeDetachController(controllerName); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
-		return errors.Wrapf(err, "failed to detach controller %s for deleting replica %s", controllerName, replicaName)
+		if !jsonrpc.IsJSONRPCRespErrorConnectionTimeout(err) {
+			return errors.Wrapf(err, "failed to detach controller %s for deleting replica %s", controllerName, replicaName)
+		}
+		// -110 (ETIMEDOUT): the peer is unreachable/stalled, so the connection is
+		// already broken and the detach is effectively done. Propagating the error
+		// would make the caller's reconcile loop re-drive this detach forever.
+		e.log.WithError(err).Warnf("Detaching NVMf controller %s timed out against an unreachable peer during replica %s delete, will treat it as detached and continue", controllerName, replicaName)
 	}
 
 	delete(e.ReplicaStatusMap, replicaName)
