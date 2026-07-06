@@ -500,6 +500,41 @@ func getEngineCntlid(engineName string) uint16 {
 	return 1 // fallback
 }
 
+// CNTLID range allocation for an engine's NVMe-oF subsystem.
+//
+// SPDK enforces (maxCntlid - minCntlid + 1) as the maximum number of
+// controllers a subsystem may hold at once. A subsystem must have room for the
+// one live host plus the controllers that transiently pile up while a kernel
+// initiator reconnects: it retries every --reconnect-delay seconds while a
+// stale controller is only reaped on keep-alive timeout. If the window is too
+// small a recoverable disconnect becomes a permanent wedge — SPDK logs
+// "Reached max simultaneous ctrlrs" and every subsequent connect is rejected —
+// so each window is deliberately large.
+//
+// At most two targets expose the same NQN simultaneously: the two sides of a
+// live migration / engine upgrade. GenerateEngineNameForVolume increments the
+// engine ordinal on every replacement, so those two targets always carry
+// *consecutive* ordinals. Mapping each ordinal to a distinct window
+// (ordinal mod cntlidWindowSlots, which must be >= 2) guarantees the two
+// concurrent targets never share a cntlid. Every window starts at
+// cntlidRangeBase, above the legacy pre-windowing scheme (cntlid..cntlid+3,
+// near 1), so a rolling upgrade from an old binary stays disjoint as well.
+//
+// Bounds check: the highest window is cntlidRangeBase + (cntlidWindowSlots-1)*
+// cntlidWindowSize + cntlidWindowSize = 1000 + 3*16000 + 16000 = 65000, within
+// the uint16 / SPDK valid cntlid space (<= 0xffef).
+const (
+	cntlidRangeBase   uint16 = 1000
+	cntlidWindowSize  uint16 = 16000
+	cntlidWindowSlots uint16 = 4
+)
+
+func getEngineCntlidRange(engineName string) (uint16, uint16) {
+	slot := (getEngineCntlid(engineName) - 1) % cntlidWindowSlots
+	lo := cntlidRangeBase + slot*cntlidWindowSize + 1
+	return lo, lo + cntlidWindowSize - 1
+}
+
 // envIntOrDefault reads an integer tunable from the environment, falling back
 // to def when unset, empty, or unparseable. Used by the transport/SPDK opts
 // tuning so operators can override defaults per IM pod without a rebuild.
