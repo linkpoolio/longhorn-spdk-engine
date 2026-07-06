@@ -330,8 +330,11 @@ func (r *Replica) prepareIPAndPorts(portCount int32, superiorPortAllocator *comm
 		return err
 	}
 
-	// Always reserved the 1st port for replica expose and the rest for rebuilding
-	bitmap, err := commonbitmap.NewBitmap(r.PortStart+1, r.PortEnd)
+	// Reserve the listener ports for replica expose and hand the rest to the
+	// local rebuild/clone allocator. On dual-listener (RDMA) replicas the
+	// first TWO ports are listeners (RDMA primary at PortStart, TCP fallback
+	// at PortStart+1), so the rebuild allocator must start at PortStart+2.
+	bitmap, err := commonbitmap.NewBitmap(r.rebuildPortAllocatorStart(), r.PortEnd)
 	if err != nil {
 		return err
 	}
@@ -4422,6 +4425,18 @@ func tcpFallbackPortFor(primaryPort int32) int32 {
 
 func (r *Replica) tcpFallbackPort() int32 {
 	return tcpFallbackPortFor(r.PortStart)
+}
+
+// rebuildPortAllocatorStart returns the first port handed to the replica's
+// local rebuild/clone port allocator. Listener ports are excluded: PortStart
+// is the primary listener, and on dual-listener (RDMA) replicas PortStart+1
+// is the TCP fallback listener (addTCPFallbackListener) — handing it to the
+// rebuild allocator would collide with the fallback listener.
+func (r *Replica) rebuildPortAllocatorStart() int32 {
+	if r.transport().IsRDMA() {
+		return r.PortStart + 2
+	}
+	return r.PortStart + 1
 }
 
 func (r *Replica) listenerPortsForTransport() (tcpPort, rdmaPort int32) {
