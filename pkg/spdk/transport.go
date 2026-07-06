@@ -55,18 +55,18 @@ func DetectTransport() TransportCapability {
 
 // Tunables for nvmf_create_transport, all overridable via env. Defaults are:
 //
-//   MaxQueueDepth=128   — SPDK upstream default. Lower values (e.g. 32) were
-//   previously used to mitigate burst saturation that turned out to be caused
-//   by NIC adaptive interrupt coalescing + sw_accel data-buffer copy on the
-//   reactor; with adaptive coalescing off + accel_mlx5 registered for HW UMR,
-//   128 is safe and gives the headroom needed for high-IOPS workloads
-//   (16 cores × 128 = 2048 inflight commands per controller, vs only 512 at
-//   depth=32). Tune via LONGHORN_V2_NVMF_RDMA_MAX_QUEUE_DEPTH if needed.
+//	MaxQueueDepth=128   — SPDK upstream default. Lower values (e.g. 32) were
+//	previously used to mitigate burst saturation that turned out to be caused
+//	by NIC adaptive interrupt coalescing + sw_accel data-buffer copy on the
+//	reactor; with adaptive coalescing off + accel_mlx5 registered for HW UMR,
+//	128 is safe and gives the headroom needed for high-IOPS workloads
+//	(16 cores × 128 = 2048 inflight commands per controller, vs only 512 at
+//	depth=32). Tune via LONGHORN_V2_NVMF_RDMA_MAX_QUEUE_DEPTH if needed.
 //
-//   data_wr_pool_size=4095 — critical. SPDK default of 0 forces per-qpair
-//   RDMA WR allocation on every submission and caps throughput at hundreds
-//   of KB/s. Mayastor uses 4095. Override with
-//   LONGHORN_V2_NVMF_RDMA_DATA_WR_POOL_SIZE.
+//	data_wr_pool_size=4095 — critical. SPDK default of 0 forces per-qpair
+//	RDMA WR allocation on every submission and caps throughput at hundreds
+//	of KB/s. Mayastor uses 4095. Override with
+//	LONGHORN_V2_NVMF_RDMA_DATA_WR_POOL_SIZE.
 //
 // IoUnitSize=8192 is the SPDK-defined RDMA minimum; SPDK chains larger I/Os.
 // MaxIoSize=131072 matches kernel's max_hw_sectors_kb.

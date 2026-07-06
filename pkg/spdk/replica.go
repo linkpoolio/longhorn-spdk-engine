@@ -256,7 +256,6 @@ func NewReplica(ctx context.Context, replicaName, lvsName, lvsUUID string, specS
 		newServiceClient = GetServiceClient
 	}
 
-
 	log := logrus.StandardLogger().WithFields(logrus.Fields{
 		"replicaName": replicaName,
 		"lvsName":     lvsName,
@@ -323,7 +322,10 @@ func (r *Replica) prepareIPAndPorts(portCount int32, superiorPortAllocator *comm
 	}
 	r.IP = podIP
 
-	r.PortStart, r.PortEnd, err = superiorPortAllocator.AllocateRange(portCount)
+	// portCount+1: the extra slot is the TCP fallback listener at PortStart+1
+	// on dual-listener (RDMA) replicas, so the caller-requested count stays
+	// available for rebuild/clone exposes (which allocate listener pairs too).
+	r.PortStart, r.PortEnd, err = superiorPortAllocator.AllocateRange(portCount + 1)
 	if err != nil {
 		return err
 	}
@@ -1153,7 +1155,7 @@ func (r *Replica) Create(spdkClient *spdkclient.Client, portCount int32, superio
 	}
 	// On RDMA-capable nodes also add a secondary TCP listener so TCP-only
 	// engines can still attach to this replica (no-op when primary is TCP).
-	if err := r.addTCPFallbackListener(spdkClient, r.Nqn, r.PortStart); err != nil {
+	if err := r.addTCPFallbackListener(spdkClient, r.Nqn, r.IP, r.PortStart); err != nil {
 		return nil, err
 	}
 
@@ -1409,8 +1411,11 @@ func (r *Replica) Expand(spdkClient *spdkclient.Client, size uint64) error {
 
 	// If we had previously exposed the bdev, we must re-expose it after the resize.
 	if reExposeBdev {
-		if err := spdkClient.StartExposeBdev(helpertypes.GetNQN(r.Name), r.Head.UUID, generateNGUID(r.Name), r.IP, strconv.Itoa(int(r.PortStart))); err != nil {
+		if err := spdkClient.StartExposeBdevWithTransport(helpertypes.GetNQN(r.Name), r.Head.UUID, generateNGUID(r.Name), r.IP, strconv.Itoa(int(r.PortStart)), r.transport().ToSPDKTransportType()); err != nil {
 			return errors.Wrapf(err, "failed to start expose replica %v after expansion", r.Name)
+		}
+		if err := r.addTCPFallbackListener(spdkClient, helpertypes.GetNQN(r.Name), r.IP, r.PortStart); err != nil {
+			return errors.Wrapf(err, "failed to re-add TCP fallback listener for replica %v after expansion", r.Name)
 		}
 		r.IsExposed = true
 	}
@@ -1763,7 +1768,10 @@ func (r *Replica) SnapshotRevert(spdkClient *spdkclient.Client, snapshotName str
 		}
 		r.IsExposed = false
 
-		if err := spdkClient.StartExposeBdev(helpertypes.GetNQN(r.Name), headLvolUUID, generateNGUID(r.Name), r.IP, strconv.Itoa(int(r.PortStart))); err != nil {
+		if err := spdkClient.StartExposeBdevWithTransport(helpertypes.GetNQN(r.Name), headLvolUUID, generateNGUID(r.Name), r.IP, strconv.Itoa(int(r.PortStart)), r.transport().ToSPDKTransportType()); err != nil {
+			return nil, err
+		}
+		if err := r.addTCPFallbackListener(spdkClient, helpertypes.GetNQN(r.Name), r.IP, r.PortStart); err != nil {
 			return nil, err
 		}
 		r.IsExposed = true
@@ -2064,8 +2072,11 @@ func (r *Replica) SnapshotCloneDstStart(spdkClient *spdkclient.Client, snapshotN
 	}
 
 	if r.snapshotCloningDstCache.cloningPort == 0 {
-		if r.snapshotCloningDstCache.cloningPort, _, err = r.portAllocator.AllocateRange(1); err != nil {
-			return errors.Wrapf(err, "failed to allocate a cloning port for dst replica %v snapshot clone start", r.Name)
+		// Allocate 2 ports: primary listener + TCP fallback at port+1.
+		// Allocating only 1 lets the fallback slot be handed to another
+		// subsystem later.
+		if r.snapshotCloningDstCache.cloningPort, _, err = r.portAllocator.AllocateRange(2); err != nil {
+			return errors.Wrapf(err, "failed to allocate a cloning port pair for dst replica %v snapshot clone start", r.Name)
 		}
 	}
 	// Create cloning lvol and expose it
@@ -2081,9 +2092,12 @@ func (r *Replica) SnapshotCloneDstStart(spdkClient *spdkclient.Client, snapshotN
 	}
 	r.snapshotCloningDstCache.cloningLvol = BdevLvolInfoToServiceLvol(&cloningBdevLvol)
 
-	if err := spdkClient.StartExposeBdev(helpertypes.GetNQN(r.snapshotCloningDstCache.cloningLvol.Name),
+	if err := spdkClient.StartExposeBdevWithTransport(helpertypes.GetNQN(r.snapshotCloningDstCache.cloningLvol.Name),
 		r.snapshotCloningDstCache.cloningLvol.UUID, generateNGUID(r.snapshotCloningDstCache.cloningLvol.Name), r.IP,
-		strconv.Itoa(int(r.snapshotCloningDstCache.cloningPort))); err != nil {
+		strconv.Itoa(int(r.snapshotCloningDstCache.cloningPort)), r.transport().ToSPDKTransportType()); err != nil {
+		return err
+	}
+	if err := r.addTCPFallbackListener(spdkClient, helpertypes.GetNQN(r.snapshotCloningDstCache.cloningLvol.Name), r.IP, r.snapshotCloningDstCache.cloningPort); err != nil {
 		return err
 	}
 	dstCloningLvolAddress := net.JoinHostPort(r.IP, strconv.Itoa(int(r.snapshotCloningDstCache.cloningPort)))
@@ -2337,8 +2351,11 @@ func (r *Replica) doCleanupForSnapshotCloneDst(spdkClient *spdkclient.Client, cl
 		aggregatedErrors = append(aggregatedErrors, err)
 	}
 	if r.snapshotCloningDstCache.cloningPort != 0 {
-		if err := r.portAllocator.ReleaseRange(r.snapshotCloningDstCache.cloningPort, r.snapshotCloningDstCache.cloningPort); err != nil {
-			r.log.WithError(err).Errorf("Failed to release the cloning port %d for cloning dst cleanup", r.snapshotCloningDstCache.cloningPort)
+		// Release both the primary and the TCP fallback slot
+		// (AllocateRange(2) reserved the pair).
+		fallback := tcpFallbackPortFor(r.snapshotCloningDstCache.cloningPort)
+		if err := r.portAllocator.ReleaseRange(r.snapshotCloningDstCache.cloningPort, fallback); err != nil {
+			r.log.WithError(err).Errorf("Failed to release the cloning port pair %d-%d for cloning dst cleanup", r.snapshotCloningDstCache.cloningPort, fallback)
 			aggregatedErrors = append(aggregatedErrors, err)
 		} else {
 			r.snapshotCloningDstCache.cloningPort = 0
@@ -2456,11 +2473,10 @@ func (r *Replica) SnapshotCloneSrcStart(spdkClient *spdkclient.Client, snapshotN
 	}
 
 	dstCloningLvolName := GetReplicaCloningLvolName(dstReplicaName)
-	// The cloning lvol is exposed on a single dedicated listener; the legacy
-	// +1 TCP fallback only exists for replica primary listeners, so it stays
-	// disabled here.
+	// The cloning lvol is dual-exposed (primary transport at the cloning port,
+	// TCP fallback at port+1), so the legacy +1 TCP fallback is allowed.
 	dstCloningBdevName, _, _, err := connectNVMfBdevWithReconnect(spdkClient, dstCloningLvolName, dstCloningLvolAddress, r.transport(),
-		rebuildCtrlrLossTimeoutSec, rebuildReconnectDelaySec, rebuildFastIOFailTimeoutSec, maxRetries, retryInterval, false)
+		rebuildCtrlrLossTimeoutSec, rebuildReconnectDelaySec, rebuildFastIOFailTimeoutSec, maxRetries, retryInterval, true)
 	if err != nil {
 		return err
 	}
@@ -2584,11 +2600,16 @@ func (r *Replica) RebuildingSrcStart(spdkClient *spdkclient.Client, dstReplicaNa
 		return "", errors.Wrapf(err, "failed to stop snapshot %s(%s) checksum hashing before replica %s rebuilding src exposes it", snapLvolName, exposedSnapshotName, r.Name)
 	}
 
-	port, _, err := r.portAllocator.AllocateRange(1)
+	// Allocate 2 ports: primary listener + TCP fallback at port+1. Allocating
+	// only 1 lets the fallback slot be handed to another subsystem later.
+	port, _, err := r.portAllocator.AllocateRange(2)
 	if err != nil {
 		return "", err
 	}
-	if err := spdkClient.StartExposeBdev(helpertypes.GetNQN(snapLvol.Name), snapLvol.UUID, generateNGUID(snapLvol.Name), r.IP, strconv.Itoa(int(port))); err != nil {
+	if err := spdkClient.StartExposeBdevWithTransport(helpertypes.GetNQN(snapLvol.Name), snapLvol.UUID, generateNGUID(snapLvol.Name), r.IP, strconv.Itoa(int(port)), r.transport().ToSPDKTransportType()); err != nil {
+		return "", err
+	}
+	if err := r.addTCPFallbackListener(spdkClient, helpertypes.GetNQN(snapLvol.Name), r.IP, port); err != nil {
 		return "", err
 	}
 	exposedSnapshotLvolAddress = net.JoinHostPort(r.IP, strconv.Itoa(int(port)))
@@ -2648,8 +2669,11 @@ func (r *Replica) doCleanupForRebuildingSrc(spdkClient *spdkclient.Client) {
 		if err := spdkClient.StopExposeBdev(helpertypes.GetNQN(spdktypes.GetLvolNameFromAlias(r.rebuildingSrcCache.exposedSnapshotAlias))); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
 			r.log.WithError(err).Errorf("Failed to stop exposing the snapshot %s for rebuilding src cleanup, will continue", r.rebuildingSrcCache.exposedSnapshotAlias)
 		} else {
-			if err := r.portAllocator.ReleaseRange(r.rebuildingSrcCache.exposedSnapshotPort, r.rebuildingSrcCache.exposedSnapshotPort); err != nil {
-				r.log.WithError(err).Errorf("Failed to release exposed snapshot port %d for rebuilding src cleanup, will continue", r.rebuildingSrcCache.exposedSnapshotPort)
+			// Release both the primary and the TCP fallback slot
+			// (AllocateRange(2) reserved the pair).
+			fallback := tcpFallbackPortFor(r.rebuildingSrcCache.exposedSnapshotPort)
+			if err := r.portAllocator.ReleaseRange(r.rebuildingSrcCache.exposedSnapshotPort, fallback); err != nil {
+				r.log.WithError(err).Errorf("Failed to release exposed snapshot port pair %d-%d for rebuilding src cleanup, will continue", r.rebuildingSrcCache.exposedSnapshotPort, fallback)
 			} else {
 				r.rebuildingSrcCache.exposedSnapshotPort = 0
 				r.rebuildingSrcCache.exposedSnapshotAlias = ""
@@ -2671,10 +2695,10 @@ func (r *Replica) rebuildingSrcAttachNoLock(spdkClient *spdkclient.Client, dstRe
 		return nil
 	}
 
-	// The dst rebuilding lvol is exposed on a single dedicated listener; the
-	// legacy +1 TCP fallback only exists for replica primary listeners, so it
-	// stays disabled here.
-	r.rebuildingSrcCache.dstRebuildingBdevName, _, _, err = connectNVMfBdevWithReconnect(spdkClient, dstRebuildingLvolName, dstRebuildingLvolAddress, r.transport(), rebuildCtrlrLossTimeoutSec, rebuildReconnectDelaySec, rebuildFastIOFailTimeoutSec, maxRetries, retryInterval, false)
+	// The dst rebuilding lvol is dual-exposed (primary transport at the
+	// rebuilding port, TCP fallback at port+1), so the legacy +1 TCP fallback
+	// is allowed.
+	r.rebuildingSrcCache.dstRebuildingBdevName, _, _, err = connectNVMfBdevWithReconnect(spdkClient, dstRebuildingLvolName, dstRebuildingLvolAddress, r.transport(), rebuildCtrlrLossTimeoutSec, rebuildReconnectDelaySec, rebuildFastIOFailTimeoutSec, maxRetries, retryInterval, true)
 	if err != nil {
 		return errors.Wrapf(err, "failed to connect rebuilding lvol %s with address %s as a NVMe bdev for replica %s rebuilding src attach", dstRebuildingLvolName, dstRebuildingLvolAddress, r.Name)
 	}
@@ -3102,11 +3126,11 @@ func (r *Replica) RebuildingDstStart(spdkClient *spdkclient.Client, srcReplicaNa
 	}
 
 	externalSnapshotLvolName := GetReplicaSnapshotLvolName(srcReplicaName, externalSnapshotName)
-	// The exposed src snapshot lives on a single dedicated listener; the
-	// legacy +1 TCP fallback only exists for replica primary listeners, so it
-	// stays disabled here.
+	// The exposed src snapshot is dual-exposed (primary transport at the
+	// allocated port, TCP fallback at port+1), so the legacy +1 TCP fallback
+	// is allowed.
 	externalSnapshotBdevName, _, _, err := connectNVMfBdevWithReconnect(spdkClient, externalSnapshotLvolName, externalSnapshotAddress, r.transport(),
-		rebuildCtrlrLossTimeoutSec, rebuildReconnectDelaySec, rebuildFastIOFailTimeoutSec, maxRetries, retryInterval, false)
+		rebuildCtrlrLossTimeoutSec, rebuildReconnectDelaySec, rebuildFastIOFailTimeoutSec, maxRetries, retryInterval, true)
 	if err != nil {
 		return "", errors.Wrapf(err, "failed to connect the external src snapshot lvol %s with address %s as a NVMf bdev for dst replica %v rebuilding start", externalSnapshotLvolName, externalSnapshotAddress, r.Name)
 	}
@@ -3116,10 +3140,12 @@ func (r *Replica) RebuildingDstStart(spdkClient *spdkclient.Client, srcReplicaNa
 	r.rebuildingDstCache.externalSnapshotName = externalSnapshotName
 	r.rebuildingDstCache.externalSnapshotBdevName = externalSnapshotBdevName
 
-	// Prepare a rebuilding port so that the dst replica can expose a rebuilding lvol in RebuildingDstSnapshotRevert
+	// Prepare a rebuilding port so that the dst replica can expose a rebuilding lvol in RebuildingDstSnapshotRevert.
+	// Allocate 2 ports: primary listener + TCP fallback at port+1. Allocating
+	// only 1 lets the fallback slot be handed to another subsystem later.
 	if r.rebuildingDstCache.rebuildingPort == 0 {
-		if r.rebuildingDstCache.rebuildingPort, _, err = r.portAllocator.AllocateRange(1); err != nil {
-			return "", errors.Wrapf(err, "failed to allocate a rebuilding port for dst replica %v rebuilding start", r.Name)
+		if r.rebuildingDstCache.rebuildingPort, _, err = r.portAllocator.AllocateRange(2); err != nil {
+			return "", errors.Wrapf(err, "failed to allocate a rebuilding port pair for dst replica %v rebuilding start", r.Name)
 		}
 	}
 
@@ -3169,7 +3195,13 @@ func (r *Replica) RebuildingDstStart(spdkClient *spdkclient.Client, srcReplicaNa
 	r.Head = BdevLvolInfoToServiceLvol(&headBdevLvol)
 	r.ActiveChain = append(r.ActiveChain, r.Head)
 
-	if err := spdkClient.StartExposeBdev(helpertypes.GetNQN(r.Name), r.Head.UUID, generateNGUID(r.Name), r.IP, strconv.Itoa(int(r.PortStart))); err != nil {
+	if err := spdkClient.StartExposeBdevWithTransport(helpertypes.GetNQN(r.Name), r.Head.UUID, generateNGUID(r.Name), r.IP, strconv.Itoa(int(r.PortStart)), r.transport().ToSPDKTransportType()); err != nil {
+		return "", err
+	}
+	// Keep the actual listeners consistent with what headLvolTransportAddresses
+	// advertises in the RebuildingDstStart response (RDMA primary at PortStart,
+	// TCP fallback at PortStart+1 on dual-listener nodes).
+	if err := r.addTCPFallbackListener(spdkClient, helpertypes.GetNQN(r.Name), r.IP, r.PortStart); err != nil {
 		return "", err
 	}
 	r.IsExposed = true
@@ -3374,8 +3406,11 @@ func (r *Replica) doCleanupForRebuildingDst(spdkClient *spdkclient.Client) error
 		aggregatedErrors = append(aggregatedErrors, err)
 	}
 	if r.rebuildingDstCache.rebuildingPort != 0 {
-		if err := r.portAllocator.ReleaseRange(r.rebuildingDstCache.rebuildingPort, r.rebuildingDstCache.rebuildingPort); err != nil {
-			r.log.WithError(err).Errorf("Rebuilding dst replica failed to release the rebuilding port %d for rebuilding dst cleanup, will continue", r.rebuildingDstCache.rebuildingPort)
+		// Release both the primary and the TCP fallback slot
+		// (AllocateRange(2) reserved the pair).
+		fallback := tcpFallbackPortFor(r.rebuildingDstCache.rebuildingPort)
+		if err := r.portAllocator.ReleaseRange(r.rebuildingDstCache.rebuildingPort, fallback); err != nil {
+			r.log.WithError(err).Errorf("Rebuilding dst replica failed to release the rebuilding port pair %d-%d for rebuilding dst cleanup, will continue", r.rebuildingDstCache.rebuildingPort, fallback)
 			aggregatedErrors = append(aggregatedErrors, err)
 		} else {
 			r.rebuildingDstCache.rebuildingPort = 0
@@ -3606,8 +3641,14 @@ func (r *Replica) rebuildingDstShallowCopyPrepare(spdkClient *spdkclient.Client,
 
 	dstRebuildingLvolAddress = r.rebuildingDstCache.rebuildingLvol.Alias
 	if r.rebuildingDstCache.rebuildingPort != 0 {
-		if err := spdkClient.StartExposeBdev(helpertypes.GetNQN(r.rebuildingDstCache.rebuildingLvol.Name), r.rebuildingDstCache.rebuildingLvol.UUID,
-			generateNGUID(r.rebuildingDstCache.rebuildingLvol.Name), r.IP, strconv.Itoa(int(r.rebuildingDstCache.rebuildingPort))); err != nil {
+		if err := spdkClient.StartExposeBdevWithTransport(helpertypes.GetNQN(r.rebuildingDstCache.rebuildingLvol.Name), r.rebuildingDstCache.rebuildingLvol.UUID,
+			generateNGUID(r.rebuildingDstCache.rebuildingLvol.Name), r.IP, strconv.Itoa(int(r.rebuildingDstCache.rebuildingPort)), r.transport().ToSPDKTransportType()); err != nil {
+			return "", false, err
+		}
+		// The rebuild src dials this with its own transport (RDMA on a
+		// dual-listener node) and may legacy-fall back to TCP at port+1, so
+		// both listeners must exist (AllocateRange(2) reserved the pair).
+		if err := r.addTCPFallbackListener(spdkClient, helpertypes.GetNQN(r.rebuildingDstCache.rebuildingLvol.Name), r.IP, r.rebuildingDstCache.rebuildingPort); err != nil {
 			return "", false, err
 		}
 		dstRebuildingLvolAddress = net.JoinHostPort(r.IP, strconv.Itoa(int(r.rebuildingDstCache.rebuildingPort)))
@@ -4427,7 +4468,7 @@ func getExposedPortForTransport(subsystem *spdktypes.NvmfSubsystem, trtype spdkt
 
 	return 0, fmt.Errorf("cannot find a %s exposed port in the NVMf subsystem", trtype)
 }
-func (r *Replica) addTCPFallbackListener(spdkClient *spdkclient.Client, nqn string, primaryPort int32) error {
+func (r *Replica) addTCPFallbackListener(spdkClient *spdkclient.Client, nqn, ip string, primaryPort int32) error {
 	if r.transport() == NvmfTransportTCP {
 		return nil
 	}
@@ -4436,13 +4477,13 @@ func (r *Replica) addTCPFallbackListener(spdkClient *spdkclient.Client, nqn stri
 	}
 	fallbackPort := strconv.Itoa(int(tcpFallbackPortFor(primaryPort)))
 	if err := spdkClient.EnsureNvmfTransport(spdktypes.NvmeTransportTypeTCP); err != nil {
-		return errors.Wrapf(err, "failed to ensure TCP transport before adding fallback listener on %s:%s for nqn %s", r.IP, fallbackPort, nqn)
+		return errors.Wrapf(err, "failed to ensure TCP transport before adding fallback listener on %s:%s for nqn %s", ip, fallbackPort, nqn)
 	}
 	if _, err := spdkClient.NvmfSubsystemAddListener(
-		nqn, r.IP, fallbackPort,
+		nqn, ip, fallbackPort,
 		spdktypes.NvmeTransportTypeTCP, spdktypes.NvmeAddressFamilyIPv4,
 	); err != nil {
-		return errors.Wrapf(err, "failed to add TCP fallback listener on %s:%s for nqn %s", r.IP, fallbackPort, nqn)
+		return errors.Wrapf(err, "failed to add TCP fallback listener on %s:%s for nqn %s", ip, fallbackPort, nqn)
 	}
 	return nil
 }
