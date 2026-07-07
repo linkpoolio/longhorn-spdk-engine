@@ -164,3 +164,34 @@ func TestGetEngineCntlidRange(t *testing.T) {
 		}
 	}
 }
+
+func TestShallowCopyPipelineDepth(t *testing.T) {
+	const key = "LONGHORN_V2_SHALLOW_COPY_PIPELINE_DEPTH"
+	cases := []struct {
+		name string
+		set  bool
+		val  string
+		want uint32
+	}{
+		{"unset returns default 1", false, "", 1},
+		{"empty returns default 1", true, "", 1},
+		{"explicit 1", true, "1", 1},
+		{"higher depth parsed", true, "8", 8},
+		{"whitespace trimmed", true, " 4 ", 4},
+		{"zero clamped to 1", true, "0", 1},
+		{"negative clamped to 1", true, "-3", 1},
+		{"unparseable returns default 1", true, "fast", 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.set {
+				t.Setenv(key, tc.val)
+			} else {
+				os.Unsetenv(key)
+			}
+			if got := shallowCopyPipelineDepth(); got != tc.want {
+				t.Errorf("shallowCopyPipelineDepth() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
