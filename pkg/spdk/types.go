@@ -138,6 +138,28 @@ func spdkCoreCount() int {
 	return count
 }
 
+// shallowCopyPipelineDepth reads LONGHORN_V2_SHALLOW_COPY_PIPELINE_DEPTH, the
+// QD passed to bdev_lvol_start_(range_)shallow_copy during replica rebuild.
+// Depth 1 (the default) keeps the SPDK strict-serial walker — one cluster
+// read+write in flight at a time; the helper omits it from the wire request,
+// so the default is compatible with SPDK targets lacking the pipelining
+// patch. Higher depths let the walker keep multiple cluster_sz DMA buffers in
+// flight on the source side, removing the QD=1 ceiling on rebuild throughput,
+// and require the shallow-copy pipelining patch on the SPDK side. Peak
+// source-side memory is depth*cluster_sz per active rebuild. Values below 1
+// are clamped to 1.
+func shallowCopyPipelineDepth() uint32 {
+	v := envIntOrDefault("LONGHORN_V2_SHALLOW_COPY_PIPELINE_DEPTH", 1)
+	if v < 1 {
+		return 1
+	}
+	return uint32(v)
+}
+
+// defaultShallowCopyPipelineDepth is resolved once at process start; see
+// shallowCopyPipelineDepth for semantics.
+var defaultShallowCopyPipelineDepth = shallowCopyPipelineDepth()
+
 var (
 	// ErrEngineFrontendCreateInvalidArgument indicates the create request carries
 	// invalid input, such as an unparsable target address.
