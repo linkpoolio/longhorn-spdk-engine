@@ -159,12 +159,22 @@ type BdevLvolResizeRequest struct {
 type BdevLvolShallowCopyRequest struct {
 	SrcLvolName string `json:"src_lvol_name"`
 	DstBdevName string `json:"dst_bdev_name"`
+	// PipelineDepth is the maximum number of clusters kept in flight on the
+	// source side of the copy. Omitted (0) means the SPDK default of 1, the
+	// strict-serial walker. Values > 1 require the shallow-copy pipelining
+	// patch on the SPDK side.
+	PipelineDepth uint32 `json:"pipeline_depth,omitempty"`
 }
 
 type BdevLvolRangeShallowCopyRequest struct {
 	SrcLvolName string   `json:"src_lvol_name"`
 	DstBdevName string   `json:"dst_bdev_name"`
 	Clusters    []uint64 `json:"clusters"`
+	// PipelineDepth is the maximum number of clusters kept in flight on the
+	// source side of the copy. Omitted (0) means the SPDK default of 1, the
+	// strict-serial walker. Values > 1 require the shallow-copy pipelining
+	// patch on the SPDK side.
+	PipelineDepth uint32 `json:"pipeline_depth,omitempty"`
 }
 
 type BdevLvolDeepCopyRequest struct {

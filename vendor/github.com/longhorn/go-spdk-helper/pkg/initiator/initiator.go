@@ -57,6 +57,20 @@ const (
 	waitDeviceInterval   = 1 * time.Second
 )
 
+const (
+	// nvmeIOTimeoutEnvVar overrides the io_timeout (in milliseconds) written
+	// to the kernel NVMe namespace block device after a successful NVMe/TCP
+	// connect.
+	nvmeIOTimeoutEnvVar = "LONGHORN_V2_NVME_IO_TIMEOUT_MS"
+
+	// defaultNvmeIOTimeoutMs is the default io_timeout applied to the kernel
+	// NVMe namespace block device (300s). The kernel default of 30s is
+	// shorter than worst-case COW-storm write tails on the SPDK target side;
+	// an expired io_timeout triggers a controller reset loop that strands
+	// qpairs and redoes the aborted COW work.
+	defaultNvmeIOTimeoutMs = 300000
+)
+
 var (
 	idGenerator IDGenerator
 )
@@ -514,6 +528,9 @@ func (i *Initiator) StartNvmeTCPInitiator(transportAddress, transportServiceID s
 			err = i.LoadEndpointForNvmeTcpFrontend(false)
 			if err == nil {
 				i.logger.Info("NVMe/TCP initiator is already launched with correct params")
+				// Re-assert the io_timeout: the namespace device may have been
+				// recreated (kernel default restored) since it was last set.
+				i.applyNVMeIOTimeout()
 				return false, nil
 			}
 			i.logger.WithError(err).Warnf("NVMe/TCP initiator is launched with failed to load the endpoint")
@@ -541,6 +558,11 @@ func (i *Initiator) StartNvmeTCPInitiator(transportAddress, transportServiceID s
 	if err != nil {
 		return dmDeviceIsBusy, errors.Wrapf(err, "failed to ensure device info after connecting target for NVMe/TCP initiator %s", i.Name)
 	}
+
+	// The kernel namespace device is up — raise its io_timeout above the
+	// 30s kernel default so target-side write tails don't trigger the
+	// io_timeout -> controller reset loop. Non-fatal on failure.
+	i.applyNVMeIOTimeout()
 
 	if dmDeviceAndEndpointCleanupRequired {
 		if dmDeviceIsBusy {
@@ -571,6 +593,49 @@ func (i *Initiator) StartNvmeTCPInitiator(transportAddress, transportServiceID s
 	i.logger.Infof("Launched NVMe/TCP initiator: %+v", i)
 
 	return dmDeviceIsBusy, nil
+}
+
+// nvmeIOTimeoutMs returns the io_timeout (milliseconds) to apply to the
+// kernel NVMe namespace block device, from LONGHORN_V2_NVME_IO_TIMEOUT_MS or
+// the 300s default. Non-positive or unparseable overrides fall back to the
+// default.
+func nvmeIOTimeoutMs() int {
+	raw, ok := os.LookupEnv(nvmeIOTimeoutEnvVar)
+	if !ok || strings.TrimSpace(raw) == "" {
+		return defaultNvmeIOTimeoutMs
+	}
+	v, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || v <= 0 {
+		return defaultNvmeIOTimeoutMs
+	}
+	return v
+}
+
+// applyNVMeIOTimeout writes the configured io_timeout to the kernel block
+// device queue of the connected NVMe namespace
+// (/sys/block/<namespace>/queue/io_timeout). The write happens in the host
+// namespaces (same nsenter machinery as the other host operations) when the
+// initiator was created with a hostProc path. Failure is non-fatal: the
+// device works with the kernel default, so only warn.
+func (i *Initiator) applyNVMeIOTimeout() {
+	if i.NVMeTCPInfo == nil || i.NVMeTCPInfo.NamespaceName == "" {
+		return
+	}
+
+	sysfsPath := fmt.Sprintf("/sys/block/%s/queue/io_timeout", i.NVMeTCPInfo.NamespaceName)
+	timeoutMs := strconv.Itoa(nvmeIOTimeoutMs())
+
+	var err error
+	if i.hostProc != "" {
+		err = commonns.WriteFile(sysfsPath, timeoutMs)
+	} else {
+		err = os.WriteFile(sysfsPath, []byte(timeoutMs), 0644)
+	}
+	if err != nil {
+		i.logger.WithError(err).Warnf("Failed to set io_timeout to %sms via %s for NVMe/TCP initiator, device keeps the kernel default", timeoutMs, sysfsPath)
+		return
+	}
+	i.logger.Infof("Set io_timeout to %sms via %s for NVMe/TCP initiator", timeoutMs, sysfsPath)
 }
 
 func (i *Initiator) isEndpointValid() bool {
