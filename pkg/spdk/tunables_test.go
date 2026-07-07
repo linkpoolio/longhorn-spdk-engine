@@ -195,3 +195,36 @@ func TestShallowCopyPipelineDepth(t *testing.T) {
 		})
 	}
 }
+
+func TestDefaultRaidDeltaBitmapEnabled(t *testing.T) {
+	const key = "LONGHORN_V2_DELTA_BITMAP"
+	cases := []struct {
+		name string
+		set  bool
+		val  string
+		want bool
+	}{
+		{"unset defaults true", false, "", true},
+		{"empty stays true", true, "", true},
+		{"zero disables", true, "0", false},
+		{"false disables", true, "false", false},
+		{"FALSE disables", true, "FALSE", false},
+		{"no disables", true, "no", false},
+		{"off with whitespace disables", true, " off ", false},
+		{"one stays true", true, "1", true},
+		{"true stays true", true, "true", true},
+		{"garbage stays true", true, "banana", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.set {
+				t.Setenv(key, tc.val)
+			} else {
+				os.Unsetenv(key)
+			}
+			if got := defaultRaidDeltaBitmapEnabled(); got != tc.want {
+				t.Errorf("defaultRaidDeltaBitmapEnabled() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

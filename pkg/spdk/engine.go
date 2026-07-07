@@ -148,6 +148,21 @@ type Engine struct {
 
 	RaidBdevUUID string
 
+	// deltaBitmapEnabled toggles SPDK raid1's per-base-bdev dirty-region
+	// tracking (delta bitmap) for this engine. Set once at construction
+	// from defaultRaidDeltaBitmapEnabled() and passed unchanged to every
+	// BdevRaidCreate (create, snapshot revert, reconstruct) so it stays
+	// stable across the volume's lifetime.
+	deltaBitmapEnabled bool
+
+	// ReplicaDirtyBitmaps maps replica name → the dirty bitmap captured
+	// when that replica transitioned RW→ERR. In-memory only (no engine
+	// record persistence on the reset stack): a bitmap survives replica
+	// re-add within this engine process but not an IM restart. Entries are
+	// cleared once the replica rebuilds successfully or the engine is
+	// deleted.
+	ReplicaDirtyBitmaps map[string]*ReplicaDirtyBitmap
+
 	NvmeTcpTarget *NvmeTcpTarget
 
 	State    types.InstanceState
@@ -270,6 +285,8 @@ func NewEngine(engineName, volumeName, frontend string, specSize uint64, replica
 
 		ReplicaStatusMap: map[string]*EngineReplicaStatus{},
 
+		deltaBitmapEnabled: defaultRaidDeltaBitmapEnabled(),
+
 		NvmeTcpTarget: &NvmeTcpTarget{},
 
 		State: types.InstanceStatePending,
@@ -354,7 +371,7 @@ func (e *Engine) Create(spdkClient *spdkclient.Client, replicaAddressMap map[str
 	e.checkAndUpdateInfoFromReplicasNoLock()
 
 	e.log.Infof("Connected all available replicas %+v, then launching raid during engine creation", e.ReplicaStatusMap)
-	if _, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, "", false); err != nil {
+	if _, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, "", e.deltaBitmapEnabled); err != nil {
 		return nil, err
 	}
 
@@ -845,6 +862,7 @@ func (e *Engine) Delete(spdkClient *spdkclient.Client, superiorPortAllocator *co
 	}()
 
 	e.log.Info("Deleting engine")
+	e.clearAllReplicaDirtyBitmapsNoLock()
 	if e.IsRestoring && e.restore != nil {
 		e.log.Info("Canceling volume restoration before engine deletion")
 		e.cancelCtx()
@@ -1063,6 +1081,30 @@ func (e *Engine) ReplicaAdd(spdkClient *spdkclient.Client, dstReplicaName, dstRe
 	for replicaName, replicaStatus := range e.ReplicaStatusMap {
 		if replicaStatus.Mode == types.ModeWO {
 			return fmt.Errorf("cannot add a new replica %s since there is already a rebuilding replica %s", dstReplicaName, replicaName)
+		}
+	}
+
+	// Delta-bitmap reuse gate: a bitmap keyed on the incoming dst replica name
+	// means this engine captured the dirty regions when that same replica
+	// faulted (RW→ERR), i.e. the dst is the reused/salvaged replica and only
+	// the captured regions diverged while it was detached.
+	//
+	// SCOPE GAP (documented, not invented around): the per-snapshot rebuild is
+	// executed by the dst replica server via ReplicaRebuildingDstShallowCopyStart,
+	// whose spdkrpc request carries no cluster list, so the engine cannot hand
+	// the bitmap-derived clusters to the range shallow copy path without a
+	// longhorn-types proto change (out of scope for this branch — the old fork
+	// branches only ever implemented capture, never consumption). Until that
+	// field exists, the reused dst still rebuilds via the checksum-driven
+	// fast-sync path; the bitmap is surfaced here for observability and its
+	// lifecycle (capture → clear on successful rebuild / engine delete) is
+	// fully wired so the consumption plumbing can land as a follow-up.
+	if bm := e.ReplicaDirtyBitmaps[dstReplicaName]; bm != nil {
+		if clusterList, cvErr := bm.ClusterList(defaultClusterSize); cvErr != nil {
+			e.log.WithError(cvErr).Warnf("Engine failed to convert the captured delta bitmap of reused rebuilding replica %s (bdev %s, captured %s) to a cluster list, discarding it", dstReplicaName, bm.BdevName, bm.CapturedAt.Format(time.RFC3339))
+			e.clearReplicaDirtyBitmapNoLock(dstReplicaName, "unusable bitmap payload")
+		} else {
+			e.log.Infof("Engine holds a captured delta bitmap for reused rebuilding replica %s (bdev %s, captured %s, regionSize %d): %d dirty cluster(s); rebuild proceeds via the checksum-based fast-sync path since the rebuild RPC surface cannot carry a cluster list yet", dstReplicaName, bm.BdevName, bm.CapturedAt.Format(time.RFC3339), bm.RegionSize, len(clusterList))
 		}
 	}
 
@@ -1618,6 +1660,9 @@ func (e *Engine) replicaAddFinish(srcReplicaServiceCli, dstReplicaServiceCli *cl
 				dstReplicaStatus.Mode = types.ModeERR
 			} else {
 				dstReplicaStatus.Mode = types.ModeRW
+				// The replica is fully rebuilt: any dirty bitmap captured when
+				// it faulted is now obsolete.
+				e.clearReplicaDirtyBitmapNoLock(dstReplicaName, "replica rebuilt successfully")
 			}
 			updateRequired = true
 		}
@@ -1996,7 +2041,7 @@ func (e *Engine) snapshotOperationWithoutLock(spdkClient *spdkclient.Client, rep
 
 		engineErr = retrygo.Do(
 			func() error {
-				_, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, "", false)
+				_, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, "", e.deltaBitmapEnabled)
 				return err
 			},
 			retrygo.Attempts(uint(maxRetries)),
@@ -3135,7 +3180,7 @@ func (e *Engine) reconstructRaidBdev(spdkClient *spdkclient.Client, bdevRaidUUID
 		return fmt.Errorf("no healthy replica bdevs available for RAID creation")
 	}
 
-	if _, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, bdevRaidUUID, false); err != nil {
+	if _, err := spdkClient.BdevRaidCreate(e.Name, spdktypes.BdevRaidLevel1, 0, replicaBdevList, bdevRaidUUID, e.deltaBitmapEnabled); err != nil {
 		return err
 	}
 
@@ -3264,7 +3309,11 @@ func (e *Engine) ValidateAndUpdate(spdkClient *spdkclient.Client) (err error) {
 		return err
 	}
 
+	previousModes := e.snapshotReplicaModesNoLock()
 	containValidReplica := e.validateReplicaStatusMapNoLock(bdevMap, &updateRequired)
+	// Capture the dirty bitmap of any replica that just transitioned to ERR,
+	// so a later re-add of the same (reused) replica can rebuild incrementally.
+	e.captureBitmapsForFaultedReplicasNoLock(spdkClient, previousModes)
 
 	e.log.UpdateLoggerWithWarnOnFailure(logrus.Fields{
 		"replicaStatusMap": e.ReplicaStatusMap,

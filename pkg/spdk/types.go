@@ -160,6 +160,26 @@ func shallowCopyPipelineDepth() uint32 {
 // shallowCopyPipelineDepth for semantics.
 var defaultShallowCopyPipelineDepth = shallowCopyPipelineDepth()
 
+// defaultRaidDeltaBitmapEnabled returns whether new v2 raid1 bdevs enable
+// per-base-bdev dirty-region tracking (the SPDK delta bitmap carried in the
+// longhorn raid1 layer on rebase/v26.05). Defaults on; operators can force
+// off with LONGHORN_V2_DELTA_BITMAP=0 (e.g. if the base bdev layer exposes
+// optimal_io_boundary=0 and would reject raid1 startup). The flag is read
+// once at engine construction and passed unchanged to every raid re-create,
+// so it stays stable across a volume's lifetime.
+func defaultRaidDeltaBitmapEnabled() bool {
+	raw, ok := os.LookupEnv("LONGHORN_V2_DELTA_BITMAP")
+	if !ok {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
+
 var (
 	// ErrEngineFrontendCreateInvalidArgument indicates the create request carries
 	// invalid input, such as an unparsable target address.
