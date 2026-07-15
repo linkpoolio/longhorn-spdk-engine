@@ -92,7 +92,7 @@ func (s *TestSuite) TestBackupOpenSnapshotCleansUpOnOpenFileFailure(c *C) {
 	backupNewFragmap = func(*Backup) (*Fragmap, error) {
 		return &Fragmap{}, nil
 	}
-	backupExposeSnapshotLvolBdev = func(*spdkclient.Client, string, string, string, int32, *commonns.Executor) (string, string, error) {
+	backupExposeSnapshotLvolBdev = func(*spdkclient.Client, string, string, string, int32, NvmfTransportType, *commonns.Executor) (string, string, error) {
 		return "subsystem", "controller", nil
 	}
 	backupStopExposeBdev = func(_ *spdkclient.Client, nqn string) error {
@@ -148,7 +148,7 @@ func (s *TestSuite) TestRestoreOpenVolumeDevCleansUpOnOpenFileFailure(c *C) {
 	newNVMeTCPInitiator = func(string, *initiator.NVMeTCPInfo) (nvmeInitiator, error) {
 		return fakeInitiator, nil
 	}
-	restoreExposeSnapshotLvolBdev = func(*spdkclient.Client, string, string, string, int32, *commonns.Executor) (string, string, error) {
+	restoreExposeSnapshotLvolBdev = func(*spdkclient.Client, string, string, string, int32, NvmfTransportType, *commonns.Executor) (string, string, error) {
 		return "subsystem", "controller", nil
 	}
 	restoreStopExposeBdev = func(_ *spdkclient.Client, nqn string) error {
@@ -200,7 +200,7 @@ func (s *TestSuite) TestRestoreOpenVolumeDevUnexposeFailureKeepsIsExposed(c *C) 
 	newNVMeTCPInitiator = func(string, *initiator.NVMeTCPInfo) (nvmeInitiator, error) {
 		return fakeInitiator, nil
 	}
-	restoreExposeSnapshotLvolBdev = func(*spdkclient.Client, string, string, string, int32, *commonns.Executor) (string, string, error) {
+	restoreExposeSnapshotLvolBdev = func(*spdkclient.Client, string, string, string, int32, NvmfTransportType, *commonns.Executor) (string, string, error) {
 		return "subsystem", "controller", nil
 	}
 	restoreStopExposeBdev = func(_ *spdkclient.Client, nqn string) error {
@@ -338,7 +338,7 @@ func (s *TestSuite) TestPrepareBackingImageSnapshotOpenFileFailureStopsInitiator
 			BdevInfoBasic: spdktypes.BdevInfoBasic{Name: "bi-temp-head"},
 		}}, nil
 	}
-	backingImageExposeSnapshotLvolBdev = func(*spdkclient.Client, string, string, string, int32, *commonns.Executor) (string, string, error) {
+	backingImageExposeSnapshotLvolBdev = func(*spdkclient.Client, string, string, string, int32, NvmfTransportType, *commonns.Executor) (string, string, error) {
 		return "subsystem", "controller", nil
 	}
 	backingImageStopExposeBdev = func(*spdkclient.Client, string) error {

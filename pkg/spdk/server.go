@@ -3,6 +3,7 @@ package spdk
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -91,7 +92,22 @@ type Server struct {
 	// (e.g. /var/lib/longhorn). If empty, persistence is disabled.
 	metadataDir string
 
+	// nodeTransport is this IM node's negotiated NVMe-oF transport (TCP or
+	// RDMA), detected once at startup from SPDK's available transports. It
+	// is propagated to every Engine/Replica/EngineFrontend created here so
+	// they expose/dial the matching transport.
+	nodeTransport NvmfTransportType
+
 	newServiceClient ServiceClientFactory
+}
+
+// isFrameworkAlreadyInitialized reports whether err is SPDK's INVALID_STATE
+// response to framework_start_init when the framework is already up. That RPC is
+// STARTUP-only; once spdk_tgt has initialised subsystems (it was launched
+// without --wait-for-rpc) it returns "Method may only be called before framework
+// is initialized." We treat that as a benign already-initialized signal.
+func isFrameworkAlreadyInitialized(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "before framework is initialized")
 }
 
 func NewServer(ctx context.Context, portStart, portEnd int32, newServiceClient ServiceClientFactory) (*Server, error) {
@@ -109,14 +125,75 @@ func NewServer(ctx context.Context, portStart, portEnd int32, newServiceClient S
 		return nil, err
 	}
 
-	if _, err = cli.BdevNvmeSetOptions(
-		replicaCtrlrLossTimeoutSec,
-		replicaReconnectDelaySec,
-		replicaFastIOFailTimeoutSec,
-		replicaTransportAckTimeout,
-		replicaKeepAliveTimeoutMs); err != nil {
+	// spdk_tgt is started with --wait-for-rpc by the IM entrypoint so that
+	// these tunables land BEFORE the iobuf/nvmf subsystems initialise:
+	//   iobuf_set_options → growing pools post-init is a no-op
+	//   bdev_nvme_set_options → ditto, the initiator defaults are frozen on init
+	// Then framework_start_init drives subsystem init with the tuned opts.
+	rdmaCapable := DetectTransport().RDMA
+	reactors := spdkCoreCount()
+	budget := spdkMemSizeBytes()
+	if budget == 0 {
+		logrus.Warn("Cannot determine the SPDK hugepage allocation; sizing iobuf pools from configured transport demand instead")
+	}
+	iobufSmall, iobufLarge := iobufPoolCounts(rdmaCapable, reactors, budget)
+	if _, err = cli.IobufSetOptions(iobufSmall, iobufLarge, 0, 0); err != nil {
+		logrus.WithError(err).Warn("Failed to grow iobuf pools before init; transport create may fail with ENOMEM")
+	} else {
+		logrus.Infof("Sized iobuf pools to small=%d large=%d (%dMiB of %dMiB budget, rdma=%v reactors=%d) before subsystem init",
+			iobufSmall, iobufLarge, iobufPoolBytes(iobufSmall, iobufLarge)>>20, budget>>20, rdmaCapable, reactors)
+	}
+
+	if _, err = cli.BdevNvmeSetOptionsWithTos(
+		int32(replicaCtrlrLossTimeoutSec),
+		int32(replicaReconnectDelaySec),
+		int32(replicaFastIOFailTimeoutSec),
+		int32(replicaTransportAckTimeout),
+		int32(replicaKeepAliveTimeoutMs),
+		int32(replicaTransportTos)); err != nil {
 		return nil, errors.Wrap(err, "failed to set NVMe options")
 	}
+
+	// Register accel_mlx5 only on RDMA-capable nodes. SPDK is built with
+	// --with-rdma=mlx5_dv so the module is present in the binary, but we
+	// only scan/register it where Mellanox hardware is actually expected.
+	// On TCP-only workers DetectTransport() returns RDMA=false; sw_accel
+	// remains assigned to all ops (correct fallback).
+	//
+	// num_requests sized at runtime (cores × 16) instead of SPDK default
+	// 2047. The default tries to allocate 2047 signature mkeys per device
+	// which returned ENOMEM on ConnectX-6 Dx fw 22.43.2566 (NIC reports
+	// crc32c capability but firmware can't back 2047 PSVs). cores × 16
+	// is SPDK's enforced minimum (ACCEL_MLX5_MAX_MKEYS_IN_TASK).
+	if DetectTransport().RDMA {
+		if _, err = cli.Mlx5ScanAccelModule(accelMlx5NumRequests()); err != nil {
+			logrus.WithError(err).Warn("Failed to register accel_mlx5 driver; falling back to sw_accel for RDMA UMR registration (per-op CPU memcpy)")
+		} else {
+			logrus.Info("Registered accel_mlx5 driver for RDMA UMR per-IO acceleration")
+		}
+	}
+
+	if _, err = cli.FrameworkStartInit(); err != nil {
+		// framework_start_init is a STARTUP-only RPC. When spdk_tgt is launched
+		// without --wait-for-rpc (e.g. the integration test harness, or a
+		// misconfigured entrypoint) subsystems auto-initialise at boot and the
+		// framework reaches RUNTIME, where this RPC returns INVALID_STATE
+		// ("...before framework is initialized"). The tunables above already
+		// applied to the running target (bdev_nvme_set_options is RUNTIME-allowed;
+		// iobuf/mlx5 are best-effort), so treat that as success rather than
+		// failing engine startup.
+		if !isFrameworkAlreadyInitialized(err) {
+			return nil, errors.Wrap(err, "failed to start SPDK subsystem init")
+		}
+		logrus.Info("SPDK framework already initialized (spdk_tgt started without --wait-for-rpc); skipping framework_start_init")
+	} else {
+		if _, err = cli.FrameworkWaitInit(); err != nil {
+			return nil, errors.Wrap(err, "failed to wait for SPDK subsystem init")
+		}
+		logrus.Info("SPDK subsystem init complete")
+	}
+
+	nodeTransport := NegotiateNodeTransport(cli)
 
 	broadcasters := map[types.InstanceType]*broadcaster.Broadcaster{}
 	broadcastChs := map[types.InstanceType]chan interface{}{}
@@ -155,6 +232,7 @@ func NewServer(ctx context.Context, portStart, portEnd int32, newServiceClient S
 		volumeHostLocks: map[string]*volumeHostLockEntry{},
 
 		metadataDir:      types.MetadataDir,
+		nodeTransport:    nodeTransport,
 		newServiceClient: newServiceClient,
 	}
 	s.hotplugActive.Store(true)
@@ -529,7 +607,7 @@ func (s *Server) rebuildCachedLvolObjects(state *verifyState) error {
 			lvsUUID := bdevLvol.DriverSpecific.Lvol.LvolStoreUUID
 			specSize := bdevLvol.NumBlocks * uint64(bdevLvol.BlockSize)
 			actualSize := bdevLvol.DriverSpecific.Lvol.NumAllocatedClusters * uint64(defaultClusterSize)
-			state.replicaMap[lvolName] = NewReplica(s.ctx, lvolName, lvsUUIDNameMap[lvsUUID], lvsUUID, specSize, true, s.updateChs[types.InstanceTypeReplica], s.newServiceClient)
+			state.replicaMap[lvolName] = NewReplica(s.ctx, lvolName, lvsUUIDNameMap[lvsUUID], lvsUUID, specSize, true, s.nodeTransport, s.updateChs[types.InstanceTypeReplica], s.newServiceClient)
 			state.replicaMapForSync[lvolName] = state.replicaMap[lvolName]
 			logrus.Infof("Detected one possible existing replica %s(%s) with disk %s(%s), spec size %d, actual size %d", bdevLvol.Aliases[0], bdevLvol.UUID, lvsUUIDNameMap[lvsUUID], lvsUUID, specSize, actualSize)
 		} else if volumeName, slotIndex, err := ParseShardLvolName(lvolName); err == nil {
@@ -752,7 +830,7 @@ func (s *Server) newReplica(req *spdkrpc.ReplicaCreateRequest) (*Replica, error)
 	if !exists {
 		return nil, fmt.Errorf("lvstore %v(%v) does not exist for replica %v creation", req.LvsName, req.LvsUuid, req.Name)
 	}
-	return NewReplica(s.ctx, req.Name, req.LvsName, req.LvsUuid, req.SpecSize, true, s.updateChs[types.InstanceTypeReplica], s.newServiceClient), nil
+	return NewReplica(s.ctx, req.Name, req.LvsName, req.LvsUuid, req.SpecSize, true, s.nodeTransport, s.updateChs[types.InstanceTypeReplica], s.newServiceClient), nil
 }
 
 func (s *Server) getBackingImage(backingImageName, lvsUUID string) (backingImage *BackingImage, err error) {
@@ -1148,6 +1226,10 @@ func (s *Server) recoverEngineFrontends(ctx context.Context) {
 		ef := NewEngineFrontend(record.Name, record.EngineName, record.VolumeName,
 			record.Frontend, record.SpecSize, 0, 0, s.updateChs[types.InstanceTypeEngineFrontend], s.newServiceClient)
 		ef.metadataDir = s.metadataDir
+		// Tag with the engine target's actual transport (TCP; see
+		// EngineFrontendCreate). RDMA-specific teardown at switchover keys on
+		// the transport observed on the live controller, not on this tag.
+		ef.NvmeTcpFrontend.Transport = engineFrontendTargetTransport()
 		ef.VolumeNQN = record.VolumeNQN
 		ef.VolumeNGUID = record.VolumeNGUID
 		ef.ActivePath = record.ActivePath

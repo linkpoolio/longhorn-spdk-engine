@@ -429,7 +429,7 @@ func (s *TestSuite) TestReplicaCreateWithStateChecks(c *C) {
 func (s *TestSuite) TestReplicaDeletePendingWithoutCleanupIsNoop(c *C) {
 	fmt.Println("Testing SPDK pending replica delete without cleanup is no-op")
 
-	r := server.NewReplica(context.Background(), "test-replica-pending", "test-lvs", "test-lvs-uuid", 0, true, make(chan interface{}, 1), nil)
+	r := server.NewReplica(context.Background(), "test-replica-pending", "test-lvs", "test-lvs-uuid", 0, true, server.NvmfTransportTCP, make(chan interface{}, 1), nil)
 	c.Assert(r, NotNil)
 	c.Assert(string(r.State), Equals, types.InstanceStatePending)
 

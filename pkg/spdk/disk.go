@@ -31,8 +31,13 @@ import (
 )
 
 const (
-	defaultClusterSize = 1 * 1024 * 1024 // 1MB
-	defaultBlockSize   = 4096            // 4KB
+	// defaultClusterSize must match the blobstore cluster size of every
+	// lvstore in the fleet: besides lvstore creation, all ActualSize and
+	// rebuild-progress math multiplies SPDK cluster counts by this constant.
+	// Production lvstores are created with 32 MiB clusters (fewer md pages
+	// and cluster allocations per GiB on large volumes).
+	defaultClusterSize = 32 * 1024 * 1024 // 32MiB
+	defaultBlockSize   = 4096             // 4KB
 
 	hostPrefix = "/host"
 )

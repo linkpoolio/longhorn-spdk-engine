@@ -1,6 +1,7 @@
 package spdk
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"regexp"
@@ -63,7 +64,12 @@ func discoverAndConnectNVMeTarget(srcIP string, srcPort int32, maxRetries int, r
 	return subsystemNQN, controllerName, nil
 }
 
-func exposeSnapshotLvolBdev(spdkClient *spdkclient.Client, lvsName, lvolName, ip string, port int32, executor *commonns.Executor) (subsystemNQN, controllerName string, err error) {
+func exposeSnapshotLvolBdev(spdkClient *spdkclient.Client, lvsName, lvolName, ip string, port int32, transport NvmfTransportType, executor *commonns.Executor) (subsystemNQN, controllerName string, err error) {
+	if transport == "" {
+		transport = DefaultNvmfTransport
+	}
+	spdkTransport := transport.ToSPDKTransportType()
+
 	bdevLvolList, err := spdkClient.BdevLvolGet(spdktypes.GetLvolAlias(lvsName, lvolName), 0)
 	if err != nil {
 		return "", "", err
@@ -73,20 +79,21 @@ func exposeSnapshotLvolBdev(spdkClient *spdkclient.Client, lvsName, lvolName, ip
 	}
 
 	portStr := strconv.Itoa(int(port))
-	err = spdkClient.StartExposeBdev(helpertypes.GetNQN(lvolName), bdevLvolList[0].UUID, generateNGUID(lvolName), ip, portStr)
+	err = spdkClient.StartExposeBdevWithTransport(helpertypes.GetNQN(lvolName), bdevLvolList[0].UUID, generateNGUID(lvolName), ip, portStr, spdkTransport)
 	if err != nil {
 		return "", "", errors.Wrapf(err, "failed to expose snapshot lvol bdev %v", lvolName)
 	}
 
+	transportStr := string(transport)
 	for r := 0; r < maxRetries; r++ {
-		subsystemNQN, err = initiator.DiscoverTarget(ip, portStr, executor)
+		subsystemNQN, err = initiator.DiscoverTargetWithTransport(transportStr, ip, portStr, executor)
 		if err != nil {
 			logrus.WithError(err).Errorf("Failed to discover target for snapshot lvol bdev %v", lvolName)
 			time.Sleep(retryInterval)
 			continue
 		}
 
-		controllerName, err = initiator.ConnectTarget(ip, portStr, subsystemNQN, executor)
+		controllerName, err = initiator.ConnectTargetWithTransport(transportStr, ip, portStr, subsystemNQN, executor)
 		if err != nil {
 			logrus.WithError(err).Errorf("Failed to connect target for snapshot lvol bdev %v", lvolName)
 			time.Sleep(retryInterval)
@@ -120,6 +127,48 @@ func splitHostPort(address string) (string, int32, error) {
 
 // connectNVMfBdev connects to the NVMe/TCP target, which is exposed by a remote lvol bdev.
 // controllerName is typically the lvol name, and address is the IP:port of the NVMe/TCP target.
+// attachRPCTimeoutSlack is added on top of a connection's own ctrl-loss /
+// fast-io-fail budget to bound the bdev_nvme_attach_controller RPC. Without a
+// bound the RPC inherits the 24h long timeout, so an attach to an unreachable
+// target — or one issued while the spdk_tgt reactor is wedged — blocks for a
+// day while the engine holds its write lock, starving every reader on that
+// engine. The bound scales with the caller's timeouts so a short engine-create
+// attach and a longer rebuild attach each get an appropriate ceiling.
+const attachRPCTimeoutSlack = 10 * time.Second
+
+// attachControllerRPCTimeout returns the per-attach RPC ceiling for a
+// connection with the given ctrl-loss / fast-io-fail seconds.
+func attachControllerRPCTimeout(ctrlrLossTimeout, fastIOFailTimeoutSec int) time.Duration {
+	return time.Duration(ctrlrLossTimeout+fastIOFailTimeoutSec)*time.Second + attachRPCTimeoutSlack
+}
+
+// resolveAttachAlreadyExists handles an SPDK -114 "controller already exists"
+// from bdev_nvme_attach_controller. A prior attempt left the controller (SPDK
+// keeps it reconnecting past a failed/slow connect), so re-attaching just spins
+// on -114 for the whole ctrl-loss window; sustained, that churn corrupts a
+// qpair and wedges the reactor. If the controller already has its namespace
+// bdev it is usable — adopt it (return its bdev name). Otherwise it is
+// reconnecting to a dead target with no namespace: detach it once so a later
+// attempt starts clean, and signal the caller to stop retrying.
+// attachControllerResolver is the subset of the SPDK client that
+// resolveAttachAlreadyExists needs; a narrow interface keeps the -114 decision
+// unit-testable.
+type attachControllerResolver interface {
+	BdevGetBdevs(name string, timeout uint64) ([]spdktypes.BdevInfo, error)
+	BdevNvmeDetachController(name string) (bool, error)
+}
+
+func resolveAttachAlreadyExists(spdkClient attachControllerResolver, controllerName string) (bdevName string, adopted bool) {
+	nvmeBdevName := controllerName + "n1"
+	if bdevs, err := spdkClient.BdevGetBdevs(nvmeBdevName, 0); err == nil && len(bdevs) == 1 {
+		return nvmeBdevName, true
+	}
+	if _, err := spdkClient.BdevNvmeDetachController(controllerName); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
+		logrus.WithError(err).Warnf("Failed to clear stale controller %s after -114 already-exists", controllerName)
+	}
+	return "", false
+}
+
 func connectNVMfBdev(spdkClient *spdkclient.Client, controllerName, address string, ctrlrLossTimeout, fastIOFailTimeoutSec int, maxRetries int, retryInterval time.Duration) (bdevName string, err error) {
 	if controllerName == "" || address == "" {
 		return "", fmt.Errorf("controllerName or address is empty")
@@ -145,10 +194,16 @@ func connectNVMfBdev(spdkClient *spdkclient.Client, controllerName, address stri
 
 	adrfam := spdkclient.DetectAddressFamily(ip)
 	nvmeBdevNameList := []string{}
+	rpcTimeout := attachControllerRPCTimeout(ctrlrLossTimeout, fastIOFailTimeoutSec)
+	// Cap the whole retry loop too: with maxRetries attempts a wedged reactor
+	// would otherwise hold the lock for maxRetries*rpcTimeout. Two attach
+	// ceilings is enough to ride out a transient failure without lingering.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*rpcTimeout)
+	defer cancel()
 	err = retry.Do(
 		func() error {
 			var err error
-			nvmeBdevNameList, err = spdkClient.BdevNvmeAttachController(
+			nvmeBdevNameList, err = spdkClient.BdevNvmeAttachControllerWithTimeout(
 				controllerName,
 				helpertypes.GetNQN(controllerName),
 				ip,
@@ -159,9 +214,18 @@ func connectNVMfBdev(spdkClient *spdkclient.Client, controllerName, address stri
 				replicaReconnectDelaySec,
 				int32(fastIOFailTimeoutSec),
 				replicaMultipath,
+				rpcTimeout,
 			)
+			if err != nil && jsonrpc.IsJSONRPCRespErrorAlreadyExists(err) {
+				if bdevName, adopted := resolveAttachAlreadyExists(spdkClient, controllerName); adopted {
+					nvmeBdevNameList = []string{bdevName}
+					return nil
+				}
+				return retry.Unrecoverable(err)
+			}
 			return err
 		},
+		retry.Context(ctx),
 		retry.Attempts(uint(maxRetries)),
 		retry.Delay(retryInterval),
 		retry.DelayType(retry.FixedDelay),
@@ -294,3 +358,92 @@ func ExtractBackingImageAndDiskUUID(lvolName string) (string, string, error) {
 
 	return backingImageName, diskUUID, nil
 }
+
+// connectNVMfBdevWithTransport attaches the remote lvol over the given
+// transport and returns the bdev name plus the address/transport dialed;
+// callers record them (EngineReplicaStatus.DialedAddress / .Transport) so
+// dial-address validation compares against what was attached.
+func connectNVMfBdevWithTransport(spdkClient *spdkclient.Client, controllerName, address string, transport NvmfTransportType, ctrlrLossTimeout, fastIOFailTimeoutSec int, maxRetries int, retryInterval time.Duration) (bdevName, dialedAddress string, dialedTransport NvmfTransportType, err error) {
+	return connectNVMfBdevWithReconnect(spdkClient, controllerName, address, transport, ctrlrLossTimeout, replicaReconnectDelaySec, fastIOFailTimeoutSec, maxRetries, retryInterval)
+}
+
+func connectNVMfBdevWithReconnect(spdkClient *spdkclient.Client, controllerName, address string, transport NvmfTransportType, ctrlrLossTimeout, reconnectDelay, fastIOFailTimeoutSec int, maxRetries int, retryInterval time.Duration) (bdevName, dialedAddress string, dialedTransport NvmfTransportType, err error) {
+	if controllerName == "" || address == "" {
+		return "", "", "", fmt.Errorf("controllerName or address is empty")
+	}
+
+	defer func() {
+		if err != nil {
+			if _, detachErr := spdkClient.BdevNvmeDetachController(controllerName); detachErr != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(detachErr) {
+				logrus.WithError(detachErr).Errorf("Failed to detach NVMe controller %s after failing at attaching it", controllerName)
+			}
+		}
+	}()
+
+	ip, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return "", "", "", err
+	}
+
+	// Blindly detach the controller in case of the previous replica connection is not cleaned up correctly
+	if _, err := spdkClient.BdevNvmeDetachController(controllerName); err != nil && !jsonrpc.IsJSONRPCRespErrorNoSuchDevice(err) {
+		return "", "", "", err
+	}
+
+	dialedAddress = address
+	dialedTransport = transport
+
+	nvmeBdevNameList := []string{}
+	spdkTransport := transport.ToSPDKTransportType()
+	rpcTimeout := attachControllerRPCTimeout(ctrlrLossTimeout, fastIOFailTimeoutSec)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*rpcTimeout)
+	defer cancel()
+	err = retry.Do(
+		func() error {
+			var err error
+			nvmeBdevNameList, err = spdkClient.BdevNvmeAttachControllerWithTimeout(
+				controllerName,
+				helpertypes.GetNQN(controllerName),
+				ip,
+				port,
+				spdkTransport,
+				spdktypes.NvmeAddressFamilyIPv4,
+				int32(ctrlrLossTimeout),
+				int32(reconnectDelay),
+				int32(fastIOFailTimeoutSec),
+				replicaMultipath,
+				rpcTimeout,
+			)
+			if err != nil && jsonrpc.IsJSONRPCRespErrorAlreadyExists(err) {
+				if bdevName, adopted := resolveAttachAlreadyExists(spdkClient, controllerName); adopted {
+					nvmeBdevNameList = []string{bdevName}
+					return nil
+				}
+				return retry.Unrecoverable(err)
+			}
+			return err
+		},
+		retry.Context(ctx),
+		retry.Attempts(uint(maxRetries)),
+		retry.Delay(retryInterval),
+		retry.DelayType(retry.FixedDelay),
+		retry.LastErrorOnly(true),
+		retry.OnRetry(func(n uint, err error) {
+			logrus.WithError(err).Warnf(
+				"Retrying NVMe bdev attach: controller=%s address=%s transport=%s attempt=%d/%d next_wait=%s",
+				controllerName, address, transport, n+1, maxRetries, retryInterval,
+			)
+		}),
+	)
+
+	if err != nil {
+		return "", "", "", fmt.Errorf("attach NVMe controller failed after %d attempts: %w", maxRetries, err)
+	}
+
+	if len(nvmeBdevNameList) != 1 {
+		return "", "", "", fmt.Errorf("got zero or multiple results when attaching lvol %s with address %s as a NVMe bdev: %+v", controllerName, address, nvmeBdevNameList)
+	}
+
+	return nvmeBdevNameList[0], dialedAddress, dialedTransport, nil
+}
+
