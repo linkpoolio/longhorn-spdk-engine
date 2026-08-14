@@ -118,11 +118,13 @@ func (c *Client) BdevAioGet(name string, timeout uint64) (bdevAioInfoList []spdk
 }
 
 // BdevLvolCreateLvstore constructs a logical volume store.
-func (c *Client) BdevLvolCreateLvstore(bdevName, lvsName string, clusterSize uint32) (uuid string, err error) {
+// numMdPagesPerClusterRatio 0 omits the field so SPDK uses its default of 100.
+func (c *Client) BdevLvolCreateLvstore(bdevName, lvsName string, clusterSize, numMdPagesPerClusterRatio uint32) (uuid string, err error) {
 	req := spdktypes.BdevLvolCreateLvstoreRequest{
-		BdevName:  bdevName,
-		LvsName:   lvsName,
-		ClusterSz: clusterSize,
+		BdevName:                  bdevName,
+		LvsName:                   lvsName,
+		ClusterSz:                 clusterSize,
+		NumMdPagesPerClusterRatio: numMdPagesPerClusterRatio,
 	}
 
 	cmdOutput, err := c.jsonCli.SendCommandWithLongTimeout("bdev_lvol_create_lvstore", req)

@@ -70,8 +70,8 @@ type BdevLvolCreateLvstoreRequest struct {
 	LvsName  string `json:"lvs_name"`
 
 	ClusterSz uint32 `json:"cluster_sz,omitempty"`
-	// ClearMethod               string `json:"clear_method,omitempty"`
-	// NumMdPagesPerClusterRatio uint32 `json:"num_md_pages_per_cluster_ratio,omitempty"`
+	// ClearMethod string `json:"clear_method,omitempty"`
+	NumMdPagesPerClusterRatio uint32 `json:"num_md_pages_per_cluster_ratio,omitempty"`
 }
 
 type BdevLvolDeleteLvstoreRequest struct {

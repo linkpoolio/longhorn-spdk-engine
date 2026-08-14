@@ -160,6 +160,23 @@ func shallowCopyPipelineDepth() uint32 {
 // shallowCopyPipelineDepth for semantics.
 var defaultShallowCopyPipelineDepth = shallowCopyPipelineDepth()
 
+const envLvstoreMdPagesPerClusterRatio = "LONGHORN_V2_LVSTORE_MD_PAGES_PER_CLUSTER_RATIO"
+
+func lvstoreMdPagesPerClusterRatio() uint32 {
+	v := envIntOrDefault(envLvstoreMdPagesPerClusterRatio, defaultLvstoreMdPagesPerClusterRatio)
+	if v < 100 {
+		return defaultLvstoreMdPagesPerClusterRatio
+	}
+	return uint32(v)
+}
+
+func resolveLvstoreMdPagesPerClusterRatio(ratio uint32) uint32 {
+	if ratio >= 100 {
+		return ratio
+	}
+	return lvstoreMdPagesPerClusterRatio()
+}
+
 var (
 	// ErrEngineFrontendCreateInvalidArgument indicates the create request carries
 	// invalid input, such as an unparsable target address.

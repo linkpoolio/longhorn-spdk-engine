@@ -13,8 +13,9 @@ import (
 	spdkutil "github.com/longhorn/go-spdk-helper/pkg/util"
 )
 
-// AddDevice adds a device with the given device path, name, and cluster size.
-func (c *Client) AddDevice(devicePath, name string, clusterSize uint32) (bdevAioName, lvsName, lvsUUID string, err error) {
+// AddDevice adds a device with the given device path, name, cluster size,
+// and lvstore metadata-page ratio. numMdPagesPerClusterRatio 0 omits the field.
+func (c *Client) AddDevice(devicePath, name string, clusterSize, numMdPagesPerClusterRatio uint32) (bdevAioName, lvsName, lvsUUID string, err error) {
 	// Use the file name as aio name and lvs name if name is not specified.
 	if name == "" {
 		name = filepath.Base(devicePath)
@@ -39,7 +40,7 @@ func (c *Client) AddDevice(devicePath, name string, clusterSize uint32) (bdevAio
 		}
 	}
 	if !lvsCreated {
-		if lvsUUID, err = c.BdevLvolCreateLvstore(name, name, clusterSize); err != nil {
+		if lvsUUID, err = c.BdevLvolCreateLvstore(name, name, clusterSize, numMdPagesPerClusterRatio); err != nil {
 			return "", "", "", err
 		}
 	}
