@@ -38,6 +38,8 @@ const (
 	// and cluster allocations per GiB on large volumes).
 	defaultClusterSize = 32 * 1024 * 1024 // 32MiB
 	defaultBlockSize   = 4096             // 4KB
+	// SPDK default: 1 metadata page per cluster.
+	defaultLvstoreMdPagesPerClusterRatio = 100
 
 	hostPrefix = "/host"
 )
@@ -87,7 +89,7 @@ func NewDisk(diskName, diskUUID, diskPath, diskDriver string, blockSize int64) *
 	}
 }
 
-func (d *Disk) DiskCreate(spdkClient *spdkclient.Client, diskName, diskUUID, diskPath, diskDriver string, blockSize int64) (err error) {
+func (d *Disk) DiskCreate(spdkClient *spdkclient.Client, diskName, diskUUID, diskPath, diskDriver string, blockSize int64, numMdPagesPerClusterRatio uint32) (err error) {
 	log := logrus.WithFields(logrus.Fields{
 		"diskName":   diskName,
 		"diskUUID":   diskUUID,
@@ -121,7 +123,7 @@ func (d *Disk) DiskCreate(spdkClient *spdkclient.Client, diskName, diskUUID, dis
 	}
 	d.DiskDriver = string(exactDiskDriver)
 
-	lvstoreUUID, err := addBlockDevice(spdkClient, diskName, diskUUID, diskPath, exactDiskDriver, blockSize)
+	lvstoreUUID, err := addBlockDevice(spdkClient, diskName, diskUUID, diskPath, exactDiskDriver, blockSize, numMdPagesPerClusterRatio)
 	if err != nil {
 		log.WithError(err).Error("Failed to add block device")
 		return grpcstatus.Errorf(grpccodes.Internal, "failed to add disk block device: %v", err)
@@ -372,7 +374,7 @@ func validateAioDiskCreation(spdkClient *spdkclient.Client, diskPath string, dis
 	return nil
 }
 
-func addBlockDevice(spdkClient *spdkclient.Client, diskName, diskUUID, originalDiskPath string, diskDriver commontypes.DiskDriver, blockSize int64) (string, error) {
+func addBlockDevice(spdkClient *spdkclient.Client, diskName, diskUUID, originalDiskPath string, diskDriver commontypes.DiskDriver, blockSize int64, numMdPagesPerClusterRatio uint32) (string, error) {
 	log := logrus.WithFields(logrus.Fields{
 		"diskName":   diskName,
 		"diskUUID":   diskUUID,
@@ -447,8 +449,10 @@ func addBlockDevice(spdkClient *spdkclient.Client, diskName, diskUUID, originalD
 	}
 
 	if diskUUID == "" {
-		log.Infof("Creating a new lvstore %v", lvstoreName)
-		return spdkClient.BdevLvolCreateLvstore(bdev.Name, lvstoreName, defaultClusterSize)
+		ratio := resolveLvstoreMdPagesPerClusterRatio(numMdPagesPerClusterRatio)
+		log.Infof("Creating a new lvstore %v (cluster_sz=%d, num_md_pages_per_cluster_ratio=%d)",
+			lvstoreName, defaultClusterSize, ratio)
+		return spdkClient.BdevLvolCreateLvstore(bdev.Name, lvstoreName, defaultClusterSize, ratio)
 	}
 
 	// The lvstore should be created before, but it cannot be found now.

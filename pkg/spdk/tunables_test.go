@@ -195,3 +195,64 @@ func TestShallowCopyPipelineDepth(t *testing.T) {
 		})
 	}
 }
+
+func TestLvstoreMdPagesPerClusterRatio(t *testing.T) {
+	const key = envLvstoreMdPagesPerClusterRatio
+	cases := []struct {
+		name string
+		set  bool
+		val  string
+		want uint32
+	}{
+		{"unset returns 100", false, "", 100},
+		{"empty returns 100", true, "", 100},
+		{"explicit 400", true, "400", 400},
+		{"200 for 2x growth", true, "200", 200},
+		{"whitespace trimmed", true, " 400 ", 400},
+		{"below 100 clamped to 100", true, "50", 100},
+		{"zero clamped to 100", true, "0", 100},
+		{"negative clamped to 100", true, "-1", 100},
+		{"unparseable returns 100", true, "lots", 100},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.set {
+				t.Setenv(key, tc.val)
+			} else {
+				os.Unsetenv(key)
+			}
+			if got := lvstoreMdPagesPerClusterRatio(); got != tc.want {
+				t.Errorf("lvstoreMdPagesPerClusterRatio() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestResolveLvstoreMdPagesPerClusterRatio(t *testing.T) {
+	const key = envLvstoreMdPagesPerClusterRatio
+	cases := []struct {
+		name  string
+		ratio uint32
+		env   string
+		want  uint32
+	}{
+		{"explicit 400 wins over env", 400, "200", 400},
+		{"explicit 200 used as-is", 200, "", 200},
+		{"zero falls back to env", 0, "300", 300},
+		{"zero with unset env uses 100", 0, "", 100},
+		{"below 100 falls back to env", 50, "250", 250},
+		{"below 100 with unset env uses 100", 99, "", 100},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.env == "" {
+				os.Unsetenv(key)
+			} else {
+				t.Setenv(key, tc.env)
+			}
+			if got := resolveLvstoreMdPagesPerClusterRatio(tc.ratio); got != tc.want {
+				t.Errorf("resolveLvstoreMdPagesPerClusterRatio(%d) = %d, want %d", tc.ratio, got, tc.want)
+			}
+		})
+	}
+}
