@@ -76,10 +76,11 @@ const (
 	rebuildReconnectDelaySec    = 5
 	rebuildFastIOFailTimeoutSec = 15
 
-	// replicaTransportTos tags outbound NVMe-oF packets with DSCP. SPDK passes
-	// this byte to rdma_set_option(RDMA_OPTION_ID_TOS), the raw 8-bit IPv4 TOS
-	// (DSCP in the upper 6 bits). DSCP 26 (AF31) = TOS 26<<2 = 104.
-	replicaTransportTos = 104
+	// RDMA priority class 0-7 maps to IPv4 TOS / IPv6 traffic class as
+	// TOS = priority << 5 (Class Selector DSCP). 0 is the rdma-core / SPDK
+	// default (untagged / CS0). Override with LONGHORN_V2_RDMA_PRIORITY_CLASS.
+	defaultRdmaPriorityClass = 0
+	rdmaPriorityClassMax     = 7
 
 	// SPDK's built-in iobuf pool baselines (v26.05 defaults) and buffer sizes.
 	// The pools live in hugepage memory; every data-moving subsystem (bdev,
@@ -161,6 +162,29 @@ func shallowCopyPipelineDepth() uint32 {
 var defaultShallowCopyPipelineDepth = shallowCopyPipelineDepth()
 
 const envLvstoreMdPagesPerClusterRatio = "LONGHORN_V2_LVSTORE_MD_PAGES_PER_CLUSTER_RATIO"
+
+const envRdmaPriorityClass = "LONGHORN_V2_RDMA_PRIORITY_CLASS"
+
+// rdmaPriorityClass reads LONGHORN_V2_RDMA_PRIORITY_CLASS (IEEE 802.1p / RoCE
+// priority 0-7). Out-of-range or unparseable values fall back to 0, the
+// rdma-core / SPDK default.
+func rdmaPriorityClass() int {
+	v := envIntOrDefault(envRdmaPriorityClass, defaultRdmaPriorityClass)
+	if v < 0 || v > rdmaPriorityClassMax {
+		return defaultRdmaPriorityClass
+	}
+	return v
+}
+
+// replicaTransportTos is the IPv4 TOS / IPv6 traffic-class byte SPDK passes
+// to rdma_set_option(RDMA_OPTION_ID_TOS). Mapping is the NVIDIA / rdma-core
+// default: TOS = priority << 5, which places the 3-bit priority in the
+// Class Selector DSCP bits (priority 0 → TOS 0 / DSCP 0; priority 3 → TOS
+// 96 / DSCP 24). 0 omits the field on the wire (omitempty) so SPDK keeps
+// its built-in default.
+func replicaTransportTos() int {
+	return rdmaPriorityClass() << 5
+}
 
 func lvstoreMdPagesPerClusterRatio() uint32 {
 	v := envIntOrDefault(envLvstoreMdPagesPerClusterRatio, defaultLvstoreMdPagesPerClusterRatio)

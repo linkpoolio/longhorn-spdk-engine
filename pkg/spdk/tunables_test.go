@@ -228,6 +228,67 @@ func TestLvstoreMdPagesPerClusterRatio(t *testing.T) {
 	}
 }
 
+func TestRdmaPriorityClass(t *testing.T) {
+	const key = envRdmaPriorityClass
+	cases := []struct {
+		name string
+		set  bool
+		val  string
+		want int
+	}{
+		{"unset is RDMA default 0", false, "", 0},
+		{"empty is RDMA default 0", true, "", 0},
+		{"explicit 0", true, "0", 0},
+		{"priority 3", true, "3", 3},
+		{"priority 7", true, "7", 7},
+		{"whitespace trimmed", true, " 4 ", 4},
+		{"above 7 falls back to 0", true, "8", 0},
+		{"negative falls back to 0", true, "-1", 0},
+		{"unparseable falls back to 0", true, "af31", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.set {
+				t.Setenv(key, tc.val)
+			} else {
+				os.Unsetenv(key)
+			}
+			if got := rdmaPriorityClass(); got != tc.want {
+				t.Errorf("rdmaPriorityClass() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestReplicaTransportTos(t *testing.T) {
+	const key = envRdmaPriorityClass
+	cases := []struct {
+		name string
+		set  bool
+		val  string
+		want int
+	}{
+		{"unset TOS 0", false, "", 0},
+		{"priority 0 TOS 0", true, "0", 0},
+		{"priority 3 TOS 96 (DSCP 24)", true, "3", 96},
+		{"priority 4 TOS 128 (DSCP 32)", true, "4", 128},
+		{"priority 7 TOS 224 (DSCP 56)", true, "7", 224},
+		{"invalid falls back to TOS 0", true, "9", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.set {
+				t.Setenv(key, tc.val)
+			} else {
+				os.Unsetenv(key)
+			}
+			if got := replicaTransportTos(); got != tc.want {
+				t.Errorf("replicaTransportTos() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestResolveLvstoreMdPagesPerClusterRatio(t *testing.T) {
 	const key = envLvstoreMdPagesPerClusterRatio
 	cases := []struct {

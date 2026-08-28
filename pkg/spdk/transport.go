@@ -90,6 +90,8 @@ var (
 		Zcopy:               boolPtr(true),
 		DataWrPoolSize:      uint32(envIntOrDefault("LONGHORN_V2_NVMF_RDMA_DATA_WR_POOL_SIZE", 4095)),
 		AcceptorPollRate:    uint32(envIntOrDefault("LONGHORN_V2_NVMF_RDMA_ACCEPTOR_POLL_RATE", 10000)),
+		// Tags listen + accepted nvmf RDMA QPs. 0 is omitted (rdma-core default).
+		Tos: uint8(replicaTransportTos()),
 	}
 	// TCP transport opts. Defaults match SPDK upstream — bumping any of
 	// these eats DPDK heap that the accel_mlx5 signature/UMR mempools also
@@ -133,7 +135,8 @@ func NegotiateNodeTransport(spdkClient *spdkclient.Client) NvmfTransportType {
 		logrus.WithError(err).Warn("SPDK rejected nvmf_create_transport(rdma); falling back to TCP for NVMe-oF")
 		return NvmfTransportTCP
 	}
-	logrus.Info("NVMe-oF RDMA transport negotiated on this node with tuned opts")
+	logrus.Infof("NVMe-oF RDMA transport negotiated on this node with tuned opts (tos=%d, priority class %d)",
+		nvmfRdmaOpts.Tos, rdmaPriorityClass())
 	return NvmfTransportRDMA
 }
 

@@ -69,6 +69,10 @@ type NvmfCreateTransportRequest struct {
 	MaxSrqDepth    uint32 `json:"max_srq_depth,omitempty"`
 	NoSrq          bool   `json:"no_srq,omitempty"`
 	DataWrPoolSize uint32 `json:"data_wr_pool_size,omitempty"`
+	// Tos is the IPv4 TOS / IPv6 traffic-class byte applied to nvmf RDMA
+	// listen and accepted QPs (rdma_set_option RDMA_OPTION_ID_TOS). 0 is
+	// the rdma-core default and is omitted from the wire.
+	Tos uint8 `json:"tos,omitempty"`
 }
 
 type NvmfGetTransportRequest struct {

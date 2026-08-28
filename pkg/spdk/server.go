@@ -136,15 +136,18 @@ func NewServer(ctx context.Context, portStart, portEnd int32, newServiceClient S
 			iobufSmall, iobufLarge, iobufPoolBytes(iobufSmall, iobufLarge)>>20, budget>>20, rdmaCapable, reactors)
 	}
 
+	tos := replicaTransportTos()
 	if _, err = cli.BdevNvmeSetOptionsWithTos(
 		int32(replicaCtrlrLossTimeoutSec),
 		int32(replicaReconnectDelaySec),
 		int32(replicaFastIOFailTimeoutSec),
 		int32(replicaTransportAckTimeout),
 		int32(replicaKeepAliveTimeoutMs),
-		int32(replicaTransportTos)); err != nil {
+		int32(tos)); err != nil {
 		return nil, errors.Wrap(err, "failed to set NVMe options")
 	}
+	logrus.Infof("Set NVMe initiator transport_tos=%d (RDMA priority class %d, DSCP %d)",
+		tos, rdmaPriorityClass(), tos>>2)
 
 	// Register accel_mlx5 only on RDMA-capable nodes. SPDK is built with
 	// --with-rdma=mlx5_dv so the module is present in the binary, but we
