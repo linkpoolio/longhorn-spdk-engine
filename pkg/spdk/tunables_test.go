@@ -1,10 +1,12 @@
 package spdk
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -286,6 +288,19 @@ func TestReplicaTransportTos(t *testing.T) {
 				t.Errorf("replicaTransportTos() = %d, want %d", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestNvmfRdmaOptsDefaultOmitsTos(t *testing.T) {
+	if replicaTransportTos() != 0 {
+		t.Skip("LONGHORN_V2_RDMA_PRIORITY_CLASS is set in this environment")
+	}
+	b, err := json.Marshal(nvmfRdmaOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), `"tos"`) {
+		t.Errorf("default nvmf RDMA opts should omit tos, got %s", b)
 	}
 }
 
